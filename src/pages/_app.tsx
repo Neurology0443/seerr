@@ -244,6 +244,7 @@ CoreApp.getInitialProps = async (initialProps) => {
     applicationUrl: '',
     hideAvailable: false,
     hideBlocklisted: false,
+    hideRequested: false,
     movie4kEnabled: false,
     series4kEnabled: false,
     localLogin: true,
@@ -261,6 +262,7 @@ CoreApp.getInitialProps = async (initialProps) => {
     emailEnabled: false,
     newPlexLogin: true,
     youtubeUrl: '',
+    versionCheck: true,
     plexClientIdentifier: '',
   };
 

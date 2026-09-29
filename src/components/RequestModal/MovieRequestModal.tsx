@@ -289,13 +289,17 @@ const MovieRequestModal = ({
           : intl.formatMessage(messages.requestfrom, {
               username: editRequest.requestedBy.displayName,
             })}
-        {(hasPermission(Permission.REQUEST_ADVANCED) ||
-          hasPermission(Permission.MANAGE_REQUESTS)) && (
+        {hasPermission(
+          [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
+          { type: 'or' }
+        ) && (
           <AdvancedRequester
             type="movie"
+            tmdbId={tmdbId}
             is4k={is4k}
             serverFixed={serverId != null}
             requestUser={editRequest.requestedBy}
+            requestId={editRequest.id}
             defaultOverrides={{
               folder: editRequest.rootFolder,
               profile: editRequest.profileId,
@@ -363,11 +367,14 @@ const MovieRequestModal = ({
           }
         />
       )}
-      {(hasPermission(Permission.REQUEST_ADVANCED) ||
-        hasPermission(Permission.MANAGE_REQUESTS)) &&
+      {hasPermission(
+        [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
+        { type: 'or' }
+      ) &&
         (serverId != null ? (
           // Per-service request: server is fixed by the button, only tags are editable
           <AdvancedRequester
+            tmdbId={tmdbId}
             type="movie"
             is4k={is4k}
             quota={quota}
@@ -379,6 +386,7 @@ const MovieRequestModal = ({
           />
         ) : (
           <AdvancedRequester
+            tmdbId={tmdbId}
             type="movie"
             is4k={is4k}
             quota={quota}

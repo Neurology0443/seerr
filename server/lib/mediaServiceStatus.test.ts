@@ -1,4 +1,5 @@
 import { MediaStatus } from '@server/constants/media';
+import { entities } from '@server/datasource';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import { upsertMediaServiceStatus } from '@server/lib/mediaServiceStatus';
 import assert from 'node:assert/strict';
@@ -31,8 +32,8 @@ describe('upsertMediaServiceStatus', () => {
       type: 'sqlite',
       database: dbPath,
       synchronize: true,
-      // Glob so related entities (Media and its graph) resolve correctly.
-      entities: ['server/entity/**/*.ts'],
+      // Full entity list so related entities (Media and its graph) resolve.
+      entities,
     });
     await ds.initialize();
     // The FK to `media` is irrelevant to this unit; skip it so we don't have to

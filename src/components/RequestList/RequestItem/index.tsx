@@ -10,7 +10,10 @@ import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
-import { refreshIntervalHelper } from '@app/utils/refreshIntervalHelper';
+import {
+  getRequestDownloadStatus,
+  refreshIntervalHelper,
+} from '@app/utils/refreshIntervalHelper';
 import { getServiceSlotStatus } from '@app/utils/serviceRequestStatus';
 import {
   ArrowPathIcon,
@@ -48,6 +51,7 @@ const messages = defineMessages('components.RequestList.RequestItem', {
   tvdbid: 'TheTVDB ID',
   unknowntitle: 'Unknown Title',
   removearr: 'Remove from {arr}',
+  removemediaerror: 'Something went wrong while removing the media.',
   profileName: 'Profile',
 });
 
@@ -79,6 +83,15 @@ const RequestItemError = ({
     iOSPlexUrl: requestData?.media?.iOSPlexUrl,
     iOSPlexUrl4k: requestData?.media?.iOSPlexUrl4k,
   });
+
+  const requestDownloadStatus = getRequestDownloadStatus(
+    requestData?.media?.[
+      requestData?.is4k ? 'downloadStatus4k' : 'downloadStatus'
+    ],
+    requestData?.type === 'tv'
+      ? (requestData?.seasons ?? []).map((season) => season.seasonNumber)
+      : []
+  );
 
   const { status: serviceSlotStatus, downloadItem: serviceDownloadStatus } =
     getServiceSlotStatus(requestData);
@@ -144,22 +157,12 @@ const RequestItemError = ({
                       ]
                     }
                     downloadItem={
-                      serviceDownloadStatus ??
-                      requestData.media[
-                        requestData.is4k ? 'downloadStatus4k' : 'downloadStatus'
-                      ]
+                      serviceDownloadStatus ?? requestDownloadStatus
                     }
                     title={intl.formatMessage(messages.unknowntitle)}
                     inProgress={
-                      (
-                        serviceDownloadStatus ??
-                        requestData.media[
-                          requestData.is4k
-                            ? 'downloadStatus4k'
-                            : 'downloadStatus'
-                        ] ??
-                        []
-                      ).length > 0
+                      (serviceDownloadStatus ?? requestDownloadStatus).length >
+                      0
                     }
                     is4k={requestData.is4k}
                     mediaType={requestData.type}
@@ -367,10 +370,20 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
 
   const deleteMediaFile = async () => {
     if (request.media) {
-      await axios.delete(
-        `/api/v1/media/${request.media.id}/file?is4k=${request.is4k}`
-      );
-      await axios.delete(`/api/v1/media/${request.media.id}`);
+      try {
+        await axios.delete(
+          `/api/v1/media/${request.media.id}/file?is4k=${request.is4k}`
+        );
+      } catch (e) {
+        if (!axios.isAxiosError(e) || e.response?.status !== 404) {
+          addToast(intl.formatMessage(messages.removemediaerror), {
+            autoDismiss: true,
+            appearance: 'error',
+          });
+          revalidateList();
+          return;
+        }
+      }
       revalidateList();
     }
   };
@@ -415,6 +428,13 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
       />
     );
   }
+
+  const requestDownloadStatus = getRequestDownloadStatus(
+    requestData.media[requestData.is4k ? 'downloadStatus4k' : 'downloadStatus'],
+    requestData.type === 'tv'
+      ? requestData.seasons.map((season) => season.seasonNumber)
+      : []
+  );
 
   return (
     <>
@@ -543,21 +563,10 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                     serviceSlotStatus ??
                     requestData.media[requestData.is4k ? 'status4k' : 'status']
                   }
-                  downloadItem={
-                    serviceDownloadStatus ??
-                    requestData.media[
-                      requestData.is4k ? 'downloadStatus4k' : 'downloadStatus'
-                    ]
-                  }
+                  downloadItem={serviceDownloadStatus ?? requestDownloadStatus}
                   title={isMovie(title) ? title.title : title.name}
                   inProgress={
-                    (
-                      serviceDownloadStatus ??
-                      requestData.media[
-                        requestData.is4k ? 'downloadStatus4k' : 'downloadStatus'
-                      ] ??
-                      []
-                    ).length > 0
+                    (serviceDownloadStatus ?? requestDownloadStatus).length > 0
                   }
                   is4k={requestData.is4k}
                   tmdbId={requestData.media.tmdbId}

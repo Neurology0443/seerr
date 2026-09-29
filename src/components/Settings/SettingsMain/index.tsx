@@ -62,6 +62,9 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   hideAvailable: 'Hide Available Media',
   hideAvailableTip:
     'Hide available media from the discover pages but not search results',
+  hideRequested: 'Hide Requested Media',
+  hideRequestedTip:
+    'Hide media that has been requested from the discover pages but not search results',
   cacheImages: 'Enable Image Caching',
   cacheImagesTip:
     'Cache externally sourced images (requires a significant amount of disk space)',
@@ -74,6 +77,8 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   youtubeUrl: 'YouTube URL',
   youtubeUrlTip:
     'Base URL for YouTube videos if a self-hosted YouTube instance is used.',
+  versionCheck: 'Version Check',
+  versionCheckTip: 'Automatically check for new versions on GitHub.',
   validationUrl: 'You must provide a valid URL',
   validationUrlTrailingSlash: 'URL must not end in a trailing slash',
 });
@@ -171,6 +176,7 @@ const SettingsMain = () => {
             applicationUrl: data?.applicationUrl,
             hideAvailable: data?.hideAvailable,
             hideBlocklisted: data?.hideBlocklisted,
+            hideRequested: data?.hideRequested,
             locale: data?.locale ?? 'en',
             discoverRegion: data?.discoverRegion,
             originalLanguage: data?.originalLanguage,
@@ -183,6 +189,7 @@ const SettingsMain = () => {
             enableSpecialEpisodes: data?.enableSpecialEpisodes,
             cacheImages: data?.cacheImages,
             youtubeUrl: data?.youtubeUrl,
+            versionCheck: data?.versionCheck,
           }}
           enableReinitialize
           validationSchema={MainSettingsSchema}
@@ -193,6 +200,7 @@ const SettingsMain = () => {
                 applicationUrl: values.applicationUrl,
                 hideAvailable: values.hideAvailable,
                 hideBlocklisted: values.hideBlocklisted,
+                hideRequested: values.hideRequested,
                 locale: values.locale,
                 discoverRegion: values.discoverRegion,
                 streamingRegion: values.streamingRegion,
@@ -205,9 +213,10 @@ const SettingsMain = () => {
                 enableSpecialEpisodes: values.enableSpecialEpisodes,
                 cacheImages: values.cacheImages,
                 youtubeUrl: values.youtubeUrl,
+                versionCheck: values?.versionCheck,
               });
               mutate('/api/v1/settings/public');
-              mutate('/api/v1/status');
+              mutate('/api/v1/status?checkUpdateAvailable=false');
 
               if (setLocale) {
                 setLocale(
@@ -539,6 +548,26 @@ const SettingsMain = () => {
                   </div>
                 </div>
                 <div className="form-row">
+                  <label htmlFor="hideRequested" className="checkbox-label">
+                    <span className="mr-2">
+                      {intl.formatMessage(messages.hideRequested)}
+                    </span>
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.hideRequestedTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      type="checkbox"
+                      id="hideRequested"
+                      name="hideRequested"
+                      onChange={() => {
+                        setFieldValue('hideRequested', !values.hideRequested);
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="form-row">
                   <label
                     htmlFor="partialRequestsEnabled"
                     className="checkbox-label"
@@ -605,6 +634,24 @@ const SettingsMain = () => {
                       typeof errors.youtubeUrl === 'string' && (
                         <div className="error">{errors.youtubeUrl}</div>
                       )}
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label htmlFor="versionCheck" className="text-label">
+                    {intl.formatMessage(messages.versionCheck)}
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.versionCheckTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      type="checkbox"
+                      id="versionCheck"
+                      name="versionCheck"
+                      onChange={() => {
+                        setFieldValue('versionCheck', !values.versionCheck);
+                      }}
+                    />
                   </div>
                 </div>
                 <div className="actions">

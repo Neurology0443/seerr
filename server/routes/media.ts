@@ -219,10 +219,12 @@ mediaRoutes.delete(
       const explicitServiceId = req.query.serviceId
         ? Number(req.query.serviceId)
         : undefined;
+      const isServiceDelete =
+        explicitServiceId !== undefined && explicitServiceId >= 0;
 
       let serviceSettings;
 
-      if (explicitServiceId !== undefined && explicitServiceId >= 0) {
+      if (isServiceDelete) {
         // Caller specified exactly which service to delete from
         serviceSettings = isMovie
           ? settings.radarr.find((r) => r.id === explicitServiceId)
@@ -257,18 +259,18 @@ mediaRoutes.delete(
       }
 
       if (!serviceSettings) {
-        logger.warn(
-          `There is no default ${
-            is4k ? '4K ' : '' + isMovie ? 'Radarr' : 'Sonarr'
-          }/ server configured. Did you set any of your ${
-            is4k ? '4K ' : '' + isMovie ? 'Radarr' : 'Sonarr'
-          } servers as default?`,
+        const arrName = `${is4k ? '4K ' : ''}${isMovie ? 'Radarr' : 'Sonarr'}`;
+        logger.info(
+          `There is no default ${arrName} server configured. Did you set any of your ${arrName} servers as default?`,
           {
             label: 'Media Request',
             mediaId: media.id,
           }
         );
-        return;
+        return next({
+          status: 409,
+          message: `No ${arrName} server configured to delete media files`,
+        });
       }
 
       let service;
@@ -294,12 +296,19 @@ mediaRoutes.delete(
           throw new Error('TVDB ID not found');
         }
         await (service as SonarrAPI).removeSeries(tvdbId);
+
+        // Per-service deletes leave the shared season status untouched
+        if (!isServiceDelete) {
+          for (const season of media.seasons) {
+            season[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
+          }
+        }
       }
 
       // For a per-service delete, clear only this service's tracking state so
       // the media row (and every other service's availability) is preserved.
       // The caller is expected NOT to follow up with a full media delete.
-      if (explicitServiceId !== undefined && explicitServiceId >= 0) {
+      if (isServiceDelete) {
         await getRepository(MediaServiceStatus)
           .createQueryBuilder()
           .delete()
@@ -318,15 +327,23 @@ mediaRoutes.delete(
             isServiceRequest: true,
           })
           .execute();
+      } else {
+        media[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
+        media.resetServiceData(is4k);
+        await mediaRepository.save(media);
       }
 
       return res.status(204).send();
     } catch (e) {
-      logger.error('Something went wrong fetching media in delete request', {
+      if (e instanceof EntityNotFoundError) {
+        return next({ status: 404, message: 'Media not found' });
+      }
+      logger.error('Something went wrong deleting media file', {
         label: 'Media',
+        mediaId: req.params.id,
         message: e.message,
       });
-      next({ status: 404, message: 'Media not found' });
+      next({ status: 500, message: 'Failed to delete media file' });
     }
   }
 );

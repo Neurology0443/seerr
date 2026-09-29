@@ -253,7 +253,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
           activeLanguageProfileId: sonarr?.activeLanguageProfileId,
           rootFolder: sonarr?.activeDirectory,
           seriesType: sonarr?.seriesType,
-          animeSeriesType: sonarr?.animeSeriesType,
+          animeSeriesType: sonarr?.animeSeriesType ?? 'anime',
           activeAnimeProfileId: sonarr?.activeAnimeProfileId,
           activeAnimeLanguageProfileId: sonarr?.activeAnimeLanguageProfileId,
           activeAnimeRootFolder: sonarr?.activeAnimeDirectory,
@@ -800,8 +800,8 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                         name="animeSeriesType"
                         disabled={!isValidated || isTesting}
                       >
-                        <option value="standard">Standard</option>
                         <option value="anime">Anime</option>
+                        <option value="standard">Standard</option>
                       </Field>
                     </div>
                   </div>
