@@ -29,6 +29,7 @@ import {
 } from 'typeorm';
 import Issue from './Issue';
 import { MediaRequest } from './MediaRequest';
+import MediaServiceStatus from './MediaServiceStatus';
 import Season from './Season';
 
 @Entity()
@@ -104,7 +105,7 @@ class Media {
     try {
       const media = await mediaRepository.findOne({
         where: { tmdbId: id, mediaType: mediaType },
-        relations: { requests: true, issues: true },
+        relations: { requests: true, issues: true, serviceStatuses: true },
       });
 
       return media ?? undefined;
@@ -156,6 +157,9 @@ class Media {
 
   @OneToMany(() => Issue, (issue) => issue.media, { cascade: true })
   public issues: Issue[];
+
+  @OneToMany(() => MediaServiceStatus, (serviceStatus) => serviceStatus.media)
+  public serviceStatuses: MediaServiceStatus[];
 
   @OneToOne(() => Blocklist, (blocklist) => blocklist.media)
   public blocklist: Promise<Blocklist>;
@@ -425,6 +429,27 @@ class Media {
         );
       }
     }
+
+    this.serviceStatuses?.forEach((serviceStatus) => {
+      if (
+        serviceStatus.externalServiceId === undefined ||
+        serviceStatus.externalServiceId === null
+      ) {
+        serviceStatus.downloadStatus = [];
+        return;
+      }
+
+      serviceStatus.downloadStatus =
+        serviceStatus.serviceType === 'sonarr'
+          ? downloadTracker.getSeriesProgress(
+              serviceStatus.serviceId,
+              serviceStatus.externalServiceId
+            )
+          : downloadTracker.getMovieProgress(
+              serviceStatus.serviceId,
+              serviceStatus.externalServiceId
+            );
+    });
   }
 
   public filter(user?: User): Media {

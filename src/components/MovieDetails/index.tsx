@@ -22,6 +22,7 @@ import PersonCard from '@app/components/PersonCard';
 import RequestButton from '@app/components/RequestButton';
 import Slider from '@app/components/Slider';
 import StatusBadge from '@app/components/StatusBadge';
+import ServiceStatusBadges from '@app/components/StatusBadge/ServiceStatusBadges';
 import useDeepLinks from '@app/hooks/useDeepLinks';
 import useLocale from '@app/hooks/useLocale';
 import useSettings from '@app/hooks/useSettings';
@@ -49,8 +50,13 @@ import {
   ChevronDoubleUpIcon,
 } from '@heroicons/react/24/solid';
 import { type RatingResponse } from '@server/api/ratings';
+import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import { IssueStatus } from '@server/constants/issue';
-import { MediaStatus, MediaType } from '@server/constants/media';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
 import { MediaServerType } from '@server/constants/server';
 import type { MovieDetails as MovieDetailsType } from '@server/models/Movie';
 import axios from 'axios';
@@ -508,41 +514,61 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
         </div>
         <div className="media-title">
           <div className="media-status">
-            <StatusBadge
-              status={data.mediaInfo?.status}
-              downloadItem={data.mediaInfo?.downloadStatus}
-              title={data.title}
-              inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
-              tmdbId={data.mediaInfo?.tmdbId}
-              mediaType="movie"
-              plexUrl={plexUrl}
-              serviceUrl={data.mediaInfo?.serviceUrl}
-            />
-            {settings.currentSettings.movie4kEnabled &&
-              hasPermission(
-                [
-                  Permission.MANAGE_REQUESTS,
-                  Permission.REQUEST_4K,
-                  Permission.REQUEST_4K_MOVIE,
-                ],
-                {
-                  type: 'or',
-                }
-              ) && (
+            {data.mediaInfo?.serviceStatuses?.some(
+              (ss) =>
+                ss.status !== MediaStatus.UNKNOWN &&
+                ss.status !== MediaStatus.DELETED
+            ) ||
+            data.mediaInfo?.requests?.some(
+              (request) =>
+                request.isServiceRequest &&
+                request.status === MediaRequestStatus.PENDING
+            ) ? (
+              <ServiceStatusBadges
+                serviceStatuses={data.mediaInfo.serviceStatuses}
+                requests={data.mediaInfo.requests}
+                mediaType="movie"
+                plexUrl={plexUrl}
+                tmdbId={data.mediaInfo.tmdbId}
+                title={data.title}
+              />
+            ) : (
+              <>
                 <StatusBadge
-                  status={data.mediaInfo?.status4k}
-                  downloadItem={data.mediaInfo?.downloadStatus4k}
+                  status={data.mediaInfo?.status}
+                  downloadItem={data.mediaInfo?.downloadStatus}
                   title={data.title}
-                  is4k
-                  inProgress={
-                    (data.mediaInfo?.downloadStatus4k ?? []).length > 0
-                  }
+                  inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
                   tmdbId={data.mediaInfo?.tmdbId}
                   mediaType="movie"
-                  plexUrl={plexUrl4k}
-                  serviceUrl={data.mediaInfo?.serviceUrl4k}
+                  plexUrl={plexUrl}
+                  serviceUrl={data.mediaInfo?.serviceUrl}
                 />
-              )}
+                {settings.currentSettings.movie4kEnabled &&
+                  hasPermission(
+                    [
+                      Permission.MANAGE_REQUESTS,
+                      Permission.REQUEST_4K,
+                      Permission.REQUEST_4K_MOVIE,
+                    ],
+                    { type: 'or' }
+                  ) && (
+                    <StatusBadge
+                      status={data.mediaInfo?.status4k}
+                      downloadItem={data.mediaInfo?.downloadStatus4k}
+                      title={data.title}
+                      is4k
+                      inProgress={
+                        (data.mediaInfo?.downloadStatus4k ?? []).length > 0
+                      }
+                      tmdbId={data.mediaInfo?.tmdbId}
+                      mediaType="movie"
+                      plexUrl={plexUrl4k}
+                      serviceUrl={data.mediaInfo?.serviceUrl4k}
+                    />
+                  )}
+              </>
+            )}
           </div>
           <h1 data-testid="media-title">
             {data.title}{' '}
@@ -628,6 +654,9 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
             media={data.mediaInfo}
             tmdbId={data.id}
             onUpdate={() => revalidate()}
+            isAnime={data.keywords.some(
+              (keyword) => keyword.id === ANIME_KEYWORD_ID
+            )}
           />
           {(data.mediaInfo?.status === MediaStatus.AVAILABLE ||
             (settings.currentSettings.movie4kEnabled &&
@@ -659,7 +688,9 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
             (data.mediaInfo.jellyfinMediaId ||
               data.mediaInfo.jellyfinMediaId4k ||
               data.mediaInfo.status !== MediaStatus.UNKNOWN ||
-              data.mediaInfo.status4k !== MediaStatus.UNKNOWN) && (
+              data.mediaInfo.status4k !== MediaStatus.UNKNOWN ||
+              (data.mediaInfo.serviceStatuses ?? []).length > 0 ||
+              (data.mediaInfo.requests ?? []).length > 0) && (
               <Tooltip content={intl.formatMessage(messages.managemovie)}>
                 <Button
                   buttonType="ghost"
@@ -973,13 +1004,15 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
                   <Link
                     href={`/discover/movies/language/${data.originalLanguage}`}
                   >
-                    {intl.formatDisplayName(data.originalLanguage, {
-                      type: 'language',
-                      fallback: 'none',
-                    }) ??
-                      data.spokenLanguages.find(
-                        (lng) => lng.iso_639_1 === data.originalLanguage
-                      )?.name}
+                    <span>
+                      {intl.formatDisplayName(data.originalLanguage, {
+                        type: 'language',
+                        fallback: 'none',
+                      }) ??
+                        data.spokenLanguages.find(
+                          (lng) => lng.iso_639_1 === data.originalLanguage
+                        )?.name}
+                    </span>
                   </Link>
                 </span>
               </div>

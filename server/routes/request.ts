@@ -131,6 +131,7 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
       let query = getRepository(MediaRequest)
         .createQueryBuilder('request')
         .leftJoinAndSelect('request.media', 'media')
+        .leftJoinAndSelect('media.serviceStatuses', 'serviceStatuses')
         .leftJoinAndSelect('request.seasons', 'seasons')
         .leftJoinAndSelect('request.modifiedBy', 'modifiedBy')
         .leftJoinAndSelect('request.requestedBy', 'requestedBy')
@@ -138,7 +139,7 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
           requestStatus: statusFilter,
         })
         .andWhere(
-          '((request.is4k = false AND media.status IN (:...mediaStatus)) OR (request.is4k = true AND media.status4k IN (:...mediaStatus)))',
+          '(request.isServiceRequest = true OR (request.is4k = false AND media.status IN (:...mediaStatus)) OR (request.is4k = true AND media.status4k IN (:...mediaStatus)))',
           {
             mediaStatus: mediaStatusFilter,
           }
@@ -223,21 +224,34 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
       let mappedRequests = requests.map((r) => {
         switch (r.type) {
           case MediaType.MOVIE: {
-            const profileName = radarrServers
-              .find((serverr) => serverr.id === r.serverId)
-              ?.profiles?.find((profile) => profile.id === r.profileId)?.name;
+            const radarrServer = radarrServers.find(
+              (serverr) => serverr.id === r.serverId
+            );
+            const profileName = radarrServer?.profiles?.find(
+              (profile) => profile.id === r.profileId
+            )?.name;
+            const serverName =
+              r.serverId != null
+                ? settings.radarr.find((s) => s.id === r.serverId)?.name
+                : undefined;
+
+            return { ...r, profileName, serverName };
+          }
+          case MediaType.TV: {
+            const sonarrServer = sonarrServers.find(
+              (serverr) => serverr.id === r.serverId
+            );
+            const serverName =
+              r.serverId != null
+                ? settings.sonarr.find((s) => s.id === r.serverId)?.name
+                : undefined;
 
             return {
               ...r,
-              profileName,
-            };
-          }
-          case MediaType.TV: {
-            return {
-              ...r,
-              profileName: sonarrServers
-                .find((serverr) => serverr.id === r.serverId)
-                ?.profiles?.find((profile) => profile.id === r.profileId)?.name,
+              profileName: sonarrServer?.profiles?.find(
+                (profile) => profile.id === r.profileId
+              )?.name,
+              serverName,
             };
           }
         }
@@ -437,7 +451,11 @@ requestRoutes.get('/:requestId', async (req, res, next) => {
   try {
     const request = await requestRepository.findOneOrFail({
       where: { id: Number(req.params.requestId) },
-      relations: { requestedBy: true, modifiedBy: true },
+      relations: {
+        requestedBy: true,
+        modifiedBy: true,
+        media: { serviceStatuses: true },
+      },
     });
 
     if (

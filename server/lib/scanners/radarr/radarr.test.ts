@@ -8,6 +8,7 @@ import {
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
+import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import { User } from '@server/entity/User';
 import { radarrScanner } from '@server/lib/scanners/radarr';
 import type { RadarrSettings } from '@server/lib/settings';
@@ -720,6 +721,55 @@ describe('Radarr Scanner', () => {
       assert.strictEqual(updatedMedia.status4k, MediaStatus.UNKNOWN);
       assert.strictEqual(updatedStandard.status, MediaRequestStatus.APPROVED);
       assert.strictEqual(updated4k.status, MediaRequestStatus.DECLINED);
+    });
+  });
+
+  describe('per-service status', () => {
+    async function seedServiceStatus(tmdbId: number): Promise<number> {
+      const media = new Media();
+      media.tmdbId = tmdbId;
+      media.mediaType = MediaType.MOVIE;
+      media.status = MediaStatus.AVAILABLE;
+      await getRepository(Media).save(media);
+
+      await getRepository(MediaServiceStatus).save(
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 0,
+          serviceType: 'radarr',
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+
+      return media.id;
+    }
+
+    it('keeps per-service status when the server returns no movies', async () => {
+      const mediaId = await seedServiceStatus(560);
+
+      configureRadarr([{ syncEnabled: true }]);
+      getMoviesImpl = async () => [];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      const serviceStatus = await getRepository(
+        MediaServiceStatus
+      ).findOneOrFail({ where: { mediaId, serviceId: 0 } });
+      assert.strictEqual(serviceStatus.status, MediaStatus.AVAILABLE);
+    });
+
+    it('resets per-service status for a movie removed from the server', async () => {
+      const mediaId = await seedServiceStatus(561);
+
+      configureRadarr([{ syncEnabled: true }]);
+      getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 562, id: 98 })];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      const serviceStatus = await getRepository(
+        MediaServiceStatus
+      ).findOneOrFail({ where: { mediaId, serviceId: 0 } });
+      assert.strictEqual(serviceStatus.status, MediaStatus.UNKNOWN);
     });
   });
 });

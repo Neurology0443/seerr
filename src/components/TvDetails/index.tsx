@@ -24,6 +24,7 @@ import RequestButton from '@app/components/RequestButton';
 import RequestModal from '@app/components/RequestModal';
 import Slider from '@app/components/Slider';
 import StatusBadge from '@app/components/StatusBadge';
+import ServiceStatusBadges from '@app/components/StatusBadge/ServiceStatusBadges';
 import Season from '@app/components/TvDetails/Season';
 import useDeepLinks from '@app/hooks/useDeepLinks';
 import useLocale from '@app/hooks/useLocale';
@@ -564,41 +565,61 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
         </div>
         <div className="media-title">
           <div className="media-status">
-            <StatusBadge
-              status={data.mediaInfo?.status}
-              downloadItem={data.mediaInfo?.downloadStatus}
-              title={data.name}
-              inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
-              tmdbId={data.mediaInfo?.tmdbId}
-              mediaType="tv"
-              plexUrl={plexUrl}
-              serviceUrl={data.mediaInfo?.serviceUrl}
-            />
-            {settings.currentSettings.series4kEnabled &&
-              hasPermission(
-                [
-                  Permission.MANAGE_REQUESTS,
-                  Permission.REQUEST_4K,
-                  Permission.REQUEST_4K_TV,
-                ],
-                {
-                  type: 'or',
-                }
-              ) && (
+            {data.mediaInfo?.serviceStatuses?.some(
+              (ss) =>
+                ss.status !== MediaStatus.UNKNOWN &&
+                ss.status !== MediaStatus.DELETED
+            ) ||
+            data.mediaInfo?.requests?.some(
+              (request) =>
+                request.isServiceRequest &&
+                request.status === MediaRequestStatus.PENDING
+            ) ? (
+              <ServiceStatusBadges
+                serviceStatuses={data.mediaInfo.serviceStatuses}
+                requests={data.mediaInfo.requests}
+                mediaType="tv"
+                plexUrl={plexUrl}
+                tmdbId={data.mediaInfo.tmdbId}
+                title={data.name}
+              />
+            ) : (
+              <>
                 <StatusBadge
-                  status={data.mediaInfo?.status4k}
-                  downloadItem={data.mediaInfo?.downloadStatus4k}
+                  status={data.mediaInfo?.status}
+                  downloadItem={data.mediaInfo?.downloadStatus}
                   title={data.name}
-                  is4k
-                  inProgress={
-                    (data.mediaInfo?.downloadStatus4k ?? []).length > 0
-                  }
+                  inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
                   tmdbId={data.mediaInfo?.tmdbId}
                   mediaType="tv"
-                  plexUrl={plexUrl4k}
-                  serviceUrl={data.mediaInfo?.serviceUrl4k}
+                  plexUrl={plexUrl}
+                  serviceUrl={data.mediaInfo?.serviceUrl}
                 />
-              )}
+                {settings.currentSettings.series4kEnabled &&
+                  hasPermission(
+                    [
+                      Permission.MANAGE_REQUESTS,
+                      Permission.REQUEST_4K,
+                      Permission.REQUEST_4K_TV,
+                    ],
+                    { type: 'or' }
+                  ) && (
+                    <StatusBadge
+                      status={data.mediaInfo?.status4k}
+                      downloadItem={data.mediaInfo?.downloadStatus4k}
+                      title={data.name}
+                      is4k
+                      inProgress={
+                        (data.mediaInfo?.downloadStatus4k ?? []).length > 0
+                      }
+                      tmdbId={data.mediaInfo?.tmdbId}
+                      mediaType="tv"
+                      plexUrl={plexUrl4k}
+                      serviceUrl={data.mediaInfo?.serviceUrl4k}
+                    />
+                  )}
+              </>
+            )}
           </div>
           <h1 data-testid="media-title">
             {data.name}{' '}
@@ -686,6 +707,9 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
             media={data?.mediaInfo}
             isShowComplete={isComplete}
             is4kShowComplete={is4kComplete}
+            isAnime={data.keywords.some(
+              (keyword) => keyword.id === ANIME_KEYWORD_ID
+            )}
           />
           {(data.mediaInfo?.status === MediaStatus.AVAILABLE ||
             data.mediaInfo?.status === MediaStatus.PARTIALLY_AVAILABLE ||
@@ -919,34 +943,41 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                               </div>
                             </>
                           )}
-                          {mSeason?.status ===
-                            MediaStatus.PARTIALLY_AVAILABLE && (
+                          {(mSeason?.status ===
+                            MediaStatus.PARTIALLY_AVAILABLE ||
+                            mSeason?.status === MediaStatus.AVAILABLE) && (
                             <>
-                              <div className="hidden md:flex">
-                                <Badge badgeType="success">
-                                  {intl.formatMessage(
-                                    globalMessages.partiallyavailable
-                                  )}
-                                </Badge>
+                              <div className="hidden items-center space-x-1 md:flex">
+                                {(data.mediaInfo?.serviceStatuses ?? []).some(
+                                  (ss) => {
+                                    const st =
+                                      ss.seasonStatuses?.[season.seasonNumber];
+                                    return (
+                                      st !== undefined &&
+                                      st !== MediaStatus.UNKNOWN &&
+                                      st !== MediaStatus.DELETED
+                                    );
+                                  }
+                                ) ? (
+                                  <ServiceStatusBadges
+                                    serviceStatuses={
+                                      data.mediaInfo?.serviceStatuses
+                                    }
+                                    mediaType="tv"
+                                    seasonNumber={season.seasonNumber}
+                                  />
+                                ) : (
+                                  <Badge badgeType="success">
+                                    {intl.formatMessage(
+                                      mSeason?.status === MediaStatus.AVAILABLE
+                                        ? globalMessages.available
+                                        : globalMessages.partiallyavailable
+                                    )}
+                                  </Badge>
+                                )}
                               </div>
                               <div className="flex md:hidden">
-                                <StatusBadgeMini
-                                  status={MediaStatus.PARTIALLY_AVAILABLE}
-                                />
-                              </div>
-                            </>
-                          )}
-                          {mSeason?.status === MediaStatus.AVAILABLE && (
-                            <>
-                              <div className="hidden md:flex">
-                                <Badge badgeType="success">
-                                  {intl.formatMessage(globalMessages.available)}
-                                </Badge>
-                              </div>
-                              <div className="flex md:hidden">
-                                <StatusBadgeMini
-                                  status={MediaStatus.AVAILABLE}
-                                />
+                                <StatusBadgeMini status={mSeason!.status} />
                               </div>
                             </>
                           )}
@@ -1230,13 +1261,15 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 <span>{intl.formatMessage(messages.originallanguage)}</span>
                 <span className="media-fact-value">
                   <Link href={`/discover/tv/language/${data.originalLanguage}`}>
-                    {intl.formatDisplayName(data.originalLanguage, {
-                      type: 'language',
-                      fallback: 'none',
-                    }) ??
-                      data.spokenLanguages.find(
-                        (lng) => lng.iso_639_1 === data.originalLanguage
-                      )?.name}
+                    <span>
+                      {intl.formatDisplayName(data.originalLanguage, {
+                        type: 'language',
+                        fallback: 'none',
+                      }) ??
+                        data.spokenLanguages.find(
+                          (lng) => lng.iso_639_1 === data.originalLanguage
+                        )?.name}
+                    </span>
                   </Link>
                 </span>
               </div>
