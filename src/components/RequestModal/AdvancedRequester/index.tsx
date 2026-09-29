@@ -72,10 +72,6 @@ interface AdvancedRequesterProps {
   defaultOverrides?: RequestOverrides;
   requestUser?: User;
   requestId?: number;
-  // When true, the destination server is fixed by a per-service request
-  // button: the server, root folder, and language profile selectors are
-  // hidden (the targeted service's defaults apply). Quality profile, tags,
-  // and "Request As" remain available.
   serverFixed?: boolean;
   quota?: { movie: { limit?: number }; tv: { limit?: number } };
   onChange: (overrides: RequestOverrides) => void;

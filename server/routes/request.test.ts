@@ -1642,21 +1642,17 @@ describe('POST /request, per-service slots', () => {
     const friend = await loginAs('demo@seerr.dev', 'test1234');
     const admin = await loginAs('admin@seerr.dev', 'test1234');
 
-    // A plain request occupies the standard slot.
     const standard = await friend
       .post('/request')
       .send({ mediaType: 'movie', mediaId: 99901 });
     assert.strictEqual(standard.status, 201);
     assert.strictEqual(standard.body.isServiceRequest, false);
 
-    // An advanced request pinning a destination server still occupies the
-    // standard slot, so it is a duplicate of the request above.
     const advanced = await admin
       .post('/request')
       .send({ mediaType: 'movie', mediaId: 99901, serverId: 0 });
     assert.strictEqual(advanced.status, 409);
 
-    // A service-specific request occupies its own per-service slot.
     const service = await friend.post('/request').send({
       mediaType: 'movie',
       mediaId: 99901,
@@ -1666,7 +1662,6 @@ describe('POST /request, per-service slots', () => {
     assert.strictEqual(service.status, 201);
     assert.strictEqual(service.body.isServiceRequest, true);
 
-    // ...but only one request per service is allowed.
     const duplicateService = await friend.post('/request').send({
       mediaType: 'movie',
       mediaId: 99901,
@@ -1675,7 +1670,6 @@ describe('POST /request, per-service slots', () => {
     });
     assert.strictEqual(duplicateService.status, 409);
 
-    // A different service is a separate slot.
     const otherService = await friend.post('/request').send({
       mediaType: 'movie',
       mediaId: 99901,

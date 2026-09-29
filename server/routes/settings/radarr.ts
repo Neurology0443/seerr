@@ -149,7 +149,6 @@ radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   const removed = settings.radarr.splice(radarrIndex, 1);
   await settings.save();
 
-  // Server IDs are reused, so drop the deleted server's per-user grants
   await removeRequestServiceGrants('radarr', removed[0].id);
 
   return res.status(200).json(removed[0]);

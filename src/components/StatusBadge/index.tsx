@@ -22,8 +22,6 @@ const messages = defineMessages('components.StatusBadge', {
   seasonepisodenumber: 'S{seasonNumber}E{episodeNumber}',
 });
 
-// Resolves the localized status label, accounting for an in-progress download
-// (which always reads as "Processing" regardless of the underlying status).
 export const getStatusLabel = (
   intl: IntlShape,
   status?: MediaStatus,
@@ -190,7 +188,6 @@ const StatusBadge = ({
       status: getStatusLabel(intl, status, inProgress),
     });
 
-  // Simple, non-progress badges.
   if (status === MediaStatus.PENDING) {
     return (
       <Tooltip content={mediaLinkDescription}>
@@ -215,8 +212,6 @@ const StatusBadge = ({
     );
   }
 
-  // Progress-capable badges (available / partially available / processing /
-  // deleted) all share the same layout and only differ by badge color.
   const badgeTypeByStatus: Partial<
     Record<MediaStatus, 'success' | 'primary' | 'danger'>
   > = {

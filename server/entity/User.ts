@@ -106,11 +106,6 @@ export class User {
   @Column({ type: 'integer', default: 0 })
   public permissions = 0;
 
-  /**
-   * Service identifiers ("radarr:<id>" / "sonarr:<id>") this user is allowed to
-   * submit per-service requests to. Empty/null means the user only sees the
-   * default request button. Stored as JSON text for database portability.
-   */
   @Column({
     type: 'text',
     nullable: true,

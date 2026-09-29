@@ -239,7 +239,6 @@ const ManageSlideOver = ({
     return `${base}/${type}/${slug}`;
   };
 
-  // Compute per-service links from MediaServiceStatus entries
   const serviceLinks: {
     name: string;
     url: string;

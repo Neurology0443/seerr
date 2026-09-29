@@ -9,11 +9,6 @@ import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { DataSource } from 'typeorm';
 
-// This suite uses its own file-backed SQLite database (not the shared in-memory
-// test datasource) so it can reproduce the exact failure deterministically: the
-// bug only surfaces when the conflicting upsert is the FIRST write on a fresh
-// connection, i.e. when last_insert_rowid() is still 0.
-
 describe('upsertMediaServiceStatus', () => {
   let dir: string;
   let dbPath: string;
@@ -32,18 +27,14 @@ describe('upsertMediaServiceStatus', () => {
       type: 'sqlite',
       database: dbPath,
       synchronize: true,
-      // Full entity list so related entities (Media and its graph) resolve.
       entities,
     });
     await ds.initialize();
-    // The FK to `media` is irrelevant to this unit; skip it so we don't have to
-    // materialize a full Media row.
     await ds.query('PRAGMA foreign_keys = OFF');
     return ds;
   }
 
   it('updates an existing row when the upsert is the first write on a fresh connection', async () => {
-    // Connection A seeds the conflicting row, then disconnects.
     const dsA = await connect();
     await upsertMediaServiceStatus(dsA.getRepository(MediaServiceStatus), {
       mediaId: 42,
@@ -53,9 +44,6 @@ describe('upsertMediaServiceStatus', () => {
     });
     await dsA.destroy();
 
-    // Connection B is fresh (last_insert_rowid() === 0). The upsert below hits
-    // the existing (mediaId, serviceId) row and must take the DO UPDATE branch
-    // without throwing "Cannot update entity because entity id is not set".
     const dsB = await connect();
     const repoB = dsB.getRepository(MediaServiceStatus);
     try {
@@ -101,7 +89,6 @@ describe('upsertMediaServiceStatus', () => {
 
   it('does not overwrite seasonStatuses unless explicitly requested', async () => {
     const dsA = await connect();
-    // Scan writes per-season data (overwrite includes seasonStatuses).
     await upsertMediaServiceStatus(
       dsA.getRepository(MediaServiceStatus),
       {
@@ -115,8 +102,6 @@ describe('upsertMediaServiceStatus', () => {
     );
     await dsA.destroy();
 
-    // A subscriber-style upsert (default overwrite, no seasonStatuses) must keep
-    // the season data set by the scan.
     const dsB = await connect();
     const repoB = dsB.getRepository(MediaServiceStatus);
     try {

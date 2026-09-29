@@ -32,7 +32,6 @@ const RequestServicesEdit = ({ value, onChange }: RequestServicesEditProps) => {
     '/api/v1/service/sonarr'
   );
 
-  // Only services with a request button label produce a per-service button
   const services: { id: string; name: string; isMovie: boolean }[] = [
     ...(radarrServices ?? [])
       .filter((s) => s.buttonLabel)
@@ -85,7 +84,6 @@ const RequestServicesEdit = ({ value, onChange }: RequestServicesEditProps) => {
         </p>
       ) : (
         <div className="max-w-3xl">
-          {/* Parent: All Services */}
           <div className="relative flex items-start">
             <div className="flex h-6 items-center">
               <input
@@ -110,7 +108,6 @@ const RequestServicesEdit = ({ value, onChange }: RequestServicesEditProps) => {
             </div>
           </div>
 
-          {/* Children: individual services */}
           {services.map((service) => {
             const checked = allSelected || value.includes(service.id);
             return (
@@ -132,33 +129,21 @@ const RequestServicesEdit = ({ value, onChange }: RequestServicesEditProps) => {
                   <div className="ml-3 text-sm leading-6">
                     <label
                       htmlFor={`request-service-${service.id}`}
-                      className="block"
+                      className="flex flex-col"
                     >
-                      <div className="flex flex-col">
-                        <span className="font-medium text-white">
-                          {intl.formatMessage(
-                            service.isMovie
-                              ? messages.radarrService
-                              : messages.sonarrService,
-                            { name: service.name }
-                          )}
-                        </span>
-                        {/* Provide visually hidden text for the label to satisfy accessibility lint */}
-                        <span className="sr-only">
-                          {service.isMovie
-                            ? intl.formatMessage(messages.radarrService, {
-                                name: service.name,
-                              })
-                            : intl.formatMessage(messages.sonarrService, {
-                                name: service.name,
-                              })}
-                        </span>
-                        <span className="font-normal text-gray-400">
-                          {intl.formatMessage(messages.serviceDescription, {
-                            name: service.name,
-                          })}
-                        </span>
-                      </div>
+                      <span className="font-medium text-white">
+                        {intl.formatMessage(
+                          service.isMovie
+                            ? messages.radarrService
+                            : messages.sonarrService,
+                          { name: service.name }
+                        )}
+                      </span>
+                      <span className="font-normal text-gray-400">
+                        {intl.formatMessage(messages.serviceDescription, {
+                          name: service.name,
+                        })}
+                      </span>
                     </label>
                   </div>
                 </div>

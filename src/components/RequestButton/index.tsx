@@ -83,8 +83,7 @@ const RequestButton = ({
     mediaType === 'movie' ? '/api/v1/service/radarr' : '/api/v1/service/sonarr';
   const { data: allServices } = useSWR<ServiceCommonServer[]>(serviceEndpoint);
 
-  // All pending requests occupying the Standard/4K slots (service-specific
-  // requests live in their own per-service slots and are handled below)
+  // All pending requests
   const activeRequests = media?.requests.filter(
     (request) =>
       request.status === MediaRequestStatus.PENDING &&
@@ -289,10 +288,6 @@ const RequestButton = ({
     }
   }
 
-  // When a (non-managing) user has been granted specific request services
-  // for this media type, the default request button is replaced entirely by
-  // their per-service buttons. Grants for the other media type don't count —
-  // a user with only Radarr grants still gets the default button on TV pages.
   const servicePrefix = mediaType === 'movie' ? 'radarr' : 'sonarr';
   const restrictToServices =
     (user?.requestServices ?? []).some((service) =>
@@ -396,17 +391,13 @@ const RequestButton = ({
     });
   }
 
-  // Per-service request buttons: show a button for every configured service that has a buttonLabel set
   const labelledServices = (allServices ?? []).filter((s) => s.buttonLabel);
 
   for (const service of labelledServices) {
-    // Anime-only services only expose their button for anime content
     if (service.animeOnly && !isAnime) {
       continue;
     }
 
-    // Hide the request button if the media already exists in this service
-    // (available, processing/downloading, or partially available)
     const serviceStatusEntry = media?.serviceStatuses?.find(
       (ss) => ss.serviceId === service.id
     );
@@ -418,8 +409,6 @@ const RequestButton = ({
       continue;
     }
 
-    // Per-service access control: a user only sees a service's request button
-    // if they manage requests, or the service is in their allowed list.
     const serviceIdentifier = `${servicePrefix}:${service.id}`;
     const canUseService =
       hasPermission(Permission.MANAGE_REQUESTS) ||
@@ -435,8 +424,6 @@ const RequestButton = ({
       (r) => r.requestedBy.id === user?.id
     );
 
-    // Hide the service entirely if the user can't use it and has no pending
-    // request of their own to view/cancel.
     if (!canUseService && !userServiceRequest) {
       continue;
     }
@@ -459,8 +446,6 @@ const RequestButton = ({
         svg: <InformationCircleIcon />,
       });
 
-      // Managers get inline approve/decline for this service's pending
-      // requests, mirroring the standard request button's dropdown entries.
       if (
         activeServiceRequests &&
         activeServiceRequests.length > 0 &&
@@ -516,9 +501,6 @@ const RequestButton = ({
 
   const [buttonOne, ...others] = buttons;
 
-  // Pending request for the service targeted by the per-service modal:
-  // the user's own request if they have one, otherwise the first pending one
-  // (only reachable by users with MANAGE_REQUESTS).
   const pendingServiceRequests =
     activeServiceModal.serverId !== null
       ? media?.requests.filter(

@@ -372,7 +372,6 @@ const MovieRequestModal = ({
         { type: 'or' }
       ) &&
         (serverId != null ? (
-          // Per-service request: server is fixed by the button, only tags are editable
           <AdvancedRequester
             tmdbId={tmdbId}
             type="movie"

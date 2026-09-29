@@ -776,7 +776,6 @@ userSettingsRoutes.post<
       user.permissions = req.body.permissions;
 
       if (req.body.requestServices !== undefined) {
-        // Only keep well-formed "radarr:<id>" / "sonarr:<id>" entries
         user.requestServices = req.body.requestServices.filter((s) =>
           /^(radarr|sonarr):\d+$/.test(s)
         );

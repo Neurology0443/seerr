@@ -45,11 +45,6 @@ const sanitizeDisplayName = (displayName: string): string => {
 
 @EventSubscriber()
 export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRequest> {
-  /**
-   * Resolves the display label of the service targeted by a service-specific
-   * request (the request button label when set, otherwise the server name).
-   * Returns undefined for regular requests so notification text is unchanged.
-   */
   private getServiceLabel(entity: MediaRequest): string | undefined {
     if (!entity.isServiceRequest || entity.serverId == null) {
       return undefined;
@@ -79,8 +74,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       });
     }
 
-    // For service-specific requests, skip the global status check — the request
-    // being COMPLETED is sufficient signal that it's available in that service.
+    // Check availability using fresh media state
     if (!latestMedia) {
       return;
     }
@@ -151,8 +145,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       return;
     }
 
-    // For service-specific requests, the COMPLETED request status is enough
-    // to notify — skip the global season availability check.
+    // Check availability using fresh media state
     if (!entity.isServiceRequest) {
       const requestedSeasons =
         entity.seasons?.map((entitySeason) => entitySeason.seasonNumber) ?? [];
@@ -328,8 +321,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           return;
         }
 
-        // For service-specific requests, only skip if THAT specific service
-        // already has the media — not just any service.
         const isAlreadyAvailable =
           entity.isServiceRequest && entity.serverId != null
             ? await (async () => {
@@ -436,9 +427,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               throw new Error('Media data not found');
             }
 
-            // Service-specific requests don't claim the standard external
-            // service slots on the media row; the per-service status below
-            // records the linkage instead.
             if (!entity.isServiceRequest) {
               media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
                 radarrMovie.id;
@@ -450,7 +438,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               await mediaRepository.save(media);
             }
 
-            // Record per-service status for this Radarr instance.
             if (radarrSettings?.id !== undefined) {
               await upsertMediaServiceStatus(
                 getRepository(MediaServiceStatus),
@@ -815,9 +802,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               throw new Error('Media data not found');
             }
 
-            // Service-specific requests don't claim the standard external
-            // service slots on the media row; the per-service status below
-            // records the linkage instead.
             if (!entity.isServiceRequest) {
               media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
                 sonarrSeries.id;
@@ -829,7 +813,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               await mediaRepository.save(media);
             }
 
-            // Record per-service status for this Sonarr instance.
             if (sonarrSettings?.id !== undefined) {
               await upsertMediaServiceStatus(
                 getRepository(MediaServiceStatus),
@@ -945,10 +928,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     const seasonRequestRepository = manager.getRepository(SeasonRequest);
     const requestRepository = manager.getRepository(MediaRequest);
 
-    // Service-specific requests never claim the Standard/4K media status
-    // slots — their state lives on the request itself and in
-    // MediaServiceStatus. Only the request's own child seasons are updated
-    // for them (see the APPROVED/DECLINED season blocks below).
     if (
       !entity.isServiceRequest &&
       entity.status === MediaRequestStatus.APPROVED &&
@@ -1072,8 +1051,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     manager: EntityManager,
     entity: MediaRequest
   ): Promise<void> {
-    // Removing a service-specific request never affects the Standard/4K
-    // media status slots — it never claimed them.
     if (entity.isServiceRequest) {
       return;
     }

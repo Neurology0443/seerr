@@ -215,7 +215,6 @@ mediaRoutes.delete(
 
       const is4k = String(req.query.is4k) === 'true';
       const isMovie = media.mediaType === MediaType.MOVIE;
-      // Optional explicit serviceId (for per-service delete from a specific instance)
       const explicitServiceId = req.query.serviceId
         ? Number(req.query.serviceId)
         : undefined;
@@ -225,7 +224,6 @@ mediaRoutes.delete(
       let serviceSettings;
 
       if (isServiceDelete) {
-        // Caller specified exactly which service to delete from
         serviceSettings = isMovie
           ? settings.radarr.find((r) => r.id === explicitServiceId)
           : settings.sonarr.find((s) => s.id === explicitServiceId);
@@ -297,7 +295,6 @@ mediaRoutes.delete(
         }
         await (service as SonarrAPI).removeSeries(tvdbId);
 
-        // Per-service deletes leave the shared season status untouched
         if (!isServiceDelete) {
           for (const season of media.seasons) {
             season[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
@@ -305,9 +302,6 @@ mediaRoutes.delete(
         }
       }
 
-      // For a per-service delete, clear only this service's tracking state so
-      // the media row (and every other service's availability) is preserved.
-      // The caller is expected NOT to follow up with a full media delete.
       if (isServiceDelete) {
         await getRepository(MediaServiceStatus)
           .createQueryBuilder()
@@ -316,8 +310,6 @@ mediaRoutes.delete(
           .andWhere('serviceId = :serviceId', { serviceId: explicitServiceId })
           .execute();
 
-        // Also remove this service's requests so the title can be requested
-        // in this service again (mirrors the full-media delete, scoped).
         await getRepository(MediaRequest)
           .createQueryBuilder()
           .delete()

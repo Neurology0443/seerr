@@ -180,11 +180,6 @@ export class MediaRequest {
       relations: ['requests'],
     });
 
-    // A request explicitly targeting a specific service (per-service request
-    // button) does not affect the Standard/4K media status slots — those remain
-    // meaningful only for the default servers. The explicit flag distinguishes
-    // these from advanced requests, which also carry a serverId but still
-    // occupy the regular Standard/4K slot.
     const isServiceSpecific =
       !!requestBody.isServiceRequest &&
       requestBody.serverId !== undefined &&
@@ -197,9 +192,6 @@ export class MediaRequest {
       );
     }
 
-    // Per-service requests are gated by the user's service grants
-    // (User.requestServices) unless they can manage requests. This mirrors
-    // the client-side filtering in RequestButton, which only hides buttons.
     if (
       isServiceSpecific &&
       !user.hasPermission(Permission.MANAGE_REQUESTS) &&
@@ -258,11 +250,6 @@ export class MediaRequest {
       }
     }
 
-    // Duplicate detection:
-    // - A service-specific request occupies its own per-service slot: one
-    //   request per (service, media) is allowed.
-    // - All other requests (including advanced requests that pin a server)
-    //   occupy the regular slot: one request per is4k slot is allowed.
     const existingQuery = requestRepository
       .createQueryBuilder('request')
       .leftJoin('request.media', 'media')
@@ -445,8 +432,6 @@ export class MediaRequest {
       if (media.requests) {
         existingSeasons = media.requests
           .filter((request) => {
-            // Service-specific requests deduplicate within their own
-            // per-service slot; everything else within the is4k slot.
             const sameSlot = isServiceSpecific
               ? request.isServiceRequest &&
                 request.serverId === requestBody.serverId
@@ -466,10 +451,7 @@ export class MediaRequest {
           }, [] as number[]);
       }
 
-      // We should also check seasons that are available/partially available
-      // but don't have existing requests. For a service-specific request the
-      // relevant availability is the targeted service's own season statuses —
-      // a season available elsewhere must still be requestable here.
+      // We should also check seasons that are available/partially available but don't have existing requests
       if (isServiceSpecific) {
         if (media.id) {
           const serviceStatus = await getRepository(MediaServiceStatus).findOne(
@@ -644,12 +626,6 @@ export class MediaRequest {
   @Column({ nullable: true })
   public serverId: number;
 
-  /**
-   * True when this request explicitly targets a specific service via a
-   * per-service request button (occupying that service's slot rather than the
-   * Standard/4K slot). Advanced requests that merely pin a destination server
-   * keep this false.
-   */
   @Column({ default: false })
   public isServiceRequest: boolean;
 

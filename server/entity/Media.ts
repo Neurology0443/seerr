@@ -158,15 +158,6 @@ class Media {
   @OneToMany(() => Issue, (issue) => issue.media, { cascade: true })
   public issues: Issue[];
 
-  // NOTE: intentionally NOT `cascade` — service statuses are written only via
-  // the scanners/subscriber (explicit repository upserts). Cascading would cause
-  // any media save (e.g. a Plex/Jellyfin library scan) to clobber the per-service
-  // availability that was set by the Radarr/Sonarr scans.
-  //
-  // Also intentionally NOT `eager` — only the single-item detail view renders
-  // per-service badges, so it's loaded explicitly via `Media.getMedia()`.
-  // Leaving it eager would join media_service_status onto every Media query,
-  // including the large Discover/search/recommendation lists that never use it.
   @OneToMany(() => MediaServiceStatus, (serviceStatus) => serviceStatus.media)
   public serviceStatuses: MediaServiceStatus[];
 
@@ -439,8 +430,6 @@ class Media {
       }
     }
 
-    // Populate per-service download progress so the per-service status badges
-    // can surface the same live progress as the legacy status badge.
     this.serviceStatuses?.forEach((serviceStatus) => {
       if (
         serviceStatus.externalServiceId === undefined ||

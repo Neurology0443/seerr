@@ -123,7 +123,6 @@ sonarrRoutes.delete<{ id: string }>('/:id', async (req, res) => {
   const removed = settings.sonarr.splice(sonarrIndex, 1);
   await settings.save();
 
-  // Server IDs are reused, so drop the deleted server's per-user grants
   await removeRequestServiceGrants('sonarr', removed[0].id);
 
   return res.status(200).json(removed[0]);

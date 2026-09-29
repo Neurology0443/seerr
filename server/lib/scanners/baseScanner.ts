@@ -214,7 +214,6 @@ class BaseScanner<T> {
           this.log(`Title already exists and no changes detected for ${title}`);
         }
 
-        // Update per-service availability tracking
         if (serviceId !== undefined) {
           const serviceStatus =
             !processing && hasFile
@@ -279,7 +278,6 @@ class BaseScanner<T> {
         await mediaRepository.save(newMedia);
         this.log(`Saved new media: ${title}`);
 
-        // Record per-service availability for the new media entry
         if (serviceId !== undefined && newMedia.id) {
           const serviceStatus =
             !processing && hasFile
@@ -587,8 +585,6 @@ class BaseScanner<T> {
         await mediaRepository.save(media);
         this.log(`Updating existing title: ${title}`);
 
-        // Update per-service availability for this Sonarr instance, computed
-        // from this server's own season data (not the combined media.status).
         if (serviceId !== undefined) {
           const { overall, perSeason } = this.computeSeasonServiceStatuses(
             seasons,
@@ -702,8 +698,6 @@ class BaseScanner<T> {
         await mediaRepository.save(newMedia);
         this.log(`Saved ${title}`);
 
-        // Record per-service availability for the new TV media entry, computed
-        // from this server's own season data (not the combined media.status).
         if (serviceId !== undefined && newMedia.id) {
           const { overall, perSeason } = this.computeSeasonServiceStatuses(
             seasons,
@@ -866,17 +860,6 @@ class BaseScanner<T> {
     logger[level](message, { label: this.scannerName, ...optional });
   }
 
-  /**
-   * Computes the availability status of a TV title within a single service,
-   * using only that server's per-season episode counts. Returns both the
-   * overall (rolled-up) status and a per-season status map so the frontend can
-   * show per-service badges at both the show and season level.
-   *
-   * Using the per-server season data (rather than media.status) is essential:
-   * media.status reflects the combined state across ALL servers, so a title
-   * available in one Sonarr instance would otherwise leak that status into
-   * every other instance.
-   */
   protected computeSeasonServiceStatuses(
     seasons: ProcessableSeason[],
     is4k: boolean
@@ -899,7 +882,6 @@ class BaseScanner<T> {
 
     for (const s of seasons) {
       const status = statusForSeason(s);
-      // Only record seasons that this server actually has/knows about
       if (status !== MediaStatus.UNKNOWN) {
         perSeason[s.seasonNumber] = status;
       }
@@ -939,7 +921,6 @@ class BaseScanner<T> {
     seasonStatuses: Record<number, MediaStatus> | null = null
   ): Promise<void> {
     const repo = getRepository(MediaServiceStatus);
-    // Scans own the per-season data, so they overwrite seasonStatuses too.
     await upsertMediaServiceStatus(
       repo,
       {
@@ -954,9 +935,6 @@ class BaseScanner<T> {
       ['status', 'externalServiceId', 'externalServiceSlug', 'seasonStatuses']
     );
 
-    // Service requests aren't completed by the media subscriber (their
-    // availability isn't reflected in media.status), so the scan is the
-    // signal that the service now has the title.
     if (
       status === MediaStatus.AVAILABLE ||
       Object.values(seasonStatuses ?? {}).some(
@@ -972,12 +950,6 @@ class BaseScanner<T> {
     }
   }
 
-  /**
-   * Transitions this service's APPROVED service-specific requests to
-   * COMPLETED once the title (movies) or every requested season (TV) is
-   * available in the service. Requests are saved through the repository so
-   * the MediaRequest subscriber fires the availability notification.
-   */
   private async completeAvailableServiceRequests(
     mediaId: number,
     serviceId: number,
@@ -1015,21 +987,6 @@ class BaseScanner<T> {
     }
   }
 
-  /**
-   * Resets this server's MediaServiceStatus rows for titles that were NOT
-   * seen during the scan that just finished (i.e. they were removed from the
-   * server). Rows already UNKNOWN or DELETED are left alone.
-   *
-   * The diff is computed in memory and the updates are issued by primary key
-   * in chunks: passing the scanned id set as bound `IN (...)` parameters
-   * would exceed SQLite/Postgres parameter limits on large libraries.
-   *
-   * NOTE: Radarr and Sonarr server IDs are independent sequences (both start
-   * at 0), so candidates MUST be scoped by serviceType — otherwise a Radarr
-   * reset would clobber Sonarr rows sharing the same numeric serviceId.
-   * `clearSeasonStatuses` keeps the per-season map in sync with the overall
-   * status for Sonarr so the two can never diverge.
-   */
   protected async resetStaleServiceStatus({
     serviceId,
     serviceType,

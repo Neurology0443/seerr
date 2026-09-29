@@ -42,11 +42,6 @@ class MediaServiceStatus {
   @Column({ nullable: true, type: 'varchar' })
   public externalServiceSlug: string | null;
 
-  /**
-   * Per-season availability within this service, keyed by season number.
-   * Only relevant for Sonarr (TV) services. Stored as JSON text so it is
-   * database-agnostic (SQLite + Postgres).
-   */
   @Column({
     type: 'text',
     nullable: true,
@@ -67,10 +62,6 @@ class MediaServiceStatus {
   })
   public seasonStatuses: Record<number, MediaStatus> | null;
 
-  /**
-   * Live download progress for this specific service, populated on load by
-   * {@link Media.getDownloadingItem}. Not persisted.
-   */
   public downloadStatus?: DownloadingItem[] = [];
 
   constructor(init?: Partial<MediaServiceStatus>) {
