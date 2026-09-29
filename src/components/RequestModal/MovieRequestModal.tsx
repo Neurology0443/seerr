@@ -370,30 +370,19 @@ const MovieRequestModal = ({
       {hasPermission(
         [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
         { type: 'or' }
-      ) &&
-        (serverId != null ? (
-          <AdvancedRequester
-            tmdbId={tmdbId}
-            type="movie"
-            is4k={is4k}
-            quota={quota}
-            serverFixed
-            defaultOverrides={{ server: serverId }}
-            onChange={(overrides) => {
-              setRequestOverrides(overrides);
-            }}
-          />
-        ) : (
-          <AdvancedRequester
-            tmdbId={tmdbId}
-            type="movie"
-            is4k={is4k}
-            quota={quota}
-            onChange={(overrides) => {
-              setRequestOverrides(overrides);
-            }}
-          />
-        ))}
+      ) && (
+        <AdvancedRequester
+          tmdbId={tmdbId}
+          type="movie"
+          is4k={is4k}
+          quota={quota}
+          serverFixed={serverId != null}
+          defaultOverrides={serverId != null ? { server: serverId } : undefined}
+          onChange={(overrides) => {
+            setRequestOverrides(overrides);
+          }}
+        />
+      )}
     </Modal>
   );
 };

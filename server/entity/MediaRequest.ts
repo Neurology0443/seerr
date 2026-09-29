@@ -318,7 +318,6 @@ export class MediaRequest {
     let rootFolder = requestBody.rootFolder;
     let profileId = requestBody.profileId;
     let tags = requestBody.tags;
-    const serverId = requestBody.serverId;
 
     const ruleResult = await overrideRules({
       mediaType: requestBody.mediaType,
@@ -396,7 +395,7 @@ export class MediaRequest {
           ? user
           : undefined,
         is4k: requestBody.is4k,
-        serverId: serverId,
+        serverId: requestBody.serverId,
         isServiceRequest: isServiceSpecific,
         profileId: profileId,
         rootFolder: rootFolder,
@@ -535,7 +534,7 @@ export class MediaRequest {
           ? user
           : undefined,
         is4k: requestBody.is4k,
-        serverId: serverId,
+        serverId: requestBody.serverId,
         isServiceRequest: isServiceSpecific,
         profileId: profileId,
         rootFolder: rootFolder,

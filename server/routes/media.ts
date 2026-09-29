@@ -215,11 +215,16 @@ mediaRoutes.delete(
 
       const is4k = String(req.query.is4k) === 'true';
       const isMovie = media.mediaType === MediaType.MOVIE;
-      const explicitServiceId = req.query.serviceId
-        ? Number(req.query.serviceId)
-        : undefined;
-      const isServiceDelete =
-        explicitServiceId !== undefined && explicitServiceId >= 0;
+      const serviceIdParam = req.query.serviceId;
+      if (
+        serviceIdParam !== undefined &&
+        !/^\d+$/.test(String(serviceIdParam))
+      ) {
+        return next({ status: 400, message: 'Invalid serviceId.' });
+      }
+      const explicitServiceId =
+        serviceIdParam !== undefined ? Number(serviceIdParam) : undefined;
+      const isServiceDelete = explicitServiceId !== undefined;
 
       let serviceSettings;
 

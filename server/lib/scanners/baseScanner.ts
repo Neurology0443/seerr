@@ -119,6 +119,7 @@ class BaseScanner<T> {
 
     await this.asyncLock.dispatch(tmdbId, async () => {
       const existing = await this.getExisting(tmdbId, MediaType.MOVIE);
+      let mediaId: number;
 
       if (existing) {
         let changedExisting = false;
@@ -214,22 +215,7 @@ class BaseScanner<T> {
           this.log(`Title already exists and no changes detected for ${title}`);
         }
 
-        if (serviceId !== undefined) {
-          const serviceStatus =
-            !processing && hasFile
-              ? MediaStatus.AVAILABLE
-              : processing
-                ? MediaStatus.PROCESSING
-                : MediaStatus.UNKNOWN;
-          await this.upsertServiceStatus(
-            existing.id,
-            serviceId,
-            'radarr',
-            serviceStatus,
-            externalServiceId,
-            externalServiceSlug
-          );
-        }
+        mediaId = existing.id;
       } else {
         if (!processing && !hasFile) {
           return;
@@ -278,22 +264,22 @@ class BaseScanner<T> {
         await mediaRepository.save(newMedia);
         this.log(`Saved new media: ${title}`);
 
-        if (serviceId !== undefined && newMedia.id) {
-          const serviceStatus =
-            !processing && hasFile
-              ? MediaStatus.AVAILABLE
-              : processing
-                ? MediaStatus.PROCESSING
-                : MediaStatus.UNKNOWN;
-          await this.upsertServiceStatus(
-            newMedia.id,
-            serviceId,
-            'radarr',
-            serviceStatus,
-            externalServiceId,
-            externalServiceSlug
-          );
-        }
+        mediaId = newMedia.id;
+      }
+
+      if (serviceId !== undefined) {
+        await this.upsertServiceStatus(
+          mediaId,
+          serviceId,
+          'radarr',
+          !processing && hasFile
+            ? MediaStatus.AVAILABLE
+            : processing
+              ? MediaStatus.PROCESSING
+              : MediaStatus.UNKNOWN,
+          externalServiceId,
+          externalServiceSlug
+        );
       }
     });
   }
@@ -1002,6 +988,14 @@ class BaseScanner<T> {
     serverName: string;
     clearSeasonStatuses?: boolean;
   }): Promise<void> {
+    if (seenTmdbIds.size === 0) {
+      this.log(
+        `No titles were processed for ${serverName}. Stale service status reset will be skipped.`,
+        'warn'
+      );
+      return;
+    }
+
     const serviceStatusRepository = getRepository(MediaServiceStatus);
 
     const candidates: { id: number; tmdbId: number }[] =

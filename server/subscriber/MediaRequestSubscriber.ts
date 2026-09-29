@@ -56,6 +56,21 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     return server?.buttonLabel ?? server?.name;
   }
 
+  private async isAlreadyAvailable(
+    manager: EntityManager,
+    entity: MediaRequest,
+    media: Media
+  ): Promise<boolean> {
+    if (entity.isServiceRequest && entity.serverId != null) {
+      const serviceStatus = await manager
+        .getRepository(MediaServiceStatus)
+        .findOne({ where: { mediaId: media.id, serviceId: entity.serverId } });
+      return serviceStatus?.status === MediaStatus.AVAILABLE;
+    }
+
+    return media[entity.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE;
+  }
+
   private async notifyAvailableMovie(
     entity: MediaRequest,
     event?: UpdateEvent<MediaRequest>
@@ -321,20 +336,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           return;
         }
 
-        const isAlreadyAvailable =
-          entity.isServiceRequest && entity.serverId != null
-            ? await (async () => {
-                const serviceStatusRepo =
-                  manager.getRepository(MediaServiceStatus);
-                const ss = await serviceStatusRepo.findOne({
-                  where: { mediaId: media.id, serviceId: entity.serverId },
-                });
-                return ss?.status === MediaStatus.AVAILABLE;
-              })()
-            : media[entity.is4k ? 'status4k' : 'status'] ===
-              MediaStatus.AVAILABLE;
-
-        if (isAlreadyAvailable) {
+        if (await this.isAlreadyAvailable(manager, entity, media)) {
           logger.warn('Media already exists, marking request as COMPLETED', {
             label: 'Media Request',
             requestId: entity.id,
@@ -600,20 +602,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           throw new Error('Media data not found');
         }
 
-        const isAlreadyAvailableSonarr =
-          entity.isServiceRequest && entity.serverId != null
-            ? await (async () => {
-                const serviceStatusRepo =
-                  manager.getRepository(MediaServiceStatus);
-                const ss = await serviceStatusRepo.findOne({
-                  where: { mediaId: media.id, serviceId: entity.serverId },
-                });
-                return ss?.status === MediaStatus.AVAILABLE;
-              })()
-            : media[entity.is4k ? 'status4k' : 'status'] ===
-              MediaStatus.AVAILABLE;
-
-        if (isAlreadyAvailableSonarr) {
+        if (await this.isAlreadyAvailable(manager, entity, media)) {
           logger.warn('Media already exists, marking request as COMPLETED', {
             label: 'Media Request',
             requestId: entity.id,
