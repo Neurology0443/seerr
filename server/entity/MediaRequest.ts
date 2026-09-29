@@ -252,7 +252,7 @@ export class MediaRequest {
 
     const existingQuery = requestRepository
       .createQueryBuilder('request')
-      .leftJoin('request.media', 'media')
+      .leftJoinAndSelect('request.media', 'media')
       .leftJoinAndSelect('request.requestedBy', 'user')
       .where('media.tmdbId = :tmdbId', { tmdbId: tmdbMedia.id })
       .andWhere('media.mediaType = :mediaType', {
