@@ -73,7 +73,7 @@ const messages = defineMessages('components.Settings.SonarrModal', {
   animeOnlyHelp: 'Only show this server’s request button for anime content.',
   buttonLabel: 'Request Button Label',
   buttonLabelHelp:
-    'Short label shown on the request button for this server (e.g. "ITA", "ENG"). Leave blank to hide the button.',
+    'Leave blank for a native Seerr target. Setting a label reserves this server for multi-service requests and requires scanning to be enabled.',
   tagRequests: 'Tag Requests',
   tagRequestsInfo:
     "Automatically add an additional tag with the requester's user ID & display name",
@@ -142,6 +142,22 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
           intl.formatMessage(messages.validationLanguageProfileRequired)
         )
       : Yup.number(),
+    buttonLabel: Yup.string()
+      .trim()
+      .test(
+        'multi-service-not-default',
+        'A request-labelled server cannot be a default server.',
+        function (value) {
+          return !value || !this.parent.isDefault;
+        }
+      )
+      .test(
+        'multi-service-sync-enabled',
+        'A request-labelled server must have scanning enabled.',
+        function (value) {
+          return !value || this.parent.syncEnabled;
+        }
+      ),
     externalUrl: Yup.string()
       .test(
         'valid-url',
@@ -312,7 +328,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
               syncEnabled: values.syncEnabled,
               preventSearch: !values.enableSearch,
               tagRequests: values.tagRequests,
-              buttonLabel: values.buttonLabel || undefined,
+              buttonLabel: values.buttonLabel?.trim() || undefined,
               animeOnly: values.animeOnly,
               monitorNewItems: values.monitorNewItems,
             };

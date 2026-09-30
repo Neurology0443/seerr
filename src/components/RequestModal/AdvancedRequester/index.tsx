@@ -30,6 +30,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import Select from 'react-select';
 import useSWR from 'swr';
+import { getSelectableServers } from './serviceTarget';
 
 type OptionType = {
   value: number;
@@ -105,6 +106,11 @@ const AdvancedRequester = ({
     defaultOverrides?.server !== undefined && defaultOverrides?.server >= 0
       ? defaultOverrides?.server
       : null
+  );
+  const selectableServers = useMemo(
+    () =>
+      getSelectableServers(data, serverFixed, defaultOverrides?.server),
+    [data, serverFixed, defaultOverrides?.server]
   );
   const [selectedProfile, setSelectedProfile] = useState<number>(
     defaultOverrides?.profile ?? -1
@@ -191,12 +197,12 @@ const AdvancedRequester = ({
   }, [filteredUserData]);
 
   useEffect(() => {
-    let defaultServer = data?.find(
+    let defaultServer = selectableServers.find(
       (server) => server.isDefault && is4k === server.is4k
     );
 
-    if (!defaultServer && (data ?? []).length > 0) {
-      defaultServer = data?.[0];
+    if (!defaultServer && selectableServers.length > 0) {
+      defaultServer = selectableServers[0];
     }
 
     if (
@@ -206,7 +212,7 @@ const AdvancedRequester = ({
     ) {
       setSelectedServer(defaultServer.id);
     }
-  }, [data]);
+  }, [selectableServers]);
 
   useEffect(() => {
     if (serverData) {
@@ -413,7 +419,7 @@ const AdvancedRequester = ({
   if (
     (!data ||
       selectedServer === null ||
-      (data.filter((server) => server.is4k === is4k).length < 2 &&
+      (selectableServers.filter((server) => server.is4k === is4k).length < 2 &&
         (!serverData ||
           (serverData.profiles.length < 2 &&
             serverData.rootFolders.length < 2 &&
@@ -433,7 +439,8 @@ const AdvancedRequester = ({
         {!!data && selectedServer !== null && (
           <div className="flex flex-col md:flex-row">
             {!serverFixed &&
-              data.filter((server) => server.is4k === is4k).length > 1 && (
+              selectableServers.filter((server) => server.is4k === is4k)
+                .length > 1 && (
                 <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
                   <label htmlFor="server">
                     {intl.formatMessage(messages.destinationserver)}
@@ -446,7 +453,7 @@ const AdvancedRequester = ({
                     onBlur={(e) => setSelectedServer(Number(e.target.value))}
                     className="border-gray-700 bg-gray-800"
                   >
-                    {data
+                    {selectableServers
                       .filter((server) => server.is4k === is4k)
                       .map((server) => (
                         <option

@@ -387,12 +387,18 @@ export interface AllSettings {
   tautulli: TautulliSettings;
   radarr: RadarrSettings[];
   sonarr: SonarrSettings[];
+  nextServiceIds?: ServiceIdCounters;
   public: PublicSettings;
   notifications: NotificationSettings;
   jobs: Record<JobId, JobSettings>;
   network: NetworkSettings;
   metadataSettings: MetadataSettings;
   migrations: string[];
+}
+
+export interface ServiceIdCounters {
+  radarr: number;
+  sonarr: number;
 }
 
 const SETTINGS_PATH = process.env.CONFIG_DIRECTORY
@@ -465,6 +471,7 @@ class Settings {
       },
       radarr: [],
       sonarr: [],
+      nextServiceIds: { radarr: 0, sonarr: 0 },
       public: {
         initialized: false,
       },
@@ -702,6 +709,17 @@ class Settings {
 
   set sonarr(data: SonarrSettings[]) {
     this.data.sonarr = data;
+  }
+
+  public async allocateServiceId(
+    type: keyof ServiceIdCounters,
+    observedMax: number
+  ): Promise<number> {
+    this.data.nextServiceIds ??= { radarr: 0, sonarr: 0 };
+    const id = Math.max(this.data.nextServiceIds[type], observedMax + 1);
+    this.data.nextServiceIds[type] = id + 1;
+    await this.save();
+    return id;
   }
 
   get public(): PublicSettings {
