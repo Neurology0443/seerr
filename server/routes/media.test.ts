@@ -17,30 +17,38 @@ import Season from '@server/entity/Season';
 import { User } from '@server/entity/User';
 import { getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
+import axios from 'axios';
 import type { Express } from 'express';
 import express from 'express';
 import request from 'supertest';
 import mediaRoutes from './media';
 
 let app: Express;
-const removeMovie = mock.method(
+const getMovie = mock.method(
   RadarrAPI.prototype,
-  'removeMovie',
-  async () => undefined
+  'getMovieByTmdbId',
+  async () => ({ id: 501, title: 'Movie' }) as never
 );
-const removeSeries = mock.method(
+const getSeries = mock.method(
   SonarrAPI.prototype,
-  'removeSeries',
-  async () => undefined
+  'getSeriesByTvdbId',
+  async () => ({ id: 701, title: 'Series' }) as never
 );
-mock.method(
-  TheMovieDb.prototype,
-  'getTvShow',
-  async () =>
-    ({
-      external_ids: { tvdb_id: 700 },
-    }) as never
-);
+const deleteRequest = mock.fn(async () => ({}));
+mock.method(axios, 'create', () => ({
+  delete: deleteRequest,
+  interceptors: { request: { use: () => undefined } },
+}));
+Object.defineProperty(TheMovieDb.prototype, 'getTvShow', {
+  get() {
+    return async () =>
+      ({
+        external_ids: { tvdb_id: 700 },
+      }) as never;
+  },
+  set() {},
+  configurable: true,
+});
 
 setupTestDb();
 
@@ -58,15 +66,18 @@ before(() => {
       _req: express.Request,
       res: express.Response,
       _next: express.NextFunction
-    ) => res.status(err.status ?? 500).json({ message: err.message })
+    ) => {
+      void _next;
+      return res.status(err.status ?? 500).json({ message: err.message });
+    }
   );
 });
 
 beforeEach(() => {
-  removeMovie.mock.resetCalls();
-  removeMovie.mock.mockImplementation(async () => undefined);
-  removeSeries.mock.resetCalls();
-  removeSeries.mock.mockImplementation(async () => undefined);
+  getMovie.mock.resetCalls();
+  getSeries.mock.resetCalls();
+  deleteRequest.mock.resetCalls();
+  deleteRequest.mock.mockImplementation(async () => ({}));
   const settings = getSettings();
   settings.radarr = [];
   settings.sonarr = [];
@@ -127,9 +138,13 @@ describe('DELETE /media/:id/file service target', () => {
         is4k: false,
       })
     );
-    await getRepository(MediaRequest).update(active.id, {
-      status: MediaRequestStatus.APPROVED,
-    });
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.APPROVED })
+      .where('id = :id', { id: active.id })
+      .callListeners(false)
+      .execute();
     await getRepository(MediaServiceStatus).save([
       new MediaServiceStatus({
         mediaId: media.id,
@@ -149,7 +164,8 @@ describe('DELETE /media/:id/file service target', () => {
       .delete(`/media/${media.id}/file?serviceId=51`)
       .expect(204);
 
-    assert.equal(removeMovie.mock.callCount(), 1);
+    assert.equal(getMovie.mock.callCount(), 1);
+    assert.equal(deleteRequest.mock.calls[0].arguments[0], '/movie/501');
     assert.equal(
       (await getRepository(Media).findOneByOrFail({ id: media.id })).status,
       MediaStatus.AVAILABLE
@@ -201,7 +217,7 @@ describe('DELETE /media/:id/file service target', () => {
         .delete(`/media/${media.id}/file?serviceId=${id}`)
         .expect(400);
     }
-    assert.equal(removeMovie.mock.callCount(), 0);
+    assert.equal(getMovie.mock.callCount(), 0);
     assert.equal(
       (await getRepository(Media).findOneByOrFail({ id: media.id })).status,
       MediaStatus.PROCESSING
@@ -225,7 +241,7 @@ describe('DELETE /media/:id/file service target', () => {
         status: MediaStatus.AVAILABLE,
       })
     );
-    removeMovie.mock.mockImplementation(async () => {
+    deleteRequest.mock.mockImplementation(async () => {
       throw new Error('Radarr unavailable');
     });
 
@@ -275,7 +291,8 @@ describe('DELETE /media/:id/file service target', () => {
       .delete(`/media/${media.id}/file?serviceId=71`)
       .expect(204);
 
-    assert.equal(removeSeries.mock.callCount(), 1);
+    assert.equal(getSeries.mock.callCount(), 1);
+    assert.equal(deleteRequest.mock.calls[0].arguments[0], '/series/701');
     const updatedMedia = await getRepository(Media).findOneByOrFail({
       id: media.id,
     });

@@ -620,22 +620,22 @@ requestRoutes.put<{ requestId: string }>(
     const userRepository = getRepository(User);
     const requestId = Number(req.params.requestId);
     try {
-      const existingRequest = await requestRepository.findOne({
-        where: { id: requestId },
-      });
-      const updateRequest = async () => {
-        // Ordering is request then owner here, user then media on create, so no cycle
-        return requestLock.dispatch(requestKey(requestId), async () => {
-          const request = await requestRepository.findOne({
-            where: {
-              id: requestId,
-            },
-          });
+      // Ordering is request then owner here, user then media on create, so no cycle
+      return await requestLock.dispatch(requestKey(requestId), async () => {
+        const request = await requestRepository.findOne({
+          where: {
+            id: requestId,
+          },
+        });
 
-          if (!request) {
-            return next({ status: 404, message: 'Request not found.' });
-          }
+        if (!request) {
+          return next({ status: 404, message: 'Request not found.' });
+        }
 
+        const requestedServerId =
+          req.body.serverId === undefined ? request.serverId : req.body.serverId;
+
+        const updateRequest = async () => {
           if (req.body.mediaType !== request.type) {
             return next({
               status: 400,
@@ -687,10 +687,6 @@ requestRoutes.put<{ requestId: string }>(
           // quota, so it is charged in full rather than as a delta
           const ownerChanging = requestUser.id !== previousOwnerId;
 
-          const requestedServerId =
-            req.body.serverId === undefined
-              ? request.serverId
-              : req.body.serverId;
           const destinationChanging = requestedServerId !== request.serverId;
           const slotChanging = request.isServiceRequest && destinationChanging;
           const target = validateRequestTarget({
@@ -960,20 +956,22 @@ requestRoutes.put<{ requestId: string }>(
               }
             )
           );
-        });
-      };
+        };
 
-      const targetId = req.body.serverId ?? existingRequest?.serverId;
-      if (existingRequest?.isServiceRequest && targetId != null) {
-        return await serviceTargetLock.dispatch(
+        if (!request.isServiceRequest) {
+          return updateRequest();
+        }
+        if (requestedServerId == null) {
+          throw new InvalidServiceTargetError('Invalid request destination.');
+        }
+        return serviceTargetLock.dispatch(
           serviceTargetKey(
-            existingRequest.type === MediaType.MOVIE ? 'radarr' : 'sonarr',
-            targetId
+            request.type === MediaType.MOVIE ? 'radarr' : 'sonarr',
+            requestedServerId
           ),
           updateRequest
         );
-      }
-      return await updateRequest();
+      });
     } catch (e) {
       if (e instanceof InvalidServiceTargetError) {
         return next({ status: 400, message: e.message });
@@ -1044,14 +1042,41 @@ requestRoutes.post<{
           });
         }
 
-        // this also triggers updating the parent media's status & sending to *arr
-        request.status = MediaRequestStatus.APPROVED;
-        request.modifiedBy = req.user;
-        await requestRepository.save(request);
+        const retry = async () => {
+          // this also triggers updating the parent media's status & sending to *arr
+          request.status = MediaRequestStatus.APPROVED;
+          request.modifiedBy = req.user;
+          await requestRepository.save(request);
 
-        return res.status(200).json(request);
+          return res.status(200).json(request);
+        };
+
+        if (!request.isServiceRequest) {
+          return retry();
+        }
+        if (request.serverId == null) {
+          throw new InvalidServiceTargetError('Invalid request destination.');
+        }
+        return serviceTargetLock.dispatch(
+          serviceTargetKey(
+            request.type === MediaType.MOVIE ? 'radarr' : 'sonarr',
+            request.serverId
+          ),
+          async () => {
+            validateRequestTarget({
+              mediaType: request.type,
+              serverId: request.serverId,
+              isServiceRequest: true,
+              is4k: request.is4k,
+            });
+            return retry();
+          }
+        );
       });
     } catch (e) {
+      if (e instanceof InvalidServiceTargetError) {
+        return next({ status: 400, message: e.message });
+      }
       logger.error('Error processing request retry', {
         label: 'Media Request',
         message: e.message,

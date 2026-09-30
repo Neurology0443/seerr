@@ -393,17 +393,17 @@ const RequestButton = ({
     const serviceStatusEntry = media?.serviceStatuses?.find(
       (ss) => ss.serviceId === service.id
     );
-    const activeServiceRequests = media?.requests.filter(
+    const occupiedRequests = media?.requests.filter(
       (request) =>
         request.isServiceRequest &&
         request.serverId === service.id &&
         (request.status === MediaRequestStatus.PENDING ||
           request.status === MediaRequestStatus.APPROVED)
     );
-    const pendingServiceRequests = activeServiceRequests?.filter(
+    const editableRequests = occupiedRequests?.filter(
       (request) => request.status === MediaRequestStatus.PENDING
     );
-    const userServiceRequest = activeServiceRequests?.find(
+    const userEditableRequest = editableRequests?.find(
       (request) => request.requestedBy.id === user?.id
     );
     const hasOccupiedMovieSlot =
@@ -417,7 +417,7 @@ const RequestButton = ({
       );
     if (
       serviceStatusEntry &&
-      !activeServiceRequests?.length &&
+      !occupiedRequests?.length &&
       mediaType === 'movie' &&
       serviceStatusEntry.status !== MediaStatus.UNKNOWN &&
       serviceStatusEntry.status !== MediaStatus.DELETED
@@ -450,14 +450,14 @@ const RequestButton = ({
       ((user?.requestServices ?? []).includes(serviceIdentifier) &&
         hasQualityPermission);
 
-    if (!canUseService && !userServiceRequest) {
+    if (!canUseService && !userEditableRequest) {
       continue;
     }
 
     if (
-      userServiceRequest ||
-      (activeServiceRequests &&
-        activeServiceRequests.length > 0 &&
+      userEditableRequest ||
+      (editableRequests &&
+        editableRequests.length > 0 &&
         hasPermission(Permission.MANAGE_REQUESTS))
     ) {
       buttons.push({
@@ -473,8 +473,8 @@ const RequestButton = ({
       });
 
       if (
-        pendingServiceRequests &&
-        pendingServiceRequests.length > 0 &&
+        editableRequests &&
+        editableRequests.length > 0 &&
         hasPermission(Permission.MANAGE_REQUESTS)
       ) {
         buttons.push(
@@ -484,7 +484,7 @@ const RequestButton = ({
               label: service.buttonLabel,
             }),
             action: () => {
-              modifyRequests(pendingServiceRequests, 'approve');
+              modifyRequests(editableRequests, 'approve');
             },
             svg: <CheckIcon />,
           },
@@ -494,7 +494,7 @@ const RequestButton = ({
               label: service.buttonLabel,
             }),
             action: () => {
-              modifyRequests(pendingServiceRequests, 'decline');
+              modifyRequests(editableRequests, 'decline');
             },
             svg: <XMarkIcon />,
           }
@@ -517,20 +517,19 @@ const RequestButton = ({
 
   const [buttonOne, ...others] = buttons;
 
-  const occupiedServiceRequests =
+  const editableServiceRequests =
     activeServiceModal.serverId !== null
       ? media?.requests.filter(
           (request) =>
             request.isServiceRequest &&
-            (request.status === MediaRequestStatus.PENDING ||
-              request.status === MediaRequestStatus.APPROVED) &&
+            request.status === MediaRequestStatus.PENDING &&
             request.serverId === activeServiceModal.serverId
         )
       : undefined;
   const activeServiceRequest =
-    occupiedServiceRequests?.find(
+    editableServiceRequests?.find(
       (request) => request.requestedBy.id === user?.id
-    ) ?? occupiedServiceRequests?.[0];
+    ) ?? editableServiceRequests?.[0];
   const selectedService = allServices?.find(
     (service) => service.id === activeServiceModal.serverId
   );

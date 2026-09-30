@@ -21,6 +21,10 @@ import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import {
+  serviceTargetKey,
+  serviceTargetLock,
+} from '@server/utils/requestLock';
 import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { Router } from 'express';
 import type { FindOneOptions } from 'typeorm';
@@ -212,7 +216,6 @@ mediaRoutes.delete(
   isAuthenticated(Permission.MANAGE_REQUESTS),
   async (req, res, next) => {
     try {
-      const settings = getSettings();
       const mediaRepository = getRepository(Media);
       const media = await mediaRepository.findOneOrFail({
         where: { id: Number(req.params.id) },
@@ -230,6 +233,9 @@ mediaRoutes.delete(
       const explicitServiceId =
         serviceIdParam !== undefined ? Number(serviceIdParam) : undefined;
       const isServiceDelete = explicitServiceId !== undefined;
+
+      const deleteFile = async () => {
+      const settings = getSettings();
 
       let serviceSettings;
 
@@ -384,6 +390,15 @@ mediaRoutes.delete(
       }
 
       return res.status(204).send();
+      };
+
+      if (isServiceDelete) {
+        return await serviceTargetLock.dispatch(
+          serviceTargetKey(isMovie ? 'radarr' : 'sonarr', explicitServiceId),
+          deleteFile
+        );
+      }
+      return await deleteFile();
     } catch (e) {
       if (e instanceof EntityNotFoundError) {
         return next({ status: 404, message: 'Media not found' });

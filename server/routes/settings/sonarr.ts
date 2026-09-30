@@ -96,10 +96,12 @@ sonarrRoutes.post('/test', async (req, res, next) => {
 });
 
 sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
+  const id = Number(req.params.id);
+  return serviceTargetLock.dispatch(serviceTargetKey('sonarr', id), async () => {
   const settings = getSettings();
 
   const sonarrIndex = settings.sonarr.findIndex(
-    (r) => r.id === Number(req.params.id)
+    (r) => r.id === id
   );
 
   if (sonarrIndex === -1) {
@@ -149,6 +151,7 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
   await settings.save();
 
   return res.status(200).json(settings.sonarr[sonarrIndex]);
+  });
 });
 
 sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {

@@ -100,10 +100,12 @@ radarrRoutes.post<
 radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
   '/:id',
   async (req, res, next) => {
+    const id = Number(req.params.id);
+    return serviceTargetLock.dispatch(serviceTargetKey('radarr', id), async () => {
     const settings = getSettings();
 
     const radarrIndex = settings.radarr.findIndex(
-      (r) => r.id === Number(req.params.id)
+      (r) => r.id === id
     );
 
     if (radarrIndex === -1) {
@@ -151,6 +153,7 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
     await settings.save();
 
     return res.status(200).json(settings.radarr[radarrIndex]);
+    });
   }
 );
 

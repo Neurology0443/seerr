@@ -13,6 +13,11 @@ import { upsertMediaServiceStatus } from '@server/lib/mediaServiceStatus';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import AsyncLock from '@server/utils/asyncLock';
+import {
+  serviceTargetKey,
+  serviceTargetLock,
+} from '@server/utils/requestLock';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { randomUUID } from 'crypto';
 
 // Default scan rates (can be overidden)
@@ -978,34 +983,46 @@ class BaseScanner<T> {
     externalServiceSlug: string | undefined,
     seasonStatuses: Record<number, MediaStatus> | null = null
   ): Promise<void> {
-    const repo = getRepository(MediaServiceStatus);
-    await upsertMediaServiceStatus(
-      repo,
-      {
-        mediaId,
-        serviceId,
-        serviceType,
-        status,
-        externalServiceId: externalServiceId ?? null,
-        externalServiceSlug: externalServiceSlug ?? null,
-        seasonStatuses,
-      },
-      ['status', 'externalServiceId', 'externalServiceSlug', 'seasonStatuses']
-    );
+    await serviceTargetLock.dispatch(
+      serviceTargetKey(serviceType, serviceId),
+      async () => {
+        const target = getSettings()[serviceType].find(
+          (service) => service.id === serviceId
+        );
+        if (!target || !isMultiServiceTarget(target) || !target.syncEnabled) {
+          return;
+        }
 
-    if (
-      status === MediaStatus.AVAILABLE ||
-      Object.values(seasonStatuses ?? {}).some(
-        (seasonStatus) => seasonStatus === MediaStatus.AVAILABLE
-      )
-    ) {
-      await this.completeAvailableServiceRequests(
-        mediaId,
-        serviceId,
-        status,
-        seasonStatuses
-      );
-    }
+        const repo = getRepository(MediaServiceStatus);
+        await upsertMediaServiceStatus(
+          repo,
+          {
+            mediaId,
+            serviceId,
+            serviceType,
+            status,
+            externalServiceId: externalServiceId ?? null,
+            externalServiceSlug: externalServiceSlug ?? null,
+            seasonStatuses,
+          },
+          ['status', 'externalServiceId', 'externalServiceSlug', 'seasonStatuses']
+        );
+
+        if (
+          status === MediaStatus.AVAILABLE ||
+          Object.values(seasonStatuses ?? {}).some(
+            (seasonStatus) => seasonStatus === MediaStatus.AVAILABLE
+          )
+        ) {
+          await this.completeAvailableServiceRequests(
+            mediaId,
+            serviceId,
+            status,
+            seasonStatuses
+          );
+        }
+      }
+    );
   }
 
   private async completeAvailableServiceRequests(
@@ -1109,7 +1126,17 @@ class BaseScanner<T> {
       Number(candidate.mediaId)
     );
 
-    await dataSource.transaction(async (manager) => {
+    const cleaned = await serviceTargetLock.dispatch(
+      serviceTargetKey(serviceType, serviceId),
+      async () => {
+      const target = getSettings()[serviceType].find(
+        (service) => service.id === serviceId
+      );
+      if (!target || !isMultiServiceTarget(target) || !target.syncEnabled) {
+        return false;
+      }
+
+      await dataSource.transaction(async (manager) => {
       if (staleMediaIds.length > 0) {
         const requestRepository = manager.getRepository(MediaRequest);
         const orphanedRequests = await requestRepository
@@ -1151,7 +1178,12 @@ class BaseScanner<T> {
           .whereInIds(staleIds.slice(i, i + chunkSize))
           .execute();
       }
-    });
+      });
+      return true;
+      }
+    );
+
+    if (!cleaned) return;
 
     this.log(
       `Reset ${staleIds.length} stale service status entries for ${serverName} (${

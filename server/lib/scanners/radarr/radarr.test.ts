@@ -515,12 +515,19 @@ describe('Radarr Scanner', () => {
       const request = await requestRepository.save(
         new MediaRequest({
           type: MediaType.MOVIE,
-          status: MediaRequestStatus.APPROVED,
+          status: MediaRequestStatus.PENDING,
           media,
           requestedBy,
           is4k: false,
         })
       );
+      await getRepository(MediaRequest)
+        .createQueryBuilder()
+        .update(MediaRequest)
+        .set({ status: MediaRequestStatus.APPROVED })
+        .where('id = :id', { id: request.id })
+        .callListeners(false)
+        .execute();
 
       configureRadarr([{ syncEnabled: true }]);
       getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 1, id: 99 })];
@@ -851,7 +858,7 @@ describe('Radarr Scanner', () => {
       const serviceRequest = await getRepository(MediaRequest).save(
         new MediaRequest({
           type: MediaType.MOVIE,
-          status: MediaRequestStatus.APPROVED,
+          status: MediaRequestStatus.PENDING,
           media,
           requestedBy,
           serverId: 0,
@@ -859,6 +866,13 @@ describe('Radarr Scanner', () => {
           is4k: false,
         })
       );
+      await getRepository(MediaRequest)
+        .createQueryBuilder()
+        .update(MediaRequest)
+        .set({ status: MediaRequestStatus.APPROVED })
+        .where('id = :id', { id: serviceRequest.id })
+        .callListeners(false)
+        .execute();
       getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 562, id: 98 })];
       getLibraryMoviesByTmdbIdImpl = async () => [];
 
