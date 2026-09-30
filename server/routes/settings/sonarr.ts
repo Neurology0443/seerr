@@ -1,8 +1,14 @@
 import SonarrAPI from '@server/api/servarr/sonarr';
 import { removeRequestServiceGrants } from '@server/lib/requestServices';
+import { allocateServiceId, hasServiceReferences } from '@server/lib/serviceId';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
+import {
+  isMultiServiceTarget,
+  normalizeButtonLabel,
+  validateServiceTargetConfig,
+} from '@server/utils/serviceTarget';
 import { Router } from 'express';
 
 const sonarrRoutes = Router();
@@ -13,19 +19,29 @@ sonarrRoutes.get('/', (_req, res) => {
   res.status(200).json(settings.sonarr);
 });
 
-sonarrRoutes.post('/', async (req, res) => {
+sonarrRoutes.post('/', async (req, res, next) => {
   const settings = getSettings();
-
-  const newSonarr = req.body as SonarrSettings;
-  const lastItem = settings.sonarr[settings.sonarr.length - 1];
-  newSonarr.id = lastItem ? lastItem.id + 1 : 0;
+  if (
+    req.body.buttonLabel !== undefined &&
+    req.body.buttonLabel !== null &&
+    typeof req.body.buttonLabel !== 'string'
+  ) {
+    return next({ status: 400, message: 'buttonLabel must be a string.' });
+  }
+  const candidate = {
+    ...req.body,
+    buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
+  } as SonarrSettings;
+  const validationError = validateServiceTargetConfig(candidate);
+  if (validationError) return next({ status: 400, message: validationError });
+  const newSonarr = { ...candidate, id: await allocateServiceId('sonarr') };
 
   // If we are setting this as the default, clear any previous defaults for the same type first
   // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
   // and are the default
-  if (req.body.isDefault) {
+  if (candidate.isDefault) {
     settings.sonarr
-      .filter((sonarrInstance) => sonarrInstance.is4k === req.body.is4k)
+      .filter((sonarrInstance) => sonarrInstance.is4k === candidate.is4k)
       .forEach((sonarrInstance) => {
         sonarrInstance.isDefault = false;
       });
@@ -74,7 +90,7 @@ sonarrRoutes.post('/test', async (req, res, next) => {
   }
 });
 
-sonarrRoutes.put<{ id: string }>('/:id', async (req, res) => {
+sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
   const settings = getSettings();
 
   const sonarrIndex = settings.sonarr.findIndex(
@@ -86,22 +102,45 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res) => {
       .status(404)
       .json({ status: '404', message: 'Settings instance not found' });
   }
+  if (
+    req.body.buttonLabel !== undefined &&
+    req.body.buttonLabel !== null &&
+    typeof req.body.buttonLabel !== 'string'
+  ) {
+    return next({ status: 400, message: 'buttonLabel must be a string.' });
+  }
+  const existing = settings.sonarr[sonarrIndex];
+  const candidate = {
+    ...req.body,
+    id: existing.id,
+    buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
+  } as SonarrSettings;
+  const validationError = validateServiceTargetConfig(candidate);
+  if (validationError) return next({ status: 400, message: validationError });
+  if (
+    (isMultiServiceTarget(existing) !== isMultiServiceTarget(candidate) ||
+      existing.is4k !== candidate.is4k) &&
+    (await hasServiceReferences('sonarr', existing.id))
+  ) {
+    return next({
+      status: 409,
+      message:
+        'This server is already referenced and its request role or 4K identity cannot be changed. Delete and recreate the server instead.',
+    });
+  }
 
   // If we are setting this as the default, clear any previous defaults for the same type first
   // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
   // and are the default
-  if (req.body.isDefault) {
+  if (candidate.isDefault) {
     settings.sonarr
-      .filter((sonarrInstance) => sonarrInstance.is4k === req.body.is4k)
+      .filter((sonarrInstance) => sonarrInstance.is4k === candidate.is4k)
       .forEach((sonarrInstance) => {
         sonarrInstance.isDefault = false;
       });
   }
 
-  settings.sonarr[sonarrIndex] = {
-    ...req.body,
-    id: Number(req.params.id),
-  } as SonarrSettings;
+  settings.sonarr[sonarrIndex] = candidate;
   await settings.save();
 
   return res.status(200).json(settings.sonarr[sonarrIndex]);

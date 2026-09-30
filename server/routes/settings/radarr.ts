@@ -1,8 +1,14 @@
 import RadarrAPI from '@server/api/servarr/radarr';
 import { removeRequestServiceGrants } from '@server/lib/requestServices';
+import { allocateServiceId, hasServiceReferences } from '@server/lib/serviceId';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
+import {
+  isMultiServiceTarget,
+  normalizeButtonLabel,
+  validateServiceTargetConfig,
+} from '@server/utils/serviceTarget';
 import { Router } from 'express';
 
 const radarrRoutes = Router();
@@ -13,19 +19,30 @@ radarrRoutes.get('/', (_req, res) => {
   res.status(200).json(settings.radarr);
 });
 
-radarrRoutes.post('/', async (req, res) => {
+radarrRoutes.post('/', async (req, res, next) => {
   const settings = getSettings();
+  if (
+    req.body.buttonLabel !== undefined &&
+    req.body.buttonLabel !== null &&
+    typeof req.body.buttonLabel !== 'string'
+  ) {
+    return next({ status: 400, message: 'buttonLabel must be a string.' });
+  }
+  const candidate = {
+    ...req.body,
+    buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
+  } as RadarrSettings;
+  const validationError = validateServiceTargetConfig(candidate);
+  if (validationError) return next({ status: 400, message: validationError });
 
-  const newRadarr = req.body as RadarrSettings;
-  const lastItem = settings.radarr[settings.radarr.length - 1];
-  newRadarr.id = lastItem ? lastItem.id + 1 : 0;
+  const newRadarr = { ...candidate, id: await allocateServiceId('radarr') };
 
   // If we are setting this as the default, clear any previous defaults for the same type first
   // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
   // and are the default
-  if (req.body.isDefault) {
+  if (candidate.isDefault) {
     settings.radarr
-      .filter((radarrInstance) => radarrInstance.is4k === req.body.is4k)
+      .filter((radarrInstance) => radarrInstance.is4k === candidate.is4k)
       .forEach((radarrInstance) => {
         radarrInstance.isDefault = false;
       });
@@ -87,22 +104,45 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
     if (radarrIndex === -1) {
       return next({ status: '404', message: 'Settings instance not found' });
     }
+    if (
+      req.body.buttonLabel !== undefined &&
+      req.body.buttonLabel !== null &&
+      typeof req.body.buttonLabel !== 'string'
+    ) {
+      return next({ status: 400, message: 'buttonLabel must be a string.' });
+    }
+    const existing = settings.radarr[radarrIndex];
+    const candidate = {
+      ...req.body,
+      id: existing.id,
+      buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
+    } as RadarrSettings;
+    const validationError = validateServiceTargetConfig(candidate);
+    if (validationError) return next({ status: 400, message: validationError });
+    if (
+      (isMultiServiceTarget(existing) !== isMultiServiceTarget(candidate) ||
+        existing.is4k !== candidate.is4k) &&
+      (await hasServiceReferences('radarr', existing.id))
+    ) {
+      return next({
+        status: 409,
+        message:
+          'This server is already referenced and its request role or 4K identity cannot be changed. Delete and recreate the server instead.',
+      });
+    }
 
     // If we are setting this as the default, clear any previous defaults for the same type first
     // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
     // and are the default
-    if (req.body.isDefault) {
+    if (candidate.isDefault) {
       settings.radarr
-        .filter((radarrInstance) => radarrInstance.is4k === req.body.is4k)
+        .filter((radarrInstance) => radarrInstance.is4k === candidate.is4k)
         .forEach((radarrInstance) => {
           radarrInstance.isDefault = false;
         });
     }
 
-    settings.radarr[radarrIndex] = {
-      ...req.body,
-      id: Number(req.params.id),
-    } as RadarrSettings;
+    settings.radarr[radarrIndex] = candidate;
     await settings.save();
 
     return res.status(200).json(settings.radarr[radarrIndex]);

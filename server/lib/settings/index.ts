@@ -1,6 +1,8 @@
 import { MediaServerType } from '@server/constants/server';
 import { Permission } from '@server/lib/permissions';
 import { runMigrations } from '@server/lib/settings/migrator';
+import type { ServiceTargetConfig } from '@server/utils/serviceTarget';
+import { validateServiceTargetConfig } from '@server/utils/serviceTarget';
 import type { AvailableLocale } from '@server/types/languages';
 import { randomBytes, randomUUID } from 'crypto';
 import fs from 'fs/promises';
@@ -13,6 +15,18 @@ const mergeSettings = <T>(current: T, incoming: Partial<T>): T =>
   mergeWith({}, current, incoming, (_objValue, srcValue) =>
     Array.isArray(srcValue) ? srcValue : undefined
   ) as T;
+
+export const assertValidServiceTargets = (
+  type: 'radarr' | 'sonarr',
+  services: (ServiceTargetConfig & { id: number })[]
+): void => {
+  for (const service of services) {
+    const error = validateServiceTargetConfig(service);
+    if (error) {
+      throw new Error(`Invalid ${type} service target ${service.id}: ${error}`);
+    }
+  }
+};
 
 export interface Library {
   id: string;
@@ -387,12 +401,18 @@ export interface AllSettings {
   tautulli: TautulliSettings;
   radarr: RadarrSettings[];
   sonarr: SonarrSettings[];
+  nextServiceIds?: ServiceIdCounters;
   public: PublicSettings;
   notifications: NotificationSettings;
   jobs: Record<JobId, JobSettings>;
   network: NetworkSettings;
   metadataSettings: MetadataSettings;
   migrations: string[];
+}
+
+export interface ServiceIdCounters {
+  radarr: number;
+  sonarr: number;
 }
 
 const SETTINGS_PATH = process.env.CONFIG_DIRECTORY
@@ -465,6 +485,7 @@ class Settings {
       },
       radarr: [],
       sonarr: [],
+      nextServiceIds: { radarr: 0, sonarr: 0 },
       public: {
         initialized: false,
       },
@@ -704,6 +725,26 @@ class Settings {
     this.data.sonarr = data;
   }
 
+  get nextServiceIds(): ServiceIdCounters {
+    this.data.nextServiceIds ??= { radarr: 0, sonarr: 0 };
+    return this.data.nextServiceIds;
+  }
+
+  set nextServiceIds(data: ServiceIdCounters) {
+    this.data.nextServiceIds = data;
+  }
+
+  public async allocateServiceId(
+    type: keyof ServiceIdCounters,
+    observedMax: number
+  ): Promise<number> {
+    this.data.nextServiceIds ??= { radarr: 0, sonarr: 0 };
+    const id = Math.max(this.data.nextServiceIds[type], observedMax + 1);
+    this.data.nextServiceIds[type] = id + 1;
+    await this.save();
+    return id;
+  }
+
   get public(): PublicSettings {
     return this.data.public;
   }
@@ -842,6 +883,9 @@ class Settings {
       const parsedJson = JSON.parse(data);
       const migratedData = await runMigrations(parsedJson, SETTINGS_PATH);
       const merged = mergeSettings(this.data, migratedData);
+
+      assertValidServiceTargets('radarr', merged.radarr);
+      assertValidServiceTargets('sonarr', merged.sonarr);
 
       if (JSON.stringify(merged) !== JSON.stringify(migratedData)) {
         change = true;
