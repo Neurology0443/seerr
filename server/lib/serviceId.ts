@@ -23,8 +23,7 @@ export const getObservedServiceIdMax = async (
 ): Promise<number> => {
   const settings = getSettings();
   const mediaType = type === 'radarr' ? MediaType.MOVIE : MediaType.TV;
-  const ruleColumn =
-    type === 'radarr' ? 'radarrServiceId' : 'sonarrServiceId';
+  const ruleColumn = type === 'radarr' ? 'radarrServiceId' : 'sonarrServiceId';
   const [requestResult, ruleResult, users, statusResult] = await Promise.all([
     getRepository(MediaRequest)
       .createQueryBuilder('request')

@@ -9,6 +9,21 @@ import {
 export class InvalidServiceTargetError extends Error {}
 
 type RequestTarget = RadarrSettings | SonarrSettings;
+type RequestSlot = {
+  isServiceRequest: boolean;
+  is4k: boolean;
+  serverId?: number | null;
+};
+
+export const isSameRequestSlot = (
+  other: RequestSlot,
+  isServiceRequest: boolean,
+  is4k: boolean,
+  serverId: number | null | undefined
+): boolean =>
+  isServiceRequest
+    ? other.isServiceRequest && other.serverId === serverId
+    : !other.isServiceRequest && other.is4k === is4k;
 
 export const validateRequestTarget = ({
   mediaType,

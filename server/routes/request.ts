@@ -7,6 +7,7 @@ import {
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import {
   BlocklistedMediaError,
   DuplicateMediaRequestError,
@@ -24,6 +25,7 @@ import type {
 import { Permission } from '@server/lib/permissions';
 import {
   InvalidServiceTargetError,
+  isSameRequestSlot,
   validateRequestTarget,
 } from '@server/lib/requestTarget';
 import { getSettings } from '@server/lib/settings';
@@ -506,6 +508,13 @@ requestRoutes.put<{ requestId: string }>(
           return next({ status: 404, message: 'Request not found.' });
         }
 
+        if (req.body.mediaType !== request.type) {
+          return next({
+            status: 400,
+            message: 'Request media type cannot be changed.',
+          });
+        }
+
         if (
           (request.requestedBy.id !== req.user?.id ||
             (req.body.mediaType !== 'tv' &&
@@ -551,7 +560,9 @@ requestRoutes.put<{ requestId: string }>(
         const ownerChanging = requestUser.id !== previousOwnerId;
 
         const requestedServerId =
-          req.body.serverId === undefined ? request.serverId : req.body.serverId;
+          req.body.serverId === undefined
+            ? request.serverId
+            : req.body.serverId;
         const destinationChanging = requestedServerId !== request.serverId;
         if (destinationChanging) {
           validateRequestTarget({
@@ -576,81 +587,110 @@ requestRoutes.put<{ requestId: string }>(
           }
         }
 
-        return requestLock.dispatch(userKey(requestUser.id), async () => {
-          if (req.body.mediaType === MediaType.MOVIE) {
-            if (ownerChanging && !request.ignoreQuota) {
-              const quotas = await requestUser.getQuota();
+        return requestLock.dispatch(userKey(requestUser.id), () =>
+          mediaLock.dispatch(
+            mediaKey(request.type, request.media.tmdbId),
+            async () => {
+              const mediaRepository = getRepository(Media);
+              const media = await mediaRepository.findOneOrFail({
+                where: {
+                  tmdbId: request.media.tmdbId,
+                  mediaType: request.type,
+                },
+                relations: { requests: true },
+              });
+              const otherActiveRequests = media.requests.filter(
+                (other) =>
+                  other.id !== request.id &&
+                  other.status !== MediaRequestStatus.DECLINED &&
+                  other.status !== MediaRequestStatus.COMPLETED &&
+                  isSameRequestSlot(
+                    other,
+                    request.isServiceRequest,
+                    request.is4k,
+                    requestedServerId
+                  )
+              );
 
-              if (quotas.movie.restricted) {
+              if (request.type === MediaType.MOVIE) {
+                if (destinationChanging && otherActiveRequests.length > 0) {
+                  return next({
+                    status: 409,
+                    message: 'Request for this media already exists.',
+                  });
+                }
+
+                if (ownerChanging && !request.ignoreQuota) {
+                  const quotas = await requestUser.getQuota();
+
+                  if (quotas.movie.restricted) {
+                    return next({
+                      status: 403,
+                      message: 'Movie Quota exceeded.',
+                    });
+                  }
+                }
+
+                request.serverId = requestedServerId;
+                request.profileId = req.body.profileId;
+                request.rootFolder = req.body.rootFolder;
+                request.tags = req.body.tags;
+                request.requestedBy = requestUser as User;
+
+                await requestRepository.save(request);
+                return res.status(200).json(request);
+              }
+
+              const requestedSeasons = req.body.seasons as number[] | undefined;
+
+              if (!requestedSeasons || requestedSeasons.length === 0) {
+                throw new Error(
+                  'Missing seasons. If you want to cancel a series request, use the DELETE method.'
+                );
+              }
+
+              const existingSeasons = otherActiveRequests.flatMap((other) =>
+                other.seasons.map((season) => season.seasonNumber)
+              );
+
+              if (
+                destinationChanging &&
+                requestedSeasons.some((season) =>
+                  existingSeasons.includes(season)
+                )
+              ) {
                 return next({
-                  status: 403,
-                  message: 'Movie Quota exceeded.',
+                  status: 409,
+                  message: 'Request for this media already exists.',
                 });
               }
-            }
 
-            request.serverId = requestedServerId;
-            request.profileId = req.body.profileId;
-            request.rootFolder = req.body.rootFolder;
-            request.tags = req.body.tags;
-            request.requestedBy = requestUser as User;
+              const currentSeasons = destinationChanging
+                ? []
+                : request.seasons.map((season) => season.seasonNumber);
 
-            await requestRepository.save(request);
-          } else if (req.body.mediaType === MediaType.TV) {
-            const mediaRepository = getRepository(Media);
-            request.serverId = requestedServerId;
-            request.profileId = req.body.profileId;
-            request.rootFolder = req.body.rootFolder;
-            request.languageProfileId = req.body.languageProfileId;
-            request.tags = req.body.tags;
-            request.requestedBy = requestUser as User;
-
-            const requestedSeasons = req.body.seasons as number[] | undefined;
-
-            if (!requestedSeasons || requestedSeasons.length === 0) {
-              throw new Error(
-                'Missing seasons. If you want to cancel a series request, use the DELETE method.'
-              );
-            }
-
-            // Same key as create, so an edit cannot claim a season that a new
-            // request is taking at the same moment
-            return mediaLock.dispatch(
-              mediaKey(MediaType.TV, request.media.tmdbId),
-              async () => {
-                // Get existing media so we can work with all the requests
-                const media = await mediaRepository.findOneOrFail({
+              let coveredSeasons: number[];
+              if (request.isServiceRequest) {
+                const serviceStatus = await getRepository(
+                  MediaServiceStatus
+                ).findOne({
                   where: {
-                    tmdbId: request.media.tmdbId,
-                    mediaType: MediaType.TV,
+                    mediaId: media.id,
+                    serviceId: requestedServerId,
+                    serviceType: 'sonarr',
                   },
-                  relations: { requests: true },
                 });
-
-                // Get all requested seasons that are not part of this request we are editing
-                const existingSeasons = media.requests
+                coveredSeasons = Object.entries(
+                  serviceStatus?.seasonStatuses ?? {}
+                )
                   .filter(
-                    (r) =>
-                      r.is4k === request.is4k &&
-                      r.id !== request.id &&
-                      r.status !== MediaRequestStatus.DECLINED &&
-                      r.status !== MediaRequestStatus.COMPLETED
+                    ([, status]) =>
+                      status !== MediaStatus.UNKNOWN &&
+                      status !== MediaStatus.DELETED
                   )
-                  .reduce((seasons, r) => {
-                    const combinedSeasons = r.seasons.map(
-                      (season) => season.seasonNumber
-                    );
-
-                    return [...seasons, ...combinedSeasons];
-                  }, [] as number[]);
-
-                const currentSeasons = request.seasons.map(
-                  (s) => s.seasonNumber
-                );
-
-                // Seasons the media already covers cannot be requested again, while
-                // the ones this request holds stay on it
-                const coveredSeasons = (media.seasons ?? [])
+                  .map(([seasonNumber]) => Number(seasonNumber));
+              } else {
+                coveredSeasons = (media.seasons ?? [])
                   .filter(
                     (season) =>
                       season[request.is4k ? 'status4k' : 'status'] !==
@@ -658,94 +698,93 @@ requestRoutes.put<{ requestId: string }>(
                       season[request.is4k ? 'status4k' : 'status'] !==
                         MediaStatus.DELETED
                   )
-                  .map((season) => season.seasonNumber)
-                  .filter((sn) => !currentSeasons.includes(sn));
+                  .map((season) => season.seasonNumber);
+              }
+              coveredSeasons = coveredSeasons.filter(
+                (season) => !currentSeasons.includes(season)
+              );
 
-                const filteredSeasons = requestedSeasons.filter(
-                  (rs) => !existingSeasons.includes(rs)
-                );
+              const filteredSeasons = requestedSeasons.filter(
+                (season) => !existingSeasons.includes(season)
+              );
+              const keptSeasons = filteredSeasons.filter((season) =>
+                currentSeasons.includes(season)
+              );
+              const newSeasons = filteredSeasons.filter(
+                (season) =>
+                  !currentSeasons.includes(season) &&
+                  !coveredSeasons.includes(season)
+              );
+              const resultingSeasonCount =
+                keptSeasons.length + newSeasons.length;
 
-                const keptSeasons = filteredSeasons.filter((sn) =>
-                  currentSeasons.includes(sn)
-                );
+              if (resultingSeasonCount === 0) {
+                return next({
+                  status: 202,
+                  message: 'No seasons available to request',
+                });
+              }
 
-                const newSeasons = filteredSeasons.filter(
-                  (sn) =>
-                    !currentSeasons.includes(sn) && !coveredSeasons.includes(sn)
-                );
-
-                const resultingSeasonCount =
-                  keptSeasons.length + newSeasons.length;
-
-                if (resultingSeasonCount === 0) {
-                  return next({
-                    status: 202,
-                    message: 'No seasons available to request',
-                  });
-                }
-
-                if (!request.ignoreQuota) {
-                  const quotas = await requestUser.getQuota();
-
-                  // Only the seasons getQuota already counted for this owner are
-                  // paid for, so the edit is charged for everything it left out
-                  const quotaWindowStart = new Date();
-                  if (quotas.tv.days) {
-                    quotaWindowStart.setDate(
-                      quotaWindowStart.getDate() - quotas.tv.days
-                    );
-                  }
-
-                  const countedAlready =
-                    !ownerChanging &&
-                    (!quotas.tv.days || request.createdAt > quotaWindowStart);
-
-                  const priorSeasonCount = countedAlready
-                    ? request.seasons.length
-                    : 0;
-                  const requiredSeasons =
-                    resultingSeasonCount - priorSeasonCount;
-
-                  if (
-                    quotas.tv.limit &&
-                    requiredSeasons > (quotas.tv.remaining ?? 0)
-                  ) {
-                    return next({
-                      status: 403,
-                      message: 'Series Quota exceeded.',
-                    });
-                  }
-                }
-
-                request.seasons = request.seasons.filter((rs) =>
-                  keptSeasons.includes(rs.seasonNumber)
-                );
-
-                if (newSeasons.length > 0) {
-                  logger.debug('Adding new seasons to request', {
-                    label: 'Media Request',
-                    newSeasons,
-                  });
-                  request.seasons.push(
-                    ...newSeasons.map(
-                      (ns) =>
-                        new SeasonRequest({
-                          seasonNumber: ns,
-                          status: MediaRequestStatus.PENDING,
-                        })
-                    )
+              if (!request.ignoreQuota) {
+                const quotas = await requestUser.getQuota();
+                const quotaWindowStart = new Date();
+                if (quotas.tv.days) {
+                  quotaWindowStart.setDate(
+                    quotaWindowStart.getDate() - quotas.tv.days
                   );
                 }
 
-                await requestRepository.save(request);
+                const countedAlready =
+                  !destinationChanging &&
+                  !ownerChanging &&
+                  (!quotas.tv.days || request.createdAt > quotaWindowStart);
+                const priorSeasonCount = countedAlready
+                  ? request.seasons.length
+                  : 0;
+                const requiredSeasons = resultingSeasonCount - priorSeasonCount;
 
-                return res.status(200).json(request);
+                if (
+                  quotas.tv.limit &&
+                  requiredSeasons > (quotas.tv.remaining ?? 0)
+                ) {
+                  return next({
+                    status: 403,
+                    message: 'Series Quota exceeded.',
+                  });
+                }
               }
-            );
-          }
 
-          return res.status(200).json(request);
-        });
+              request.serverId = requestedServerId;
+              request.profileId = req.body.profileId;
+              request.rootFolder = req.body.rootFolder;
+              request.languageProfileId = req.body.languageProfileId;
+              request.tags = req.body.tags;
+              request.requestedBy = requestUser as User;
+              request.seasons = request.seasons.filter((season) =>
+                keptSeasons.includes(season.seasonNumber)
+              );
+
+              if (newSeasons.length > 0) {
+                logger.debug('Adding new seasons to request', {
+                  label: 'Media Request',
+                  newSeasons,
+                });
+                request.seasons.push(
+                  ...newSeasons.map(
+                    (season) =>
+                      new SeasonRequest({
+                        seasonNumber: season,
+                        status: MediaRequestStatus.PENDING,
+                      })
+                  )
+                );
+              }
+
+              await requestRepository.save(request);
+              return res.status(200).json(request);
+            }
+          )
+        );
       });
     } catch (e) {
       if (e instanceof InvalidServiceTargetError) {

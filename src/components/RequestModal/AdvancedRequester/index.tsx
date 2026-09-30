@@ -108,8 +108,7 @@ const AdvancedRequester = ({
       : null
   );
   const selectableServers = useMemo(
-    () =>
-      getSelectableServers(data, serverFixed, defaultOverrides?.server),
+    () => getSelectableServers(data, serverFixed, defaultOverrides?.server),
     [data, serverFixed, defaultOverrides?.server]
   );
   const [selectedProfile, setSelectedProfile] = useState<number>(

@@ -9,7 +9,10 @@ import type { MediaRequestBody } from '@server/interfaces/api/requestInterfaces'
 import notificationManager, { Notification } from '@server/lib/notifications';
 import overrideRules from '@server/lib/overrideRules';
 import { Permission } from '@server/lib/permissions';
-import { validateRequestTarget } from '@server/lib/requestTarget';
+import {
+  isSameRequestSlot,
+  validateRequestTarget,
+} from '@server/lib/requestTarget';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
@@ -84,15 +87,12 @@ export class MediaRequest {
     const userRepository = getRepository(User);
     const settings = getSettings();
 
-    const target = validateRequestTarget({
+    validateRequestTarget({
       mediaType: requestBody.mediaType,
       serverId: requestBody.serverId,
       isServiceRequest: !!requestBody.isServiceRequest,
       is4k: !!requestBody.is4k,
     });
-    if (requestBody.isServiceRequest && target) {
-      requestBody.is4k = target.is4k;
-    }
 
     let requestUser = user;
 
@@ -284,8 +284,11 @@ export class MediaRequest {
       // If there is an existing movie request that isn't declined, don't allow a new one.
       if (
         requestBody.mediaType === MediaType.MOVIE &&
-        existing[0].status !== MediaRequestStatus.DECLINED &&
-        existing[0].status !== MediaRequestStatus.COMPLETED
+        existing.some(
+          (request) =>
+            request.status !== MediaRequestStatus.DECLINED &&
+            request.status !== MediaRequestStatus.COMPLETED
+        )
       ) {
         logger.warn('Duplicate request for media blocked', {
           tmdbId: tmdbMedia.id,
@@ -326,7 +329,7 @@ export class MediaRequest {
       tmdbMedia,
       requestUser,
       tags,
-      serviceId: requestBody.serverId,
+      serviceId: requestBody.serverId ?? undefined,
     });
     const isAdvanced = user.hasPermission(
       [Permission.MANAGE_REQUESTS, Permission.REQUEST_ADVANCED],
@@ -433,12 +436,13 @@ export class MediaRequest {
       if (media.requests) {
         existingSeasons = media.requests
           .filter((request) => {
-            const sameSlot = isServiceSpecific
-              ? request.isServiceRequest &&
-                request.serverId === requestBody.serverId
-              : !request.isServiceRequest && request.is4k === requestBody.is4k;
             return (
-              sameSlot &&
+              isSameRequestSlot(
+                request,
+                isServiceSpecific,
+                !!requestBody.is4k,
+                requestBody.serverId
+              ) &&
               request.status !== MediaRequestStatus.DECLINED &&
               request.status !== MediaRequestStatus.COMPLETED
             );
@@ -457,7 +461,11 @@ export class MediaRequest {
         if (media.id) {
           const serviceStatus = await getRepository(MediaServiceStatus).findOne(
             {
-              where: { mediaId: media.id, serviceId: requestBody.serverId },
+              where: {
+                mediaId: media.id,
+                serviceId: requestBody.serverId,
+                serviceType: 'sonarr',
+              },
             }
           );
           existingSeasons = [
