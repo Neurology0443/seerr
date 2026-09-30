@@ -17,11 +17,18 @@ const enforceMultiServiceTargetInvariants = (settings: any): AllSettings => {
           ? service.buttonLabel.trim()
           : '';
 
-      if (!label || service.isDefault || !service.syncEnabled) {
+      if (!label) {
         delete service.buttonLabel;
-      } else {
-        service.buttonLabel = label;
+        continue;
       }
+
+      if (service.isDefault || !service.syncEnabled) {
+        throw new Error(
+          `Invalid labelled ${type} target #${service.id}: labelled targets must be non-default and synchronized.`
+        );
+      }
+
+      service.buttonLabel = label;
     }
   }
 

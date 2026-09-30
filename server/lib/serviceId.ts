@@ -1,4 +1,4 @@
-import { MediaType } from '@server/constants/media';
+import { MediaRequestStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
@@ -88,4 +88,45 @@ export const hasServiceReferences = async (
     rule ||
     users.some((user) => user.requestServices?.includes(grant))
   );
+};
+
+export const hasActiveServiceRequests = async (
+  type: ServiceType,
+  id: number
+): Promise<boolean> => {
+  const common = {
+    serverId: id,
+    type: type === 'radarr' ? MediaType.MOVIE : MediaType.TV,
+    isServiceRequest: true,
+  };
+  return (
+    (await getRepository(MediaRequest).exists({
+      where: { ...common, status: MediaRequestStatus.PENDING },
+    })) ||
+    (await getRepository(MediaRequest).exists({
+      where: { ...common, status: MediaRequestStatus.APPROVED },
+    }))
+  );
+};
+
+export const removeLiveServiceReferences = async (
+  type: ServiceType,
+  id: number
+): Promise<void> => {
+  await getRepository(MediaServiceStatus).delete({
+    serviceId: id,
+    serviceType: type,
+  });
+  await getRepository(OverrideRule)
+    .createQueryBuilder()
+    .update()
+    .set(
+      type === 'radarr'
+        ? { radarrServiceId: () => 'NULL' }
+        : { sonarrServiceId: () => 'NULL' }
+    )
+    .where(`${type === 'radarr' ? 'radarrServiceId' : 'sonarrServiceId'} = :id`, {
+      id,
+    })
+    .execute();
 };

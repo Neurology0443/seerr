@@ -1146,8 +1146,8 @@ class BaseScanner<T> {
           .update()
           .set(
             clearSeasonStatuses
-              ? { status: MediaStatus.UNKNOWN, seasonStatuses: null }
-              : { status: MediaStatus.UNKNOWN }
+              ? { status: MediaStatus.DELETED, seasonStatuses: null }
+              : { status: MediaStatus.DELETED }
           )
           .whereInIds(staleIds.slice(i, i + chunkSize))
           .execute();

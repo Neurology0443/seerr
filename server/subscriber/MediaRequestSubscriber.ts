@@ -671,8 +671,8 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
 
         if (!tvdbId) {
           const requestRepository = manager.getRepository(MediaRequest);
-          await mediaRepository.remove(media);
-          await requestRepository.remove(entity);
+          entity.status = MediaRequestStatus.FAILED;
+          await requestRepository.save(entity);
           throw new Error('TVDB ID not found');
         }
 

@@ -1,4 +1,5 @@
 import TheMovieDb from '@server/api/themoviedb';
+import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -10,6 +11,7 @@ import notificationManager, { Notification } from '@server/lib/notifications';
 import overrideRules from '@server/lib/overrideRules';
 import { Permission } from '@server/lib/permissions';
 import {
+  InvalidServiceTargetError,
   isSameRequestSlot,
   validateRequestTarget,
 } from '@server/lib/requestTarget';
@@ -57,8 +59,18 @@ export class MediaRequest {
     user: User,
     options: MediaRequestOptions = {}
   ): Promise<MediaRequest> {
-    // is4k is optional, and an undefined one binds as null in the duplicate query
-    const body = { ...requestBody, is4k: !!requestBody.is4k };
+    const target = validateRequestTarget({
+      mediaType: requestBody.mediaType,
+      serverId: requestBody.serverId,
+      isServiceRequest: !!requestBody.isServiceRequest,
+      is4k: !!requestBody.is4k,
+    });
+    // A labelled target owns its quality identity. Native requests retain the
+    // historical body-driven Standard/4K behavior.
+    const body = {
+      ...requestBody,
+      is4k: requestBody.isServiceRequest ? !!target?.is4k : !!requestBody.is4k,
+    };
 
     // Only a caller allowed to set the request user may queue on their lock
     const lockUserId =
@@ -87,7 +99,7 @@ export class MediaRequest {
     const userRepository = getRepository(User);
     const settings = getSettings();
 
-    validateRequestTarget({
+    const target = validateRequestTarget({
       mediaType: requestBody.mediaType,
       serverId: requestBody.serverId,
       isServiceRequest: !!requestBody.isServiceRequest,
@@ -182,6 +194,20 @@ export class MediaRequest {
       requestBody.mediaType === MediaType.MOVIE
         ? await tmdb.getMovie({ movieId: requestBody.mediaId })
         : await tmdb.getTvShow({ tvId: requestBody.mediaId });
+
+    if (
+      target?.animeOnly &&
+      !('results' in tmdbMedia.keywords
+        ? tmdbMedia.keywords.results
+        : tmdbMedia.keywords.keywords
+      ).some(
+        (keyword) => keyword.id === ANIME_KEYWORD_ID
+      )
+    ) {
+      throw new InvalidServiceTargetError(
+        'This request destination is restricted to anime.'
+      );
+    }
 
     let media = await mediaRepository.findOne({
       where: {
@@ -286,8 +312,8 @@ export class MediaRequest {
         requestBody.mediaType === MediaType.MOVIE &&
         existing.some(
           (request) =>
-            request.status !== MediaRequestStatus.DECLINED &&
-            request.status !== MediaRequestStatus.COMPLETED
+            request.status === MediaRequestStatus.PENDING ||
+            request.status === MediaRequestStatus.APPROVED
         )
       ) {
         logger.warn('Duplicate request for media blocked', {
@@ -424,6 +450,14 @@ export class MediaRequest {
               )
               .map((season) => season.season_number)
           : (requestBody.seasons as number[]);
+      if (
+        requestedSeasons.some(
+          (season) => !Number.isInteger(season) || season < 0
+        )
+      ) {
+        throw new InvalidServiceTargetError('Invalid season selection.');
+      }
+      requestedSeasons = [...new Set(requestedSeasons)];
       if (!settings.main.enableSpecialEpisodes) {
         requestedSeasons = requestedSeasons.filter((sn) => sn > 0);
       }
@@ -443,8 +477,8 @@ export class MediaRequest {
                 !!requestBody.is4k,
                 requestBody.serverId
               ) &&
-              request.status !== MediaRequestStatus.DECLINED &&
-              request.status !== MediaRequestStatus.COMPLETED
+              (request.status === MediaRequestStatus.PENDING ||
+                request.status === MediaRequestStatus.APPROVED)
             );
           })
           .reduce((seasons, request) => {
@@ -472,9 +506,7 @@ export class MediaRequest {
             ...existingSeasons,
             ...Object.entries(serviceStatus?.seasonStatuses ?? {})
               .filter(
-                ([, status]) =>
-                  status !== MediaStatus.UNKNOWN &&
-                  status !== MediaStatus.DELETED
+                ([, status]) => status === MediaStatus.AVAILABLE
               )
               .map(([seasonNumber]) => Number(seasonNumber)),
           ];

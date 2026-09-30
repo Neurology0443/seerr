@@ -53,7 +53,7 @@ export const validateRequestTarget = ({
   if (
     !service ||
     isMultiServiceTarget(service) !== isServiceRequest ||
-    service.is4k !== is4k ||
+    (!isServiceRequest && service.is4k !== is4k) ||
     (isServiceRequest && validateServiceTargetConfig(service) !== undefined)
   ) {
     throw new InvalidServiceTargetError('Invalid request destination.');

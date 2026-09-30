@@ -1,6 +1,11 @@
 import SonarrAPI from '@server/api/servarr/sonarr';
 import { removeRequestServiceGrants } from '@server/lib/requestServices';
-import { allocateServiceId, hasServiceReferences } from '@server/lib/serviceId';
+import {
+  allocateServiceId,
+  hasActiveServiceRequests,
+  hasServiceReferences,
+  removeLiveServiceReferences,
+} from '@server/lib/serviceId';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -160,7 +165,10 @@ sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   }
 
   const existing = settings.sonarr[sonarrIndex];
-  if (await hasServiceReferences('sonarr', existing.id)) {
+  if (
+    isMultiServiceTarget(existing) &&
+    (await hasActiveServiceRequests('sonarr', existing.id))
+  ) {
     return next({
       status: 409,
       message: 'This server is still referenced and cannot be deleted.',
@@ -171,6 +179,9 @@ sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   await settings.save();
 
   await removeRequestServiceGrants('sonarr', removed[0].id);
+  if (isMultiServiceTarget(existing)) {
+    await removeLiveServiceReferences('sonarr', removed[0].id);
+  }
 
   return res.status(200).json(removed[0]);
 });

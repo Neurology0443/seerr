@@ -520,8 +520,7 @@ const AdvancedRequester = ({
                 </select>
               </div>
             )}
-            {!serverFixed &&
-              (isValidating ||
+            {(isValidating ||
                 !serverData ||
                 serverData.rootFolders.length > 1) && (
                 <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
@@ -575,8 +574,7 @@ const AdvancedRequester = ({
                   </select>
                 </div>
               )}
-            {!serverFixed &&
-              type === 'tv' &&
+            {type === 'tv' &&
               (isValidating ||
                 !serverData ||
                 (serverData.languageProfiles ?? []).length > 1) && (

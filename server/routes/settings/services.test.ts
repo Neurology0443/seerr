@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { before, beforeEach, describe, it } from 'node:test';
 
 import { getRepository } from '@server/datasource';
+import { MediaRequestStatus, MediaStatus, MediaType } from '@server/constants/media';
+import Media from '@server/entity/Media';
+import MediaRequest from '@server/entity/MediaRequest';
 import OverrideRule from '@server/entity/OverrideRule';
+import { User } from '@server/entity/User';
 import { getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
 import type { Express } from 'express';
@@ -189,17 +193,56 @@ for (const type of ['radarr', 'sonarr'] as const) {
       assert.deepEqual(settings[type], []);
     });
 
-    it('refuses to delete a referenced target without mutation', async () => {
+    it('cleans resolved references when deleting a labelled target', async () => {
       const settings = getSettings();
-      settings[type] = [payload({ id: 13 }) as never];
-      await getRepository(OverrideRule).save(
+      settings[type] = [payload({ id: 13, buttonLabel: 'Deutsch' }) as never];
+      const rule = await getRepository(OverrideRule).save(
         new OverrideRule(
           type === 'radarr' ? { radarrServiceId: 13 } : { sonarrServiceId: 13 }
         )
       );
+
+      await request(app).delete(`/settings/${type}/13`).expect(200);
+      assert.deepEqual(settings[type], []);
+      const updatedRule = await getRepository(OverrideRule).findOneByOrFail({
+        id: rule.id,
+      });
+      assert.equal(
+        type === 'radarr'
+          ? updatedRule.radarrServiceId
+          : updatedRule.sonarrServiceId,
+        null
+      );
+    });
+
+    it('refuses to delete a labelled target with an active request', async () => {
+      const settings = getSettings();
+      settings[type] = [payload({ id: 14, buttonLabel: 'Deutsch' }) as never];
+      const mediaType = type === 'radarr' ? MediaType.MOVIE : MediaType.TV;
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: type === 'radarr' ? 9014 : 9015,
+          mediaType,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      const requestedBy = await getRepository(User).findOneOrFail({
+        where: { email: 'admin@seerr.dev' },
+      });
+      await getRepository(MediaRequest).save(
+        new MediaRequest({
+          type: mediaType,
+          status: MediaRequestStatus.PENDING,
+          media,
+          requestedBy,
+          serverId: 14,
+          isServiceRequest: true,
+          is4k: false,
+        })
+      );
       const beforeState = structuredClone(settings[type]);
 
-      await request(app).delete(`/settings/${type}/13`).expect(409);
+      await request(app).delete(`/settings/${type}/14`).expect(409);
       assert.deepEqual(settings[type], beforeState);
     });
   });

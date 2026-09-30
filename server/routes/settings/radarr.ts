@@ -1,6 +1,11 @@
 import RadarrAPI from '@server/api/servarr/radarr';
 import { removeRequestServiceGrants } from '@server/lib/requestServices';
-import { allocateServiceId, hasServiceReferences } from '@server/lib/serviceId';
+import {
+  allocateServiceId,
+  hasActiveServiceRequests,
+  hasServiceReferences,
+  removeLiveServiceReferences,
+} from '@server/lib/serviceId';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -187,7 +192,10 @@ radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   }
 
   const existing = settings.radarr[radarrIndex];
-  if (await hasServiceReferences('radarr', existing.id)) {
+  if (
+    isMultiServiceTarget(existing) &&
+    (await hasActiveServiceRequests('radarr', existing.id))
+  ) {
     return next({
       status: 409,
       message: 'This server is still referenced and cannot be deleted.',
@@ -198,6 +206,9 @@ radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   await settings.save();
 
   await removeRequestServiceGrants('radarr', removed[0].id);
+  if (isMultiServiceTarget(existing)) {
+    await removeLiveServiceReferences('radarr', removed[0].id);
+  }
 
   return res.status(200).json(removed[0]);
 });

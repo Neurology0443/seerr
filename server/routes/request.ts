@@ -1,5 +1,7 @@
 import RadarrAPI from '@server/api/servarr/radarr';
 import SonarrAPI from '@server/api/servarr/sonarr';
+import TheMovieDb from '@server/api/themoviedb';
+import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -52,7 +54,7 @@ const requestedTvSeasonsAvailable = (serviceRequest: boolean): string => {
       WHERE requested_season."requestId" = request.id
         AND (
           media_season.id IS NULL OR
-          CASE WHEN request.is4k = true
+          CASE WHEN request."is4k" = true
             THEN media_season.status4k
             ELSE media_season.status
           END != :availableStatus
@@ -67,7 +69,7 @@ const requestedTvSeasonsAvailable = (serviceRequest: boolean): string => {
   return `EXISTS (
     SELECT 1 FROM media_service_status matched_service_status
     WHERE matched_service_status."mediaId" = media.id
-      AND matched_service_status."serviceId" = request.serverId
+      AND matched_service_status."serviceId" = request."serverId"
       AND matched_service_status."serviceType" = :sonarrType
       AND NOT EXISTS (
         SELECT 1 FROM season_request requested_season
@@ -79,21 +81,21 @@ const requestedTvSeasonsAvailable = (serviceRequest: boolean): string => {
 
 const requestAvailableCondition = `(
   (request.type = :movieType AND (
-    (request.isServiceRequest = false AND (
-      (request.is4k = false AND media.status = :availableStatus) OR
-      (request.is4k = true AND media.status4k = :availableStatus)
+    (request."isServiceRequest" = false AND (
+      (request."is4k" = false AND media.status = :availableStatus) OR
+      (request."is4k" = true AND media."status4k" = :availableStatus)
     )) OR
-    (request.isServiceRequest = true AND EXISTS (
+    (request."isServiceRequest" = true AND EXISTS (
       SELECT 1 FROM media_service_status matched_service_status
       WHERE matched_service_status."mediaId" = media.id
-        AND matched_service_status."serviceId" = request.serverId
+        AND matched_service_status."serviceId" = request."serverId"
         AND matched_service_status."serviceType" = :radarrType
         AND matched_service_status.status = :availableStatus
     ))
   )) OR
   (request.type = :tvType AND (
-    (request.isServiceRequest = false AND ${requestedTvSeasonsAvailable(false)}) OR
-    (request.isServiceRequest = true AND ${requestedTvSeasonsAvailable(true)})
+    (request."isServiceRequest" = false AND ${requestedTvSeasonsAvailable(false)}) OR
+    (request."isServiceRequest" = true AND ${requestedTvSeasonsAvailable(true)})
   ))
 )`;
 
@@ -223,15 +225,15 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
       } else if (req.query.filter === 'deleted') {
         query = query.andWhere(
           `(
-            (request.isServiceRequest = false AND (
-              (request.is4k = false AND media.status IN (:...mediaStatus)) OR
-              (request.is4k = true AND media.status4k IN (:...mediaStatus))
+            (request."isServiceRequest" = false AND (
+              (request."is4k" = false AND media.status IN (:...mediaStatus)) OR
+              (request."is4k" = true AND media."status4k" IN (:...mediaStatus))
             )) OR
-            (request.isServiceRequest = true AND EXISTS (
+            (request."isServiceRequest" = true AND EXISTS (
               SELECT 1 FROM media_service_status matchedServiceStatus
-              WHERE matchedServiceStatus.mediaId = media.id
-                AND matchedServiceStatus.serviceId = request.serverId
-                AND matchedServiceStatus.serviceType = CASE
+              WHERE matchedServiceStatus."mediaId" = media.id
+                AND matchedServiceStatus."serviceId" = request."serverId"
+                AND matchedServiceStatus."serviceType" = CASE
                   WHEN request.type = :movieType THEN :radarrType
                   ELSE :sonarrType
                 END
@@ -663,25 +665,60 @@ requestRoutes.put<{ requestId: string }>(
             : req.body.serverId;
         const destinationChanging = requestedServerId !== request.serverId;
         const slotChanging = request.isServiceRequest && destinationChanging;
-        if (destinationChanging) {
-          validateRequestTarget({
-            mediaType: request.type,
-            serverId: requestedServerId,
-            isServiceRequest: request.isServiceRequest,
-            is4k: request.is4k,
-          });
+        const target = validateRequestTarget({
+          mediaType: request.type,
+          serverId: requestedServerId,
+          isServiceRequest: request.isServiceRequest,
+          is4k: request.is4k,
+        });
+        if (request.isServiceRequest && target?.is4k !== request.is4k) {
+          throw new InvalidServiceTargetError('Invalid request destination.');
+        }
 
-          if (
-            request.isServiceRequest &&
-            !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
-            !req.user?.requestServices?.includes(
-              `${request.type === MediaType.MOVIE ? 'radarr' : 'sonarr'}:${
-                requestedServerId
-              }`
-            )
-          ) {
-            throw new RequestPermissionError(
-              'You do not have permission to request in this service.'
+        const qualityPermissions =
+          request.type === MediaType.MOVIE
+            ? request.is4k
+              ? [Permission.REQUEST_4K, Permission.REQUEST_4K_MOVIE]
+              : [Permission.REQUEST, Permission.REQUEST_MOVIE]
+            : request.is4k
+              ? [Permission.REQUEST_4K, Permission.REQUEST_4K_TV]
+              : [Permission.REQUEST, Permission.REQUEST_TV];
+        if (
+          !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
+          !requestUser.hasPermission(qualityPermissions, { type: 'or' })
+        ) {
+          throw new RequestPermissionError(
+            'You do not have permission to request in this service.'
+          );
+        }
+
+        if (
+          request.isServiceRequest &&
+          !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
+          !req.user?.requestServices?.includes(
+            `${request.type === MediaType.MOVIE ? 'radarr' : 'sonarr'}:${
+              requestedServerId
+            }`
+          )
+        ) {
+          throw new RequestPermissionError(
+            'You do not have permission to request in this service.'
+          );
+        }
+
+        if (target?.animeOnly) {
+          const tmdb = new TheMovieDb();
+          const tmdbMedia =
+            request.type === MediaType.MOVIE
+              ? await tmdb.getMovie({ movieId: request.media.tmdbId })
+              : await tmdb.getTvShow({ tvId: request.media.tmdbId });
+          const keywords =
+            'results' in tmdbMedia.keywords
+              ? tmdbMedia.keywords.results
+              : tmdbMedia.keywords.keywords;
+          if (!keywords.some((keyword) => keyword.id === ANIME_KEYWORD_ID)) {
+            throw new InvalidServiceTargetError(
+              'This request destination is restricted to anime.'
             );
           }
         }
@@ -740,13 +777,25 @@ requestRoutes.put<{ requestId: string }>(
                 return res.status(200).json(request);
               }
 
-              const requestedSeasons = req.body.seasons as number[] | undefined;
+              const rawRequestedSeasons = req.body.seasons as
+                | number[]
+                | undefined;
 
-              if (!requestedSeasons || requestedSeasons.length === 0) {
+              if (!rawRequestedSeasons || rawRequestedSeasons.length === 0) {
                 throw new Error(
                   'Missing seasons. If you want to cancel a series request, use the DELETE method.'
                 );
               }
+              if (
+                rawRequestedSeasons.some(
+                  (season) => !Number.isInteger(season) || season < 0
+                )
+              ) {
+                throw new InvalidServiceTargetError(
+                  'Invalid season selection.'
+                );
+              }
+              const requestedSeasons = [...new Set(rawRequestedSeasons)];
 
               const existingSeasons = otherActiveRequests.flatMap((other) =>
                 other.seasons.map((season) => season.seasonNumber)
@@ -783,9 +832,7 @@ requestRoutes.put<{ requestId: string }>(
                   serviceStatus?.seasonStatuses ?? {}
                 )
                   .filter(
-                    ([, status]) =>
-                      status !== MediaStatus.UNKNOWN &&
-                      status !== MediaStatus.DELETED
+                    ([, status]) => status === MediaStatus.AVAILABLE
                   )
                   .map(([seasonNumber]) => Number(seasonNumber));
               } else {

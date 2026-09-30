@@ -842,7 +842,7 @@ describe('Radarr Scanner', () => {
       const serviceStatus = await getRepository(
         MediaServiceStatus
       ).findOneOrFail({ where: { mediaId, serviceId: 0 } });
-      assert.strictEqual(serviceStatus.status, MediaStatus.UNKNOWN);
+      assert.strictEqual(serviceStatus.status, MediaStatus.DELETED);
       const updatedRequest = await getRepository(MediaRequest).findOneByOrFail({
         id: serviceRequest.id,
       });
