@@ -312,8 +312,11 @@ export class MediaRequest {
         requestBody.mediaType === MediaType.MOVIE &&
         existing.some(
           (request) =>
-            request.status === MediaRequestStatus.PENDING ||
-            request.status === MediaRequestStatus.APPROVED
+            isServiceSpecific
+              ? request.status === MediaRequestStatus.PENDING ||
+                request.status === MediaRequestStatus.APPROVED
+              : request.status !== MediaRequestStatus.DECLINED &&
+                request.status !== MediaRequestStatus.COMPLETED
         )
       ) {
         logger.warn('Duplicate request for media blocked', {
@@ -336,7 +339,10 @@ export class MediaRequest {
           (r) =>
             r.requestedBy.id === requestUser.id &&
             r.isAutoRequest &&
-            r.media?.[statusKey] !== MediaStatus.DELETED
+            (isServiceSpecific
+              ? r.status === MediaRequestStatus.PENDING ||
+                r.status === MediaRequestStatus.APPROVED
+              : r.media?.[statusKey] !== MediaStatus.DELETED)
         )
       ) {
         throw new DuplicateMediaRequestError(
@@ -449,7 +455,10 @@ export class MediaRequest {
                   season.season_number !== 0 && season.episode_count > 0
               )
               .map((season) => season.season_number)
-          : (requestBody.seasons as number[]);
+          : requestBody.seasons;
+      if (!Array.isArray(requestedSeasons)) {
+        throw new InvalidServiceTargetError('Invalid season selection.');
+      }
       if (
         requestedSeasons.some(
           (season) => !Number.isInteger(season) || season < 0
@@ -477,8 +486,11 @@ export class MediaRequest {
                 !!requestBody.is4k,
                 requestBody.serverId
               ) &&
-              (request.status === MediaRequestStatus.PENDING ||
-                request.status === MediaRequestStatus.APPROVED)
+              (isServiceSpecific
+                ? request.status === MediaRequestStatus.PENDING ||
+                  request.status === MediaRequestStatus.APPROVED
+                : request.status !== MediaRequestStatus.DECLINED &&
+                  request.status !== MediaRequestStatus.COMPLETED)
             );
           })
           .reduce((seasons, request) => {

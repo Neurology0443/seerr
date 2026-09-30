@@ -83,6 +83,7 @@ const RequestBlock = ({ request, onUpdate }: RequestBlockProps) => {
         tmdbId={request.media.tmdbId}
         type={request.type}
         is4k={request.is4k}
+        serverId={request.isServiceRequest ? request.serverId : undefined}
         editRequest={request}
         onCancel={() => setShowEditModal(false)}
         onComplete={() => {

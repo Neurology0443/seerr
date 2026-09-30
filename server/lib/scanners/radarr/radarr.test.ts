@@ -815,6 +815,13 @@ describe('Radarr Scanner', () => {
 
     it('resets per-service status for a movie removed from the server', async () => {
       const mediaId = await seedServiceStatus(561, MediaStatus.PROCESSING);
+      configureRadarr([
+        {
+          syncEnabled: true,
+          buttonLabel: 'Deutsch',
+          isDefault: false,
+        },
+      ]);
       const media = await getRepository(Media).findOneByOrFail({ id: mediaId });
       const requestedBy = await getRepository(User).findOneOrFail({
         where: { email: 'admin@seerr.dev' },
@@ -833,7 +840,6 @@ describe('Radarr Scanner', () => {
       serviceRequest.status = MediaRequestStatus.APPROVED;
       await getRepository(MediaRequest).save(serviceRequest);
 
-      configureRadarr([{ syncEnabled: true }]);
       getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 562, id: 98 })];
       getLibraryMoviesByTmdbIdImpl = async () => [];
 

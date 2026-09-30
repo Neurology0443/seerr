@@ -397,7 +397,8 @@ const RequestButton = ({
       (request) =>
         request.isServiceRequest &&
         request.serverId === service.id &&
-        request.status === MediaRequestStatus.PENDING
+        (request.status === MediaRequestStatus.PENDING ||
+          request.status === MediaRequestStatus.APPROVED)
     );
     const userServiceRequest = activeServiceRequests?.find(
       (request) => request.requestedBy.id === user?.id
@@ -408,8 +409,8 @@ const RequestButton = ({
         (request) =>
           request.isServiceRequest &&
           request.serverId === service.id &&
-          request.status !== MediaRequestStatus.DECLINED &&
-          request.status !== MediaRequestStatus.COMPLETED
+          (request.status === MediaRequestStatus.PENDING ||
+            request.status === MediaRequestStatus.APPROVED)
       );
     if (
       serviceStatusEntry &&

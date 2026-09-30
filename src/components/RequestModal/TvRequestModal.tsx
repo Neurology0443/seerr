@@ -106,6 +106,13 @@ const TvRequestModal = ({
     request: Pick<MediaRequest, 'isServiceRequest' | 'serverId' | 'is4k'>
   ): boolean => isRequestInSlot(request, serverId, is4k);
 
+  const isBlockingRequest = (request: MediaRequest): boolean =>
+    serverId != null
+      ? request.status === MediaRequestStatus.PENDING ||
+        request.status === MediaRequestStatus.APPROVED
+      : request.status !== MediaRequestStatus.DECLINED &&
+        request.status !== MediaRequestStatus.COMPLETED;
+
   const getSeasonStatus = (seasonNumber: number): MediaStatus =>
     getDestinationSeasonStatus({
       seasonNumber,
@@ -280,8 +287,7 @@ const TvRequestModal = ({
         (request) =>
           isCurrentSlot(request) &&
           request.id !== editRequest?.id &&
-          request.status !== MediaRequestStatus.DECLINED &&
-          request.status !== MediaRequestStatus.COMPLETED
+          isBlockingRequest(request)
       )
       .reduce((requestedSeasons, request) => {
         return [
@@ -293,8 +299,10 @@ const TvRequestModal = ({
     const availableSeasons = getAllSeasons()
       .filter(
         (seasonNumber) =>
-          getSeasonStatus(seasonNumber) !== MediaStatus.UNKNOWN &&
-          getSeasonStatus(seasonNumber) !== MediaStatus.DELETED &&
+          (serverId != null
+            ? getSeasonStatus(seasonNumber) === MediaStatus.AVAILABLE
+            : getSeasonStatus(seasonNumber) !== MediaStatus.UNKNOWN &&
+              getSeasonStatus(seasonNumber) !== MediaStatus.DELETED) &&
           !editingSeasons.includes(seasonNumber) &&
           !requestedSeasons.includes(seasonNumber)
       );
@@ -375,17 +383,13 @@ const TvRequestModal = ({
       data?.mediaInfo &&
       (data.mediaInfo.requests || []).filter(
         (request) =>
-          isCurrentSlot(request) &&
-          request.status !== MediaRequestStatus.DECLINED &&
-          request.status !== MediaRequestStatus.COMPLETED
+          isCurrentSlot(request) && isBlockingRequest(request)
       ).length > 0
     ) {
       data.mediaInfo.requests
         .filter(
           (request) =>
-            isCurrentSlot(request) &&
-            request.status !== MediaRequestStatus.DECLINED &&
-            request.status !== MediaRequestStatus.COMPLETED
+            isCurrentSlot(request) && isBlockingRequest(request)
         )
         .forEach((request) => {
           if (!seasonRequest) {

@@ -1035,6 +1035,9 @@ class BaseScanner<T> {
 
       if (isComplete) {
         request.status = MediaRequestStatus.COMPLETED;
+        request.seasons.forEach((season) => {
+          season.status = MediaRequestStatus.COMPLETED;
+        });
         await requestRepository.save(request);
         this.log(
           `Service request ${request.id} marked as completed (service ${serviceId})`,

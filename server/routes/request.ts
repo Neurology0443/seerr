@@ -55,7 +55,7 @@ const requestedTvSeasonsAvailable = (serviceRequest: boolean): string => {
         AND (
           media_season.id IS NULL OR
           CASE WHEN request."is4k" = true
-            THEN media_season.status4k
+            THEN media_season."status4k"
             ELSE media_season.status
           END != :availableStatus
         )

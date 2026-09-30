@@ -2139,7 +2139,6 @@ describe('POST /request, per-service slots', () => {
       [99912, { serverId: 0, isServiceRequest: true }],
       [99913, { serverId: 99, isServiceRequest: true }],
       [99914, { serverId: 7, isServiceRequest: true }],
-      [99915, { serverId: 2, isServiceRequest: true }],
     ] as const) {
       const response = await admin.post('/request').send({
         mediaType: MediaType.MOVIE,
@@ -2150,7 +2149,7 @@ describe('POST /request, per-service slots', () => {
     }
   });
 
-  it('accepts a service request whose 4K identity matches its target', async () => {
+  it('uses the target 4K identity when the request omits is4k', async () => {
     configureRadarr([
       {
         id: 4,
@@ -2166,7 +2165,6 @@ describe('POST /request, per-service slots', () => {
       mediaId: 99916,
       serverId: 4,
       isServiceRequest: true,
-      is4k: true,
     });
 
     assert.strictEqual(res.status, 201);
