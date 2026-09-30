@@ -2,9 +2,14 @@ import RadarrAPI from '@server/api/servarr/radarr';
 import SonarrAPI from '@server/api/servarr/sonarr';
 import TautulliAPI from '@server/api/tautulli';
 import TheMovieDb from '@server/api/themoviedb';
-import { MediaStatus, MediaType } from '@server/constants/media';
-import { getRepository } from '@server/datasource';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
+import dataSource, { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaRequest } from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import Season from '@server/entity/Season';
 import { User } from '@server/entity/User';
@@ -320,39 +325,58 @@ mediaRoutes.delete(
       }
 
       if (isServiceDelete) {
-        const serviceStatusRepository = getRepository(MediaServiceStatus);
-        const serviceStatus = await serviceStatusRepository.findOne({
-          where: {
-            mediaId: media.id,
-            serviceId: explicitServiceId,
-          },
-        });
-
-        const deletedServiceStatus =
-          serviceStatus ??
-          new MediaServiceStatus({
-            mediaId: media.id,
-            serviceId: explicitServiceId,
-            serviceType: isMovie ? 'radarr' : 'sonarr',
+        await dataSource.transaction(async (manager) => {
+          const serviceStatusRepository =
+            manager.getRepository(MediaServiceStatus);
+          const serviceStatus = await serviceStatusRepository.findOne({
+            where: { mediaId: media.id, serviceId: explicitServiceId },
           });
-        deletedServiceStatus.status = MediaStatus.DELETED;
-        deletedServiceStatus.externalServiceId = null;
-        deletedServiceStatus.externalServiceSlug = null;
-        if (!isMovie) {
-          const seasonNumbers = new Set([
-            ...Object.keys(deletedServiceStatus.seasonStatuses ?? {}).map(
-              Number
-            ),
-            ...media.seasons.map((season) => season.seasonNumber),
-          ]);
-          deletedServiceStatus.seasonStatuses = Object.fromEntries(
-            [...seasonNumbers].map((seasonNumber) => [
-              seasonNumber,
-              MediaStatus.DELETED,
-            ])
-          );
-        }
-        await serviceStatusRepository.save(deletedServiceStatus);
+
+          const deletedServiceStatus =
+            serviceStatus ??
+            new MediaServiceStatus({
+              mediaId: media.id,
+              serviceId: explicitServiceId,
+              serviceType: isMovie ? 'radarr' : 'sonarr',
+            });
+          deletedServiceStatus.status = MediaStatus.DELETED;
+          deletedServiceStatus.externalServiceId = null;
+          deletedServiceStatus.externalServiceSlug = null;
+          if (!isMovie) {
+            const seasonNumbers = new Set([
+              ...Object.keys(deletedServiceStatus.seasonStatuses ?? {}).map(
+                Number
+              ),
+              ...media.seasons.map((season) => season.seasonNumber),
+            ]);
+            deletedServiceStatus.seasonStatuses = Object.fromEntries(
+              [...seasonNumbers].map((seasonNumber) => [
+                seasonNumber,
+                MediaStatus.DELETED,
+              ])
+            );
+          }
+          await serviceStatusRepository.save(deletedServiceStatus);
+
+          const requests = await manager.getRepository(MediaRequest).find({
+            where: {
+              media: { id: media.id },
+              serverId: explicitServiceId,
+              isServiceRequest: true,
+              status: MediaRequestStatus.APPROVED,
+            },
+            relations: {
+              media: true,
+              seasons: true,
+              requestedBy: true,
+              modifiedBy: true,
+            },
+          });
+          for (const request of requests) {
+            request.status = MediaRequestStatus.DECLINED;
+            await manager.getRepository(MediaRequest).save(request);
+          }
+        });
       } else {
         media[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
         media.resetServiceData(is4k);

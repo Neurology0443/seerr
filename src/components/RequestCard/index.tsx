@@ -465,10 +465,17 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
             ) : (
               <StatusBadge
                 status={
-                  serviceSlotStatus ??
-                  requestData.media[requestData.is4k ? 'status4k' : 'status']
+                  requestData.isServiceRequest
+                    ? (serviceSlotStatus ?? MediaStatus.UNKNOWN)
+                    : requestData.media[
+                        requestData.is4k ? 'status4k' : 'status'
+                      ]
                 }
-                downloadItem={serviceDownloadStatus ?? requestDownloadStatus}
+                downloadItem={
+                  requestData.isServiceRequest
+                    ? serviceDownloadStatus
+                    : requestDownloadStatus
+                }
                 title={isMovie(title) ? title.title : title.name}
                 inProgress={
                   (serviceDownloadStatus ?? requestDownloadStatus).length > 0

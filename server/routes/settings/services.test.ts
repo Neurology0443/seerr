@@ -2,9 +2,14 @@ import assert from 'node:assert/strict';
 import { before, beforeEach, describe, it } from 'node:test';
 
 import { getRepository } from '@server/datasource';
-import { MediaRequestStatus, MediaStatus, MediaType } from '@server/constants/media';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
+import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import OverrideRule from '@server/entity/OverrideRule';
 import { User } from '@server/entity/User';
 import { getSettings } from '@server/lib/settings';
@@ -201,6 +206,38 @@ for (const type of ['radarr', 'sonarr'] as const) {
           type === 'radarr' ? { radarrServiceId: 13 } : { sonarrServiceId: 13 }
         )
       );
+      const mediaType = type === 'radarr' ? MediaType.MOVIE : MediaType.TV;
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: type === 'radarr' ? 9113 : 9114,
+          mediaType,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      const requestedBy = await getRepository(User).findOneOrFail({
+        where: { email: 'admin@seerr.dev' },
+      });
+      requestedBy.requestServices = [`${type}:13`];
+      await getRepository(User).save(requestedBy);
+      const historicalRequest = await getRepository(MediaRequest).save(
+        new MediaRequest({
+          type: mediaType,
+          status: MediaRequestStatus.FAILED,
+          media,
+          requestedBy,
+          serverId: 13,
+          isServiceRequest: true,
+          is4k: false,
+        })
+      );
+      await getRepository(MediaServiceStatus).save(
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 13,
+          serviceType: type,
+          status: MediaStatus.DELETED,
+        })
+      );
 
       await request(app).delete(`/settings/${type}/13`).expect(200);
       assert.deepEqual(settings[type], []);
@@ -213,6 +250,23 @@ for (const type of ['radarr', 'sonarr'] as const) {
           : updatedRule.sonarrServiceId,
         null
       );
+      assert.equal(
+        await getRepository(MediaServiceStatus).existsBy({
+          serviceId: 13,
+          serviceType: type,
+        }),
+        false
+      );
+      assert.equal(
+        await getRepository(MediaRequest).existsBy({
+          id: historicalRequest.id,
+        }),
+        true
+      );
+      const updatedUser = await getRepository(User).findOneByOrFail({
+        id: requestedBy.id,
+      });
+      assert.deepEqual(updatedUser.requestServices, []);
     });
 
     it('refuses to delete a labelled target with an active request', async () => {

@@ -7,6 +7,7 @@ import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import SearchByNameModal from '@app/components/RequestModal/SearchByNameModal';
 import {
   getDestinationSeasonStatus,
+  isSeasonUnavailableForRequest,
   isRequestInSlot,
 } from '@app/components/RequestModal/tvSeasonSelection';
 import useSettings from '@app/hooks/useSettings';
@@ -296,16 +297,15 @@ const TvRequestModal = ({
         ];
       }, [] as number[]);
 
-    const availableSeasons = getAllSeasons()
-      .filter(
-        (seasonNumber) =>
-          (serverId != null
-            ? getSeasonStatus(seasonNumber) === MediaStatus.AVAILABLE
-            : getSeasonStatus(seasonNumber) !== MediaStatus.UNKNOWN &&
-              getSeasonStatus(seasonNumber) !== MediaStatus.DELETED) &&
-          !editingSeasons.includes(seasonNumber) &&
-          !requestedSeasons.includes(seasonNumber)
-      );
+    const availableSeasons = getAllSeasons().filter(
+      (seasonNumber) =>
+        isSeasonUnavailableForRequest(
+          getSeasonStatus(seasonNumber),
+          serverId != null
+        ) &&
+        !editingSeasons.includes(seasonNumber) &&
+        !requestedSeasons.includes(seasonNumber)
+    );
 
     return [...requestedSeasons, ...availableSeasons];
   };
@@ -382,14 +382,12 @@ const TvRequestModal = ({
     if (
       data?.mediaInfo &&
       (data.mediaInfo.requests || []).filter(
-        (request) =>
-          isCurrentSlot(request) && isBlockingRequest(request)
+        (request) => isCurrentSlot(request) && isBlockingRequest(request)
       ).length > 0
     ) {
       data.mediaInfo.requests
         .filter(
-          (request) =>
-            isCurrentSlot(request) && isBlockingRequest(request)
+          (request) => isCurrentSlot(request) && isBlockingRequest(request)
         )
         .forEach((request) => {
           if (!seasonRequest) {
@@ -615,12 +613,11 @@ const TvRequestModal = ({
                       const seasonRequest = getSeasonRequest(
                         season.seasonNumber
                       );
-                      const seasonStatus = getSeasonStatus(
-                        season.seasonNumber
+                      const seasonStatus = getSeasonStatus(season.seasonNumber);
+                      const isSeasonAvailable = isSeasonUnavailableForRequest(
+                        seasonStatus,
+                        serverId != null
                       );
-                      const isSeasonAvailable =
-                        seasonStatus !== MediaStatus.UNKNOWN &&
-                        seasonStatus !== MediaStatus.DELETED;
                       const isOwnedEditingSeason =
                         !!editRequest &&
                         editingSeasons.includes(season.seasonNumber);

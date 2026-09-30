@@ -151,13 +151,16 @@ const RequestItemError = ({
                 ) : (
                   <StatusBadge
                     status={
-                      serviceSlotStatus ??
-                      requestData.media[
-                        requestData.is4k ? 'status4k' : 'status'
-                      ]
+                      requestData.isServiceRequest
+                        ? (serviceSlotStatus ?? MediaStatus.UNKNOWN)
+                        : requestData.media[
+                            requestData.is4k ? 'status4k' : 'status'
+                          ]
                     }
                     downloadItem={
-                      serviceDownloadStatus ?? requestDownloadStatus
+                      requestData.isServiceRequest
+                        ? serviceDownloadStatus
+                        : requestDownloadStatus
                     }
                     title={intl.formatMessage(messages.unknowntitle)}
                     inProgress={
@@ -567,10 +570,17 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
               ) : (
                 <StatusBadge
                   status={
-                    serviceSlotStatus ??
-                    requestData.media[requestData.is4k ? 'status4k' : 'status']
+                    requestData.isServiceRequest
+                      ? (serviceSlotStatus ?? MediaStatus.UNKNOWN)
+                      : requestData.media[
+                          requestData.is4k ? 'status4k' : 'status'
+                        ]
                   }
-                  downloadItem={serviceDownloadStatus ?? requestDownloadStatus}
+                  downloadItem={
+                    requestData.isServiceRequest
+                      ? serviceDownloadStatus
+                      : requestDownloadStatus
+                  }
                   title={isMovie(title) ? title.title : title.name}
                   inProgress={
                     (serviceDownloadStatus ?? requestDownloadStatus).length > 0

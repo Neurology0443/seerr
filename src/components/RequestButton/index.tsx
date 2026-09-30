@@ -400,6 +400,9 @@ const RequestButton = ({
         (request.status === MediaRequestStatus.PENDING ||
           request.status === MediaRequestStatus.APPROVED)
     );
+    const pendingServiceRequests = activeServiceRequests?.filter(
+      (request) => request.status === MediaRequestStatus.PENDING
+    );
     const userServiceRequest = activeServiceRequests?.find(
       (request) => request.requestedBy.id === user?.id
     );
@@ -470,8 +473,8 @@ const RequestButton = ({
       });
 
       if (
-        activeServiceRequests &&
-        activeServiceRequests.length > 0 &&
+        pendingServiceRequests &&
+        pendingServiceRequests.length > 0 &&
         hasPermission(Permission.MANAGE_REQUESTS)
       ) {
         buttons.push(
@@ -481,7 +484,7 @@ const RequestButton = ({
               label: service.buttonLabel,
             }),
             action: () => {
-              modifyRequests(activeServiceRequests, 'approve');
+              modifyRequests(pendingServiceRequests, 'approve');
             },
             svg: <CheckIcon />,
           },
@@ -491,7 +494,7 @@ const RequestButton = ({
               label: service.buttonLabel,
             }),
             action: () => {
-              modifyRequests(activeServiceRequests, 'decline');
+              modifyRequests(pendingServiceRequests, 'decline');
             },
             svg: <XMarkIcon />,
           }
@@ -514,19 +517,20 @@ const RequestButton = ({
 
   const [buttonOne, ...others] = buttons;
 
-  const pendingServiceRequests =
+  const occupiedServiceRequests =
     activeServiceModal.serverId !== null
       ? media?.requests.filter(
           (request) =>
             request.isServiceRequest &&
-            request.status === MediaRequestStatus.PENDING &&
+            (request.status === MediaRequestStatus.PENDING ||
+              request.status === MediaRequestStatus.APPROVED) &&
             request.serverId === activeServiceModal.serverId
         )
       : undefined;
   const activeServiceRequest =
-    pendingServiceRequests?.find(
+    occupiedServiceRequests?.find(
       (request) => request.requestedBy.id === user?.id
-    ) ?? pendingServiceRequests?.[0];
+    ) ?? occupiedServiceRequests?.[0];
   const selectedService = allServices?.find(
     (service) => service.id === activeServiceModal.serverId
   );

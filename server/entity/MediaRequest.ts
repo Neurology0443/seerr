@@ -21,6 +21,8 @@ import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
 import requestLock, {
   mediaKey,
   mediaLock,
+  serviceTargetKey,
+  serviceTargetLock,
   userKey,
 } from '@server/utils/requestLock';
 import { truncate } from 'lodash';
@@ -59,33 +61,51 @@ export class MediaRequest {
     user: User,
     options: MediaRequestOptions = {}
   ): Promise<MediaRequest> {
-    const target = validateRequestTarget({
-      mediaType: requestBody.mediaType,
-      serverId: requestBody.serverId,
-      isServiceRequest: !!requestBody.isServiceRequest,
-      is4k: !!requestBody.is4k,
-    });
-    // A labelled target owns its quality identity. Native requests retain the
-    // historical body-driven Standard/4K behavior.
-    const body = {
-      ...requestBody,
-      is4k: requestBody.isServiceRequest ? !!target?.is4k : !!requestBody.is4k,
+    const create = async (): Promise<MediaRequest> => {
+      const target = validateRequestTarget({
+        mediaType: requestBody.mediaType,
+        serverId: requestBody.serverId,
+        isServiceRequest: !!requestBody.isServiceRequest,
+        is4k: !!requestBody.is4k,
+      });
+      // A labelled target owns its quality identity. Native requests retain the
+      // historical body-driven Standard/4K behavior.
+      const body = {
+        ...requestBody,
+        is4k: requestBody.isServiceRequest
+          ? !!target?.is4k
+          : !!requestBody.is4k,
+      };
+
+      // Only a caller allowed to set the request user may queue on their lock
+      const lockUserId =
+        body.userId &&
+        user.hasPermission([
+          Permission.MANAGE_USERS,
+          Permission.MANAGE_REQUESTS,
+        ])
+          ? body.userId
+          : user.id;
+
+      // No is4k in the key: one media row holds both statuses, so a 4k and a
+      // non-4k request for the same title race to create it
+      return requestLock.dispatch(userKey(lockUserId), () =>
+        mediaLock.dispatch(mediaKey(body.mediaType, body.mediaId), () =>
+          MediaRequest.createRequest(body, user, options)
+        )
+      );
     };
 
-    // Only a caller allowed to set the request user may queue on their lock
-    const lockUserId =
-      body.userId &&
-      user.hasPermission([Permission.MANAGE_USERS, Permission.MANAGE_REQUESTS])
-        ? body.userId
-        : user.id;
-
-    // No is4k in the key: one media row holds both statuses, so a 4k and a
-    // non-4k request for the same title race to create it
-    return requestLock.dispatch(userKey(lockUserId), () =>
-      mediaLock.dispatch(mediaKey(body.mediaType, body.mediaId), () =>
-        MediaRequest.createRequest(body, user, options)
-      )
-    );
+    if (requestBody.isServiceRequest && requestBody.serverId != null) {
+      return serviceTargetLock.dispatch(
+        serviceTargetKey(
+          requestBody.mediaType === MediaType.MOVIE ? 'radarr' : 'sonarr',
+          requestBody.serverId
+        ),
+        create
+      );
+    }
+    return create();
   }
 
   private static async createRequest(
@@ -197,12 +217,11 @@ export class MediaRequest {
 
     if (
       target?.animeOnly &&
-      !('results' in tmdbMedia.keywords
-        ? tmdbMedia.keywords.results
-        : tmdbMedia.keywords.keywords
-      ).some(
-        (keyword) => keyword.id === ANIME_KEYWORD_ID
-      )
+      !(
+        'results' in tmdbMedia.keywords
+          ? tmdbMedia.keywords.results
+          : tmdbMedia.keywords.keywords
+      ).some((keyword) => keyword.id === ANIME_KEYWORD_ID)
     ) {
       throw new InvalidServiceTargetError(
         'This request destination is restricted to anime.'
@@ -310,13 +329,12 @@ export class MediaRequest {
       // If there is an existing movie request that isn't declined, don't allow a new one.
       if (
         requestBody.mediaType === MediaType.MOVIE &&
-        existing.some(
-          (request) =>
-            isServiceSpecific
-              ? request.status === MediaRequestStatus.PENDING ||
-                request.status === MediaRequestStatus.APPROVED
-              : request.status !== MediaRequestStatus.DECLINED &&
-                request.status !== MediaRequestStatus.COMPLETED
+        existing.some((request) =>
+          isServiceSpecific
+            ? request.status === MediaRequestStatus.PENDING ||
+              request.status === MediaRequestStatus.APPROVED
+            : request.status !== MediaRequestStatus.DECLINED &&
+              request.status !== MediaRequestStatus.COMPLETED
         )
       ) {
         logger.warn('Duplicate request for media blocked', {
@@ -517,9 +535,7 @@ export class MediaRequest {
           existingSeasons = [
             ...existingSeasons,
             ...Object.entries(serviceStatus?.seasonStatuses ?? {})
-              .filter(
-                ([, status]) => status === MediaStatus.AVAILABLE
-              )
+              .filter(([, status]) => status === MediaStatus.AVAILABLE)
               .map(([seasonNumber]) => Number(seasonNumber)),
           ];
         }

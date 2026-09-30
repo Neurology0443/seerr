@@ -799,11 +799,33 @@ describe('Radarr Scanner', () => {
       assert.strictEqual(unchangedMedia.status, MediaStatus.PROCESSING);
     });
 
-    it('keeps per-service status when the server returns no movies', async () => {
+    it('deletes confirmed absent service status when a healthy inventory is empty', async () => {
       const mediaId = await seedServiceStatus(560);
 
-      configureRadarr([{ syncEnabled: true }]);
+      configureRadarr([
+        { syncEnabled: true, buttonLabel: 'Deutsch', isDefault: false },
+      ]);
       getMoviesImpl = async () => [];
+      getLibraryMoviesByTmdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      const serviceStatus = await getRepository(
+        MediaServiceStatus
+      ).findOneOrFail({ where: { mediaId, serviceId: 0 } });
+      assert.strictEqual(serviceStatus.status, MediaStatus.DELETED);
+    });
+
+    it('keeps service status when absence confirmation fails', async () => {
+      const mediaId = await seedServiceStatus(563);
+
+      configureRadarr([
+        { syncEnabled: true, buttonLabel: 'Deutsch', isDefault: false },
+      ]);
+      getMoviesImpl = async () => [];
+      getLibraryMoviesByTmdbIdImpl = async () => {
+        throw new Error('Radarr unavailable');
+      };
 
       await runWithMockTimers(() => radarrScanner.run());
 
@@ -829,7 +851,7 @@ describe('Radarr Scanner', () => {
       const serviceRequest = await getRepository(MediaRequest).save(
         new MediaRequest({
           type: MediaType.MOVIE,
-          status: MediaRequestStatus.PENDING,
+          status: MediaRequestStatus.APPROVED,
           media,
           requestedBy,
           serverId: 0,
@@ -837,9 +859,6 @@ describe('Radarr Scanner', () => {
           is4k: false,
         })
       );
-      serviceRequest.status = MediaRequestStatus.APPROVED;
-      await getRepository(MediaRequest).save(serviceRequest);
-
       getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 562, id: 98 })];
       getLibraryMoviesByTmdbIdImpl = async () => [];
 

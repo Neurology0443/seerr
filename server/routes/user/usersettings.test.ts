@@ -132,3 +132,77 @@ describe('POST /user/:id/settings/linked-accounts/jellyfin/quickconnect', () => 
     assert.strictEqual(user.jellyfinUserId, null);
   });
 });
+
+describe('POST /user/:id/settings/permissions request services', () => {
+  it('validates and deduplicates labelled target grants', async () => {
+    const settings = getSettings();
+    settings.radarr = [
+      {
+        id: 41,
+        name: 'German',
+        hostname: 'localhost',
+        port: 7878,
+        apiKey: 'key',
+        baseUrl: '',
+        useSsl: false,
+        activeProfileId: 1,
+        activeProfileName: 'Profile',
+        activeDirectory: '/movies',
+        is4k: false,
+        minimumAvailability: 'released',
+        tags: [],
+        tagRequests: false,
+        overrideRule: [],
+        isDefault: false,
+        syncEnabled: true,
+        preventSearch: false,
+        externalUrl: '',
+        buttonLabel: 'Deutsch',
+      },
+      {
+        id: 42,
+        name: 'Native',
+        hostname: 'localhost',
+        port: 7878,
+        apiKey: 'key',
+        baseUrl: '',
+        useSsl: false,
+        activeProfileId: 1,
+        activeProfileName: 'Profile',
+        activeDirectory: '/movies',
+        is4k: false,
+        minimumAvailability: 'released',
+        tags: [],
+        tagRequests: false,
+        overrideRule: [],
+        isDefault: true,
+        syncEnabled: true,
+        preventSearch: false,
+        externalUrl: '',
+      },
+    ];
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const demo = await getRepository(User).findOneByOrFail({
+      email: 'demo@seerr.dev',
+    });
+
+    const accepted = await admin.agent
+      .post(`/user/${demo.id}/settings/permissions`)
+      .send({
+        permissions: demo.permissions,
+        requestServices: ['radarr:41', 'radarr:41'],
+      });
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(accepted.body.requestServices, ['radarr:41']);
+
+    for (const invalid of ['radarr:42', 'radarr:999', 'sonarr:41']) {
+      const rejected = await admin.agent
+        .post(`/user/${demo.id}/settings/permissions`)
+        .send({
+          permissions: demo.permissions,
+          requestServices: [invalid],
+        });
+      assert.equal(rejected.status, 400);
+    }
+  });
+});

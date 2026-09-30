@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import { MediaStatus } from '@server/constants/media';
 import {
   getDestinationSeasonStatus,
+  isSeasonUnavailableForRequest,
   isRequestInSlot,
 } from './tvSeasonSelection';
 
@@ -92,5 +93,20 @@ describe('TV request destination selection', () => {
       }),
       MediaStatus.UNKNOWN
     );
+  });
+
+  it('blocks only available seasons for a multi-service target', () => {
+    assert.equal(
+      isSeasonUnavailableForRequest(MediaStatus.AVAILABLE, true),
+      true
+    );
+    for (const status of [
+      MediaStatus.PROCESSING,
+      MediaStatus.PARTIALLY_AVAILABLE,
+      MediaStatus.UNKNOWN,
+      MediaStatus.DELETED,
+    ]) {
+      assert.equal(isSeasonUnavailableForRequest(status, true), false);
+    }
   });
 });

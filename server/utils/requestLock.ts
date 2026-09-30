@@ -7,10 +7,15 @@ const requestLock = new AsyncLock();
 
 // keyed on media. always taken inside requestLock, never around it.
 export const mediaLock = new AsyncLock();
+// Coordinates request persistence with deletion of one destination. Never use
+// this lock from an entity subscriber.
+export const serviceTargetLock = new AsyncLock();
 
 export const userKey = (userId: number) => `user:${userId}`;
 export const requestKey = (requestId: number) => `request:${requestId}`;
 export const mediaKey = (mediaType: MediaType, mediaId: number) =>
   `${mediaType}:${mediaId}`;
+export const serviceTargetKey = (type: 'radarr' | 'sonarr', id: number) =>
+  `${type}:${id}`;
 
 export default requestLock;
