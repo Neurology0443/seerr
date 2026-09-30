@@ -125,7 +125,7 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
     return next({
       status: 409,
       message:
-        'This server is already referenced and its request role or 4K identity cannot be changed. Delete and recreate the server instead.',
+        'This server is already referenced and its request role or 4K identity cannot be changed.',
     });
   }
 
@@ -146,7 +146,7 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
   return res.status(200).json(settings.sonarr[sonarrIndex]);
 });
 
-sonarrRoutes.delete<{ id: string }>('/:id', async (req, res) => {
+sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   const settings = getSettings();
 
   const sonarrIndex = settings.sonarr.findIndex(
@@ -157,6 +157,14 @@ sonarrRoutes.delete<{ id: string }>('/:id', async (req, res) => {
     return res
       .status(404)
       .json({ status: '404', message: 'Settings instance not found' });
+  }
+
+  const existing = settings.sonarr[sonarrIndex];
+  if (await hasServiceReferences('sonarr', existing.id)) {
+    return next({
+      status: 409,
+      message: 'This server is still referenced and cannot be deleted.',
+    });
   }
 
   const removed = settings.sonarr.splice(sonarrIndex, 1);

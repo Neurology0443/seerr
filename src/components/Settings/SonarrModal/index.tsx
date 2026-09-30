@@ -342,8 +342,14 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
             }
 
             onSave();
-          } catch {
-            // set error here
+          } catch (error) {
+            const message = axios.isAxiosError<{ message?: string }>(error)
+              ? error.response?.data?.message
+              : undefined;
+            addToast(message ?? intl.formatMessage(globalMessages.error), {
+              appearance: 'error',
+              autoDismiss: true,
+            });
           }
         }}
       >

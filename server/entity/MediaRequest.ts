@@ -9,6 +9,7 @@ import type { MediaRequestBody } from '@server/interfaces/api/requestInterfaces'
 import notificationManager, { Notification } from '@server/lib/notifications';
 import overrideRules from '@server/lib/overrideRules';
 import { Permission } from '@server/lib/permissions';
+import { validateRequestTarget } from '@server/lib/requestTarget';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
@@ -82,6 +83,16 @@ export class MediaRequest {
     const requestRepository = getRepository(MediaRequest);
     const userRepository = getRepository(User);
     const settings = getSettings();
+
+    const target = validateRequestTarget({
+      mediaType: requestBody.mediaType,
+      serverId: requestBody.serverId,
+      isServiceRequest: !!requestBody.isServiceRequest,
+      is4k: !!requestBody.is4k,
+    });
+    if (requestBody.isServiceRequest && target) {
+      requestBody.is4k = target.is4k;
+    }
 
     let requestUser = user;
 
@@ -180,17 +191,7 @@ export class MediaRequest {
       relations: ['requests'],
     });
 
-    const isServiceSpecific =
-      !!requestBody.isServiceRequest &&
-      requestBody.serverId !== undefined &&
-      requestBody.serverId !== null &&
-      requestBody.serverId >= 0;
-
-    if (requestBody.isServiceRequest && !isServiceSpecific) {
-      throw new Error(
-        'Service-specific requests must target a valid serverId.'
-      );
-    }
+    const isServiceSpecific = !!requestBody.isServiceRequest;
 
     if (
       isServiceSpecific &&
@@ -325,6 +326,7 @@ export class MediaRequest {
       tmdbMedia,
       requestUser,
       tags,
+      serviceId: requestBody.serverId,
     });
     const isAdvanced = user.hasPermission(
       [Permission.MANAGE_REQUESTS, Permission.REQUEST_ADVANCED],

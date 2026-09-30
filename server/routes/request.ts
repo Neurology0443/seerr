@@ -22,6 +22,10 @@ import type {
   RequestResultsResponse,
 } from '@server/interfaces/api/requestInterfaces';
 import { Permission } from '@server/lib/permissions';
+import {
+  InvalidServiceTargetError,
+  validateRequestTarget,
+} from '@server/lib/requestTarget';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
@@ -348,6 +352,8 @@ requestRoutes.post<never, MediaRequest, MediaRequestBody>(
           return next({ status: 202, message: error.message });
         case BlocklistedMediaError:
           return next({ status: 403, message: error.message });
+        case InvalidServiceTargetError:
+          return next({ status: 400, message: error.message });
         default:
           return next({ status: 500, message: error.message });
       }
@@ -544,6 +550,32 @@ requestRoutes.put<{ requestId: string }>(
         // quota, so it is charged in full rather than as a delta
         const ownerChanging = requestUser.id !== previousOwnerId;
 
+        const requestedServerId =
+          req.body.serverId === undefined ? request.serverId : req.body.serverId;
+        const destinationChanging = requestedServerId !== request.serverId;
+        if (destinationChanging) {
+          validateRequestTarget({
+            mediaType: request.type,
+            serverId: requestedServerId,
+            isServiceRequest: request.isServiceRequest,
+            is4k: request.is4k,
+          });
+
+          if (
+            request.isServiceRequest &&
+            !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
+            !req.user?.requestServices?.includes(
+              `${request.type === MediaType.MOVIE ? 'radarr' : 'sonarr'}:${
+                requestedServerId
+              }`
+            )
+          ) {
+            throw new RequestPermissionError(
+              'You do not have permission to request in this service.'
+            );
+          }
+        }
+
         return requestLock.dispatch(userKey(requestUser.id), async () => {
           if (req.body.mediaType === MediaType.MOVIE) {
             if (ownerChanging && !request.ignoreQuota) {
@@ -557,7 +589,7 @@ requestRoutes.put<{ requestId: string }>(
               }
             }
 
-            request.serverId = req.body.serverId;
+            request.serverId = requestedServerId;
             request.profileId = req.body.profileId;
             request.rootFolder = req.body.rootFolder;
             request.tags = req.body.tags;
@@ -566,7 +598,7 @@ requestRoutes.put<{ requestId: string }>(
             await requestRepository.save(request);
           } else if (req.body.mediaType === MediaType.TV) {
             const mediaRepository = getRepository(Media);
-            request.serverId = req.body.serverId;
+            request.serverId = requestedServerId;
             request.profileId = req.body.profileId;
             request.rootFolder = req.body.rootFolder;
             request.languageProfileId = req.body.languageProfileId;
@@ -716,6 +748,12 @@ requestRoutes.put<{ requestId: string }>(
         });
       });
     } catch (e) {
+      if (e instanceof InvalidServiceTargetError) {
+        return next({ status: 400, message: e.message });
+      }
+      if (e instanceof RequestPermissionError) {
+        return next({ status: 403, message: e.message });
+      }
       next({ status: 500, message: e.message });
     }
   }

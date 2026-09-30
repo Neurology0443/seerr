@@ -9,32 +9,38 @@ import { getSettings } from '@server/lib/settings';
 export type ServiceType = 'radarr' | 'sonarr';
 
 const maxOrNegativeOne = (values: (number | null | undefined)[]): number =>
-  Math.max(
-    -1,
-    ...values.filter((value): value is number => Number.isInteger(value))
+  values.reduce<number>(
+    (maximum, value) =>
+      Number.isInteger(value) ? Math.max(maximum, value as number) : maximum,
+    -1
   );
+
+const rawMaximum = (value: number | string | null | undefined): number =>
+  value == null || !Number.isInteger(Number(value)) ? -1 : Number(value);
 
 export const getObservedServiceIdMax = async (
   type: ServiceType
 ): Promise<number> => {
   const settings = getSettings();
   const mediaType = type === 'radarr' ? MediaType.MOVIE : MediaType.TV;
-  const [requests, rules, users, statuses] = await Promise.all([
-    getRepository(MediaRequest).find({
-      select: { serverId: true },
-      where: { type: mediaType },
-    }),
-    getRepository(OverrideRule).find({
-      select:
-        type === 'radarr'
-          ? { radarrServiceId: true }
-          : { sonarrServiceId: true },
-    }),
+  const ruleColumn =
+    type === 'radarr' ? 'radarrServiceId' : 'sonarrServiceId';
+  const [requestResult, ruleResult, users, statusResult] = await Promise.all([
+    getRepository(MediaRequest)
+      .createQueryBuilder('request')
+      .select('MAX(request.serverId)', 'maxId')
+      .where('request.type = :type', { type: mediaType })
+      .getRawOne<{ maxId: number | string | null }>(),
+    getRepository(OverrideRule)
+      .createQueryBuilder('rule')
+      .select(`MAX(rule.${ruleColumn})`, 'maxId')
+      .getRawOne<{ maxId: number | string | null }>(),
     getRepository(User).find({ select: { requestServices: true } }),
-    getRepository(MediaServiceStatus).find({
-      select: { serviceId: true },
-      where: { serviceType: type },
-    }),
+    getRepository(MediaServiceStatus)
+      .createQueryBuilder('status')
+      .select('MAX(status.serviceId)', 'maxId')
+      .where('status.serviceType = :type', { type })
+      .getRawOne<{ maxId: number | string | null }>(),
   ]);
   const prefix = `${type}:`;
   const grantIds = users
@@ -44,13 +50,14 @@ export const getObservedServiceIdMax = async (
     .filter(Number.isInteger);
 
   return maxOrNegativeOne([
-    ...settings[type].map((service) => service.id),
-    ...requests.map((request) => request.serverId),
-    ...rules.map((rule) =>
-      type === 'radarr' ? rule.radarrServiceId : rule.sonarrServiceId
+    settings[type].reduce(
+      (maximum, service) => Math.max(maximum, service.id),
+      -1
     ),
-    ...grantIds,
-    ...statuses.map((status) => status.serviceId),
+    rawMaximum(requestResult?.maxId),
+    rawMaximum(ruleResult?.maxId),
+    grantIds.reduce((maximum, id) => Math.max(maximum, id), -1),
+    rawMaximum(statusResult?.maxId),
   ]);
 };
 

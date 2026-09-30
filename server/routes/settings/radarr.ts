@@ -127,7 +127,7 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
       return next({
         status: 409,
         message:
-          'This server is already referenced and its request role or 4K identity cannot be changed. Delete and recreate the server instead.',
+          'This server is already referenced and its request role or 4K identity cannot be changed.',
       });
     }
 
@@ -184,6 +184,14 @@ radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
 
   if (radarrIndex === -1) {
     return next({ status: '404', message: 'Settings instance not found' });
+  }
+
+  const existing = settings.radarr[radarrIndex];
+  if (await hasServiceReferences('radarr', existing.id)) {
+    return next({
+      status: 409,
+      message: 'This server is still referenced and cannot be deleted.',
+    });
   }
 
   const removed = settings.radarr.splice(radarrIndex, 1);

@@ -316,6 +316,7 @@ describe('DELETE /request/:requestId', () => {
 
 describe('PUT /request/:requestId (movie)', () => {
   it('persists server and root folder changes to the database', async () => {
+    configureRadarr([{ id: 3, isDefault: false }]);
     const requestRepo = getRepository(MediaRequest);
     const mediaRequest = await seedRequest();
 
@@ -339,6 +340,7 @@ describe('PUT /request/:requestId (movie)', () => {
   });
 
   it('refuses to modify a request that is no longer pending', async () => {
+    configureRadarr([{ id: 3, isDefault: false }]);
     const requestRepo = getRepository(MediaRequest);
     const mediaRequest = await seedRequest(MediaRequestStatus.APPROVED);
 
@@ -357,6 +359,29 @@ describe('PUT /request/:requestId (movie)', () => {
     });
     assert.strictEqual(saved.serverId, null);
     assert.strictEqual(saved.rootFolder, null);
+  });
+
+  it('rejects a labelled destination for a native request without mutation', async () => {
+    configureRadarr([
+      { id: 4, buttonLabel: 'Service', isDefault: false, is4k: false },
+    ]);
+    const requestRepo = getRepository(MediaRequest);
+    const mediaRequest = await seedRequest();
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.MOVIE,
+      serverId: 4,
+      rootFolder: '/must-not-change',
+    });
+    assert.strictEqual(res.status, 400);
+
+    const saved = await requestRepo.findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, null);
+    assert.strictEqual(saved.rootFolder, null);
+    assert.strictEqual(saved.isServiceRequest, false);
   });
 });
 
@@ -554,6 +579,7 @@ describe('PUT /request/:requestId (season availability)', () => {
   });
 
   it('keeps the seasons it already holds once they are available', async () => {
+    configureSonarr([{ id: 3, isDefault: false }]);
     const requestRepo = getRepository(MediaRequest);
     const owner = await seedUser('demo@seerr.dev');
     const mediaRequest = await seedTvRequest(owner, [1, 2]);
@@ -1663,6 +1689,10 @@ describe('POST /request, auto-requests', () => {
 });
 
 describe('POST /request, per-service slots', () => {
+  beforeEach(() => {
+    configureLanguageServers();
+  });
+
   async function grantServices(email: string, services: string[]) {
     const userRepo = getRepository(User);
     const user = await userRepo.findOneOrFail({ where: { email } });
@@ -1684,7 +1714,7 @@ describe('POST /request, per-service slots', () => {
     const advanced = await admin
       .post('/request')
       .send({ mediaType: 'movie', mediaId: 99901, serverId: 0 });
-    assert.strictEqual(advanced.status, 409);
+    assert.strictEqual(advanced.status, 400);
 
     const service = await friend.post('/request').send({
       mediaType: 'movie',
@@ -1718,7 +1748,41 @@ describe('POST /request, per-service slots', () => {
     const res = await friend
       .post('/request')
       .send({ mediaType: 'movie', mediaId: 99901, isServiceRequest: true });
-    assert.strictEqual(res.status, 500);
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('enforces target role, type, existence, and 4K identity', async () => {
+    configureRadarr([
+      { id: 0, buttonLabel: undefined, isDefault: true },
+      { id: 1, buttonLabel: 'Service', isDefault: false },
+      { id: 2, buttonLabel: '4K Service', isDefault: false, is4k: true },
+    ]);
+    configureSonarr([
+      { id: 7, buttonLabel: 'TV Service', isDefault: false },
+    ]);
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const native = await admin.post('/request').send({
+      mediaType: MediaType.MOVIE,
+      mediaId: 99910,
+      serverId: 0,
+    });
+    assert.strictEqual(native.status, 201);
+
+    for (const [mediaId, destination] of [
+      [99911, { serverId: 1 }],
+      [99912, { serverId: 0, isServiceRequest: true }],
+      [99913, { serverId: 99, isServiceRequest: true }],
+      [99914, { serverId: 7, isServiceRequest: true }],
+      [99915, { serverId: 2, isServiceRequest: true }],
+    ] as const) {
+      const response = await admin.post('/request').send({
+        mediaType: MediaType.MOVIE,
+        mediaId,
+        ...destination,
+      });
+      assert.strictEqual(response.status, 400);
+    }
   });
 
   it('rejects a service request to a service the user has no grant for', async () => {
@@ -1780,12 +1844,12 @@ describe('POST /request, per-service slots', () => {
 
   function configureLanguageServers() {
     configureRadarr([
-      { name: 'Radarr English', buttonLabel: 'ENG' },
-      { name: 'Radarr Italian', buttonLabel: 'ITA' },
+      { name: 'Radarr English', buttonLabel: 'ENG', isDefault: false },
+      { name: 'Radarr Italian', buttonLabel: 'ITA', isDefault: false },
     ]);
     configureSonarr([
-      { name: 'Sonarr English', buttonLabel: 'ENG' },
-      { name: 'Sonarr Italian', buttonLabel: 'ITA' },
+      { name: 'Sonarr English', buttonLabel: 'ENG', isDefault: false },
+      { name: 'Sonarr Italian', buttonLabel: 'ITA', isDefault: false },
     ]);
   }
 

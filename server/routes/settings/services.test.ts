@@ -49,7 +49,10 @@ before(() => {
       _req: express.Request,
       res: express.Response,
       _next: express.NextFunction
-    ) => res.status(err.status ?? 500).json({ message: err.message })
+    ) => {
+      void _next;
+      return res.status(err.status ?? 500).json({ message: err.message });
+    }
   );
 });
 
@@ -176,6 +179,28 @@ for (const type of ['radarr', 'sonarr'] as const) {
         .put(`/settings/${type}/10`)
         .send(payload({ id: 10 }))
         .expect(200);
+    });
+
+    it('deletes an unreferenced target', async () => {
+      const settings = getSettings();
+      settings[type] = [payload({ id: 12 }) as never];
+
+      await request(app).delete(`/settings/${type}/12`).expect(200);
+      assert.deepEqual(settings[type], []);
+    });
+
+    it('refuses to delete a referenced target without mutation', async () => {
+      const settings = getSettings();
+      settings[type] = [payload({ id: 13 }) as never];
+      await getRepository(OverrideRule).save(
+        new OverrideRule(
+          type === 'radarr' ? { radarrServiceId: 13 } : { sonarrServiceId: 13 }
+        )
+      );
+      const beforeState = structuredClone(settings[type]);
+
+      await request(app).delete(`/settings/${type}/13`).expect(409);
+      assert.deepEqual(settings[type], beforeState);
     });
   });
 }

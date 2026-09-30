@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { assertValidServiceTargets } from '@server/lib/settings';
-import migrate from './settings/migrations/0009_multi_service_target_invariants';
+import migrate from './migrations/0009_multi_service_target_invariants';
 
 describe('0009 multi-service target invariants', () => {
   it('normalizes valid labels and restores ambiguous targets to native', () => {
