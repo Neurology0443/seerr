@@ -5,6 +5,10 @@ import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequ
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import SearchByNameModal from '@app/components/RequestModal/SearchByNameModal';
+import {
+  getDestinationSeasonStatus,
+  isRequestInSlot,
+} from '@app/components/RequestModal/tvSeasonSelection';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
 import { useUser } from '@app/hooks/useUser';
@@ -61,49 +65,6 @@ interface RequestModalProps extends React.HTMLAttributes<HTMLDivElement> {
   serverId?: number;
   editRequest?: NonFunctionProperties<MediaRequest>;
 }
-
-export const isRequestInSlot = (
-  request: Pick<MediaRequest, 'isServiceRequest' | 'serverId' | 'is4k'>,
-  serverId: number | undefined,
-  is4k: boolean
-): boolean =>
-  serverId != null
-    ? request.isServiceRequest && request.serverId === serverId
-    : !request.isServiceRequest && request.is4k === is4k;
-
-export const getDestinationSeasonStatus = ({
-  seasonNumber,
-  serverId,
-  is4k,
-  seasons,
-  serviceStatuses,
-}: {
-  seasonNumber: number;
-  serverId?: number;
-  is4k: boolean;
-  seasons?: {
-    seasonNumber: number;
-    status: MediaStatus;
-    status4k: MediaStatus;
-  }[];
-  serviceStatuses?: {
-    serviceType: string;
-    serviceId: number;
-    seasonStatuses?: Record<number, MediaStatus> | null;
-  }[];
-}): MediaStatus => {
-  if (serverId != null) {
-    return (
-      serviceStatuses?.find(
-        (status) =>
-          status.serviceType === 'sonarr' && status.serviceId === serverId
-      )?.seasonStatuses?.[seasonNumber] ?? MediaStatus.UNKNOWN
-    );
-  }
-
-  const season = seasons?.find((item) => item.seasonNumber === seasonNumber);
-  return season?.[is4k ? 'status4k' : 'status'] ?? MediaStatus.UNKNOWN;
-};
 
 const TvRequestModal = ({
   onCancel,

@@ -393,12 +393,22 @@ const RequestButton = ({
     const serviceStatusEntry = media?.serviceStatuses?.find(
       (ss) => ss.serviceId === service.id
     );
+    const activeServiceRequests = media?.requests.filter(
+      (request) =>
+        request.isServiceRequest &&
+        request.serverId === service.id &&
+        request.status === MediaRequestStatus.PENDING
+    );
+    const userServiceRequest = activeServiceRequests?.find(
+      (request) => request.requestedBy.id === user?.id
+    );
     if (
       serviceStatusEntry &&
-      serviceStatusEntry.status !== MediaStatus.UNKNOWN &&
-      serviceStatusEntry.status !== MediaStatus.DELETED &&
-      (mediaType !== 'tv' ||
-        serviceStatusEntry.status !== MediaStatus.PARTIALLY_AVAILABLE)
+      !activeServiceRequests?.length &&
+      (mediaType === 'movie'
+        ? serviceStatusEntry.status !== MediaStatus.UNKNOWN &&
+          serviceStatusEntry.status !== MediaStatus.DELETED
+        : serviceStatusEntry.status === MediaStatus.AVAILABLE)
     ) {
       continue;
     }
@@ -427,16 +437,6 @@ const RequestButton = ({
       hasPermission(Permission.MANAGE_REQUESTS) ||
       ((user?.requestServices ?? []).includes(serviceIdentifier) &&
         hasQualityPermission);
-
-    const activeServiceRequests = media?.requests.filter(
-      (r) =>
-        r.isServiceRequest &&
-        r.serverId === service.id &&
-        r.status === MediaRequestStatus.PENDING
-    );
-    const userServiceRequest = activeServiceRequests?.find(
-      (r) => r.requestedBy.id === user?.id
-    );
 
     if (!canUseService && !userServiceRequest) {
       continue;

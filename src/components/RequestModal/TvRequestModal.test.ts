@@ -5,7 +5,7 @@ import { MediaStatus } from '@server/constants/media';
 import {
   getDestinationSeasonStatus,
   isRequestInSlot,
-} from './TvRequestModal';
+} from './tvSeasonSelection';
 
 describe('TV request destination selection', () => {
   it('isolates native and multi-service request slots', () => {
