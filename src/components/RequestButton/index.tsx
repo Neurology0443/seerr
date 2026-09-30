@@ -402,6 +402,15 @@ const RequestButton = ({
     const userServiceRequest = activeServiceRequests?.find(
       (request) => request.requestedBy.id === user?.id
     );
+    const hasOccupiedMovieSlot =
+      mediaType === 'movie' &&
+      media?.requests.some(
+        (request) =>
+          request.isServiceRequest &&
+          request.serverId === service.id &&
+          request.status !== MediaRequestStatus.DECLINED &&
+          request.status !== MediaRequestStatus.COMPLETED
+      );
     if (
       serviceStatusEntry &&
       !activeServiceRequests?.length &&
@@ -488,7 +497,7 @@ const RequestButton = ({
           }
         );
       }
-    } else if (canUseService) {
+    } else if (canUseService && !hasOccupiedMovieSlot) {
       buttons.push({
         id: `request-service-${service.id}`,
         text: intl.formatMessage(messages.requestinservice, {

@@ -743,6 +743,7 @@ export class MediaRequest {
 
       if (
         this.status === MediaRequestStatus.APPROVED &&
+        !this.isServiceRequest &&
         media[this.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
       ) {
         logger.info(

@@ -408,7 +408,7 @@ requestRoutes.get('/count', async (_req, res, next) => {
         requestStatus: MediaRequestStatus.APPROVED,
       })
       .andWhere(
-        '((request.is4k = false AND media.status != :availableStatus) OR (request.is4k = true AND media.status4k != :availableStatus))',
+        '(request.isServiceRequest = true OR (request.isServiceRequest = false AND ((request.is4k = false AND media.status != :availableStatus) OR (request.is4k = true AND media.status4k != :availableStatus))))',
         {
           availableStatus: MediaStatus.AVAILABLE,
         }
@@ -420,7 +420,7 @@ requestRoutes.get('/count', async (_req, res, next) => {
         requestStatus: MediaRequestStatus.APPROVED,
       })
       .andWhere(
-        '((request.is4k = false AND media.status = :availableStatus) OR (request.is4k = true AND media.status4k = :availableStatus))',
+        '(request.isServiceRequest = false AND ((request.is4k = false AND media.status = :availableStatus) OR (request.is4k = true AND media.status4k = :availableStatus)))',
         {
           availableStatus: MediaStatus.AVAILABLE,
         }

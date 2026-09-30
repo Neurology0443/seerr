@@ -290,6 +290,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
     const requestedSeasons = (data?.mediaInfo?.requests ?? [])
       .filter(
         (request) =>
+          !request.isServiceRequest &&
           request.is4k === is4k &&
           request.status !== MediaRequestStatus.DECLINED &&
           request.status !== MediaRequestStatus.COMPLETED
@@ -565,16 +566,49 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
         </div>
         <div className="media-title">
           <div className="media-status">
-            {data.mediaInfo?.serviceStatuses?.some(
+            <StatusBadge
+              status={data.mediaInfo?.status}
+              downloadItem={data.mediaInfo?.downloadStatus}
+              title={data.name}
+              inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
+              tmdbId={data.mediaInfo?.tmdbId}
+              mediaType="tv"
+              plexUrl={plexUrl}
+              serviceUrl={data.mediaInfo?.serviceUrl}
+            />
+            {settings.currentSettings.series4kEnabled &&
+              hasPermission(
+                [
+                  Permission.MANAGE_REQUESTS,
+                  Permission.REQUEST_4K,
+                  Permission.REQUEST_4K_TV,
+                ],
+                { type: 'or' }
+              ) && (
+                <StatusBadge
+                  status={data.mediaInfo?.status4k}
+                  downloadItem={data.mediaInfo?.downloadStatus4k}
+                  title={data.name}
+                  is4k
+                  inProgress={
+                    (data.mediaInfo?.downloadStatus4k ?? []).length > 0
+                  }
+                  tmdbId={data.mediaInfo?.tmdbId}
+                  mediaType="tv"
+                  plexUrl={plexUrl4k}
+                  serviceUrl={data.mediaInfo?.serviceUrl4k}
+                />
+              )}
+            {(data.mediaInfo?.serviceStatuses?.some(
               (ss) =>
                 ss.status !== MediaStatus.UNKNOWN &&
                 ss.status !== MediaStatus.DELETED
             ) ||
-            data.mediaInfo?.requests?.some(
+              data.mediaInfo?.requests?.some(
               (request) =>
                 request.isServiceRequest &&
                 request.status === MediaRequestStatus.PENDING
-            ) ? (
+              )) && (
               <ServiceStatusBadges
                 serviceStatuses={data.mediaInfo.serviceStatuses}
                 requests={data.mediaInfo.requests}
@@ -583,42 +617,6 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 tmdbId={data.mediaInfo.tmdbId}
                 title={data.name}
               />
-            ) : (
-              <>
-                <StatusBadge
-                  status={data.mediaInfo?.status}
-                  downloadItem={data.mediaInfo?.downloadStatus}
-                  title={data.name}
-                  inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
-                  tmdbId={data.mediaInfo?.tmdbId}
-                  mediaType="tv"
-                  plexUrl={plexUrl}
-                  serviceUrl={data.mediaInfo?.serviceUrl}
-                />
-                {settings.currentSettings.series4kEnabled &&
-                  hasPermission(
-                    [
-                      Permission.MANAGE_REQUESTS,
-                      Permission.REQUEST_4K,
-                      Permission.REQUEST_4K_TV,
-                    ],
-                    { type: 'or' }
-                  ) && (
-                    <StatusBadge
-                      status={data.mediaInfo?.status4k}
-                      downloadItem={data.mediaInfo?.downloadStatus4k}
-                      title={data.name}
-                      is4k
-                      inProgress={
-                        (data.mediaInfo?.downloadStatus4k ?? []).length > 0
-                      }
-                      tmdbId={data.mediaInfo?.tmdbId}
-                      mediaType="tv"
-                      plexUrl={plexUrl4k}
-                      serviceUrl={data.mediaInfo?.serviceUrl4k}
-                    />
-                  )}
-              </>
             )}
           </div>
           <h1 data-testid="media-title">

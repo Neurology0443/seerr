@@ -1893,7 +1893,8 @@ describe('DELETE /request/:requestId, orphaned season status reset', () => {
 
   async function seedTvRequest(
     media: Media,
-    seasonNumbers: number[]
+    seasonNumbers: number[],
+    options: { isServiceRequest?: boolean; serverId?: number } = {}
   ): Promise<MediaRequest> {
     const userRepo = getRepository(User);
     const requestRepo = getRepository(MediaRequest);
@@ -1909,6 +1910,8 @@ describe('DELETE /request/:requestId, orphaned season status reset', () => {
         media,
         requestedBy: admin,
         is4k: false,
+        isServiceRequest: options.isServiceRequest ?? false,
+        serverId: options.serverId,
         seasons: seasonNumbers.map(
           (seasonNumber) =>
             new SeasonRequest({
@@ -1978,6 +1981,25 @@ describe('DELETE /request/:requestId, orphaned season status reset', () => {
 
     const updated = await mediaRepo.findOneOrFail({ where: { id: media.id } });
     assert.strictEqual(updated.seasons[0].status, MediaStatus.PROCESSING);
+  });
+
+  it('ignores a service request when resetting an orphaned native season', async () => {
+    const mediaRepo = getRepository(Media);
+    const media = await seedTvShow(99105, [
+      { seasonNumber: 1, status: MediaStatus.PROCESSING },
+    ]);
+    const nativeRequest = await seedTvRequest(media, [1]);
+    await seedTvRequest(media, [1], {
+      isServiceRequest: true,
+      serverId: 7,
+    });
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.delete(`/request/${nativeRequest.id}`);
+    assert.strictEqual(res.status, 204);
+
+    const updated = await mediaRepo.findOneOrFail({ where: { id: media.id } });
+    assert.strictEqual(updated.seasons[0].status, MediaStatus.UNKNOWN);
   });
 
   it('leaves season status4k untouched when deleting a non-4K request', async () => {

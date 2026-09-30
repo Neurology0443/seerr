@@ -61,10 +61,53 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     entity: MediaRequest,
     media: Media
   ): Promise<boolean> {
+    if (entity.type === MediaType.TV) {
+      const requestedSeasons = (entity.seasons ?? []).map(
+        (season) => season.seasonNumber
+      );
+      if (requestedSeasons.length === 0) {
+        return false;
+      }
+
+      if (entity.isServiceRequest && entity.serverId != null) {
+        const serviceStatus = await manager
+          .getRepository(MediaServiceStatus)
+          .findOne({
+            where: {
+              mediaId: media.id,
+              serviceId: entity.serverId,
+              serviceType: 'sonarr',
+            },
+          });
+        return requestedSeasons.every(
+          (seasonNumber) =>
+            serviceStatus?.seasonStatuses?.[seasonNumber] ===
+            MediaStatus.AVAILABLE
+        );
+      }
+
+      const mediaWithSeasons = await manager.findOne(Media, {
+        where: { id: media.id },
+        relations: { seasons: true },
+      });
+      return requestedSeasons.every(
+        (seasonNumber) =>
+          mediaWithSeasons?.seasons.find(
+            (season) => season.seasonNumber === seasonNumber
+          )?.[entity.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
+      );
+    }
+
     if (entity.isServiceRequest && entity.serverId != null) {
       const serviceStatus = await manager
         .getRepository(MediaServiceStatus)
-        .findOne({ where: { mediaId: media.id, serviceId: entity.serverId } });
+        .findOne({
+          where: {
+            mediaId: media.id,
+            serviceId: entity.serverId,
+            serviceType: 'radarr',
+          },
+        });
       return serviceStatus?.status === MediaStatus.AVAILABLE;
     }
 
@@ -1117,6 +1160,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         fullMedia.requests
           .filter(
             (request) =>
+              !request.isServiceRequest &&
               request.is4k === entity.is4k &&
               request.status !== MediaRequestStatus.COMPLETED &&
               request.status !== MediaRequestStatus.DECLINED
