@@ -10,6 +10,7 @@ import type {
 import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -109,10 +110,9 @@ class RadarrScanner
             serverName: server.name,
             confirmAbsent: async (tmdbId) => {
               try {
-                return (
-                  (await this.radarrApi.getLibraryMoviesByTmdbId(tmdbId))
-                    .length === 0
-                );
+                const movies =
+                  await this.radarrApi.getLibraryMoviesByTmdbId(tmdbId);
+                return !movies.some((movie) => movie.tmdbId === tmdbId);
               } catch {
                 return undefined;
               }
@@ -175,6 +175,7 @@ class RadarrScanner
         title: radarrMovie.title,
         processing: !radarrMovie.hasFile && radarrMovie.monitored,
         hasFile: radarrMovie.hasFile,
+        isServiceTarget: isMultiServiceTarget(this.currentServer),
       });
     } catch (e) {
       this.log('Failed to process Radarr media', 'error', {

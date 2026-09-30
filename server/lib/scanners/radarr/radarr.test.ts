@@ -30,10 +30,14 @@ Object.defineProperty(RadarrAPI.prototype, 'getMovies', {
 let getLibraryMoviesByTmdbIdImpl: (
   tmdbId: number
 ) => Promise<RadarrMovie[]> = async () => [];
+let getLibraryMoviesByTmdbIdCalls = 0;
 Object.defineProperty(RadarrAPI.prototype, 'getLibraryMoviesByTmdbId', {
   set() {},
   get() {
-    return async (tmdbId: number) => getLibraryMoviesByTmdbIdImpl(tmdbId);
+    return async (tmdbId: number) => {
+      getLibraryMoviesByTmdbIdCalls++;
+      return getLibraryMoviesByTmdbIdImpl(tmdbId);
+    };
   },
   configurable: true,
 });
@@ -90,6 +94,7 @@ describe('Radarr Scanner', () => {
   beforeEach(() => {
     getMoviesImpl = async () => [];
     getLibraryMoviesByTmdbIdImpl = async () => [];
+    getLibraryMoviesByTmdbIdCalls = 0;
   });
 
   describe('unmonitored movie handling', () => {
@@ -744,6 +749,28 @@ describe('Radarr Scanner', () => {
       return media.id;
     }
 
+    it('does not update native availability for a labelled target', async () => {
+      configureRadarr([
+        {
+          syncEnabled: true,
+          buttonLabel: 'Deutsch',
+          isDefault: false,
+        },
+      ]);
+      getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 559 })];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      const media = await getRepository(Media).findOneOrFail({
+        where: { tmdbId: 559 },
+      });
+      assert.strictEqual(media.status, MediaStatus.UNKNOWN);
+      const serviceStatus = await getRepository(
+        MediaServiceStatus
+      ).findOneOrFail({ where: { mediaId: media.id, serviceId: 0 } });
+      assert.strictEqual(serviceStatus.status, MediaStatus.AVAILABLE);
+    });
+
     it('keeps per-service status when the server returns no movies', async () => {
       const mediaId = await seedServiceStatus(560);
 
@@ -781,6 +808,7 @@ describe('Radarr Scanner', () => {
 
       configureRadarr([{ syncEnabled: true }]);
       getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 562, id: 98 })];
+      getLibraryMoviesByTmdbIdImpl = async () => [];
 
       await runWithMockTimers(() => radarrScanner.run());
 
@@ -792,6 +820,7 @@ describe('Radarr Scanner', () => {
         id: serviceRequest.id,
       });
       assert.strictEqual(updatedRequest.status, MediaRequestStatus.DECLINED);
+      assert.strictEqual(getLibraryMoviesByTmdbIdCalls, 1);
     });
   });
 });

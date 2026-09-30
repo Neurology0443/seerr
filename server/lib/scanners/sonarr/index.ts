@@ -19,6 +19,7 @@ import type {
 import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -120,10 +121,11 @@ class SonarrScanner
             confirmAbsent: async (_tmdbId, tvdbId) => {
               if (!tvdbId) return undefined;
               try {
-                await this.sonarrApi.getSeriesByTvdbId(tvdbId);
-                return false;
-              } catch (error) {
-                return error?.response?.status === 404 ? true : undefined;
+                const series =
+                  await this.sonarrApi.getLibrarySeriesByTvdbId(tvdbId);
+                return !series.some((item) => item.tvdbId === tvdbId);
+              } catch {
+                return undefined;
               }
             },
           });
@@ -252,6 +254,7 @@ class SonarrScanner
         externalServiceSlug: sonarrSeries.titleSlug,
         title: sonarrSeries.title,
         is4k: server4k,
+        isServiceTarget: isMultiServiceTarget(this.currentServer),
       });
     } catch (e) {
       this.log('Failed to process Sonarr media', 'error', {

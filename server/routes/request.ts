@@ -145,36 +145,29 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
           requestStatus: statusFilter,
         })
         .andWhere(
-          '(request.isServiceRequest = true OR (request.is4k = false AND media.status IN (:...mediaStatus)) OR (request.is4k = true AND media.status4k IN (:...mediaStatus)))',
+          `(
+            (request.isServiceRequest = false AND (
+              (request.is4k = false AND media.status IN (:...mediaStatus)) OR
+              (request.is4k = true AND media.status4k IN (:...mediaStatus))
+            )) OR
+            (request.isServiceRequest = true AND EXISTS (
+              SELECT 1 FROM media_service_status matchedServiceStatus
+              WHERE matchedServiceStatus.mediaId = media.id
+                AND matchedServiceStatus.serviceId = request.serverId
+                AND matchedServiceStatus.serviceType = CASE
+                  WHEN request.type = :movieType THEN :radarrType
+                  ELSE :sonarrType
+                END
+                AND matchedServiceStatus.status IN (:...mediaStatus)
+            ))
+          )`,
           {
             mediaStatus: mediaStatusFilter,
-          }
-        );
-
-      if (req.query.filter === 'deleted') {
-        query = query.andWhere(
-          '(request.isServiceRequest = false OR (serviceStatuses.serviceId = request.serverId AND serviceStatuses.serviceType = CASE WHEN request.type = :movieType THEN :radarrType ELSE :sonarrType END AND serviceStatuses.status = :deletedStatus))',
-          {
             movieType: MediaType.MOVIE,
             radarrType: 'radarr',
             sonarrType: 'sonarr',
-            deletedStatus: MediaStatus.DELETED,
           }
         );
-      } else if (req.query.filter === 'available') {
-        query = query.andWhere(
-          '(request.isServiceRequest = false OR (serviceStatuses.serviceId = request.serverId AND serviceStatuses.serviceType = CASE WHEN request.type = :movieType THEN :radarrType ELSE :sonarrType END AND serviceStatuses.status NOT IN (:...unavailableServiceStatuses)))',
-          {
-            movieType: MediaType.MOVIE,
-            radarrType: 'radarr',
-            sonarrType: 'sonarr',
-            unavailableServiceStatuses: [
-              MediaStatus.UNKNOWN,
-              MediaStatus.DELETED,
-            ],
-          }
-        );
-      }
 
       if (
         !req.user?.hasPermission(
@@ -433,9 +426,43 @@ requestRoutes.get('/count', async (_req, res, next) => {
         requestStatus: MediaRequestStatus.APPROVED,
       })
       .andWhere(
-        '(request.isServiceRequest = true OR (request.isServiceRequest = false AND ((request.is4k = false AND media.status != :availableStatus) OR (request.is4k = true AND media.status4k != :availableStatus))))',
+        `(
+          (request.isServiceRequest = false AND (
+            (request.is4k = false AND media.status != :availableStatus) OR
+            (request.is4k = true AND media.status4k != :availableStatus)
+          )) OR
+          (request.isServiceRequest = true AND (
+            NOT EXISTS (
+              SELECT 1 FROM media_service_status matchedServiceStatus
+              WHERE matchedServiceStatus.mediaId = media.id
+                AND matchedServiceStatus.serviceId = request.serverId
+                AND matchedServiceStatus.serviceType = CASE
+                  WHEN request.type = :movieType THEN :radarrType
+                  ELSE :sonarrType
+                END
+            ) OR EXISTS (
+              SELECT 1 FROM media_service_status matchedServiceStatus
+              WHERE matchedServiceStatus.mediaId = media.id
+                AND matchedServiceStatus.serviceId = request.serverId
+                AND matchedServiceStatus.serviceType = CASE
+                  WHEN request.type = :movieType THEN :radarrType
+                  ELSE :sonarrType
+                END
+                AND matchedServiceStatus.status IN (:...processingStatuses)
+            )
+          ))
+        )`,
         {
           availableStatus: MediaStatus.AVAILABLE,
+          movieType: MediaType.MOVIE,
+          radarrType: 'radarr',
+          sonarrType: 'sonarr',
+          processingStatuses: [
+            MediaStatus.UNKNOWN,
+            MediaStatus.PENDING,
+            MediaStatus.PROCESSING,
+            MediaStatus.PARTIALLY_AVAILABLE,
+          ],
         }
       )
       .getCount();
@@ -445,9 +472,27 @@ requestRoutes.get('/count', async (_req, res, next) => {
         requestStatus: MediaRequestStatus.APPROVED,
       })
       .andWhere(
-        '(request.isServiceRequest = false AND ((request.is4k = false AND media.status = :availableStatus) OR (request.is4k = true AND media.status4k = :availableStatus)))',
+        `(
+          (request.isServiceRequest = false AND (
+            (request.is4k = false AND media.status = :availableStatus) OR
+            (request.is4k = true AND media.status4k = :availableStatus)
+          )) OR
+          (request.isServiceRequest = true AND EXISTS (
+            SELECT 1 FROM media_service_status matchedServiceStatus
+            WHERE matchedServiceStatus.mediaId = media.id
+              AND matchedServiceStatus.serviceId = request.serverId
+              AND matchedServiceStatus.serviceType = CASE
+                WHEN request.type = :movieType THEN :radarrType
+                ELSE :sonarrType
+              END
+              AND matchedServiceStatus.status = :availableStatus
+          ))
+        )`,
         {
           availableStatus: MediaStatus.AVAILABLE,
+          movieType: MediaType.MOVIE,
+          radarrType: 'radarr',
+          sonarrType: 'sonarr',
         }
       )
       .getCount();
