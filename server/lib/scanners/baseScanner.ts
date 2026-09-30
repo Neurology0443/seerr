@@ -998,11 +998,12 @@ class BaseScanner<T> {
 
     const serviceStatusRepository = getRepository(MediaServiceStatus);
 
-    const candidates: { id: number; tmdbId: number }[] =
+    const candidates: { id: number; mediaId: number; tmdbId: number }[] =
       await serviceStatusRepository
         .createQueryBuilder('serviceStatus')
         .innerJoin(Media, 'media', 'media.id = serviceStatus.mediaId')
         .select('serviceStatus.id', 'id')
+        .addSelect('serviceStatus.mediaId', 'mediaId')
         .addSelect('media.tmdbId', 'tmdbId')
         .where('serviceStatus.serviceId = :serviceId', { serviceId })
         .andWhere('serviceStatus.serviceType = :serviceType', { serviceType })
@@ -1015,6 +1016,32 @@ class BaseScanner<T> {
     const staleIds = candidates
       .filter((candidate) => !seenTmdbIds.has(Number(candidate.tmdbId)))
       .map((candidate) => candidate.id);
+    const staleMediaIds = candidates
+      .filter((candidate) => !seenTmdbIds.has(Number(candidate.tmdbId)))
+      .map((candidate) => Number(candidate.mediaId));
+
+    if (staleMediaIds.length > 0) {
+      const requestRepository = getRepository(MediaRequest);
+      const orphanedRequests = await requestRepository
+        .createQueryBuilder('request')
+        .where('request.isServiceRequest = :isServiceRequest', {
+          isServiceRequest: true,
+        })
+        .andWhere('request.serverId = :serviceId', { serviceId })
+        .andWhere('request.type = :mediaType', { mediaType })
+        .andWhere('request.status = :status', {
+          status: MediaRequestStatus.APPROVED,
+        })
+        .andWhere('request.mediaId IN (:...mediaIds)', {
+          mediaIds: staleMediaIds,
+        })
+        .getMany();
+
+      for (const request of orphanedRequests) {
+        request.status = MediaRequestStatus.DECLINED;
+        await requestRepository.save(request);
+      }
+    }
 
     const chunkSize = 500;
     for (let i = 0; i < staleIds.length; i += chunkSize) {

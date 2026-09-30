@@ -414,10 +414,9 @@ const RequestButton = ({
     if (
       serviceStatusEntry &&
       !activeServiceRequests?.length &&
-      (mediaType === 'movie'
-        ? serviceStatusEntry.status !== MediaStatus.UNKNOWN &&
-          serviceStatusEntry.status !== MediaStatus.DELETED
-        : serviceStatusEntry.status === MediaStatus.AVAILABLE)
+      mediaType === 'movie' &&
+      serviceStatusEntry.status !== MediaStatus.UNKNOWN &&
+      serviceStatusEntry.status !== MediaStatus.DELETED
     ) {
       continue;
     }

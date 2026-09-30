@@ -731,6 +731,7 @@ export class MediaRequest {
       const mediaRepository = getRepository(Media);
       const media = await mediaRepository.findOne({
         where: { id: this.media.id },
+        relations: this.type === MediaType.TV ? { seasons: true } : {},
       });
       if (!media) {
         logger.error('Media data not found', {
@@ -741,10 +742,22 @@ export class MediaRequest {
         return;
       }
 
+      const isNativeRequestAvailable =
+        !this.isServiceRequest &&
+        (this.type === MediaType.MOVIE
+          ? media[this.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
+          : (this.seasons ?? []).length > 0 &&
+            (this.seasons ?? []).every(
+              (requestedSeason) =>
+                media.seasons.find(
+                  (season) =>
+                    season.seasonNumber === requestedSeason.seasonNumber
+                )?.[this.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
+            ));
+
       if (
         this.status === MediaRequestStatus.APPROVED &&
-        !this.isServiceRequest &&
-        media[this.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
+        isNativeRequestAvailable
       ) {
         logger.info(
           'Media is already available. Sending availability notification instead of approval.',

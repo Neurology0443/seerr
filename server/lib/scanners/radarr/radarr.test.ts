@@ -760,6 +760,21 @@ describe('Radarr Scanner', () => {
 
     it('resets per-service status for a movie removed from the server', async () => {
       const mediaId = await seedServiceStatus(561);
+      const media = await getRepository(Media).findOneByOrFail({ id: mediaId });
+      const requestedBy = await getRepository(User).findOneOrFail({
+        where: { email: 'admin@seerr.dev' },
+      });
+      const serviceRequest = await getRepository(MediaRequest).save(
+        new MediaRequest({
+          type: MediaType.MOVIE,
+          status: MediaRequestStatus.APPROVED,
+          media,
+          requestedBy,
+          serverId: 0,
+          isServiceRequest: true,
+          is4k: false,
+        })
+      );
 
       configureRadarr([{ syncEnabled: true }]);
       getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 562, id: 98 })];
@@ -770,6 +785,10 @@ describe('Radarr Scanner', () => {
         MediaServiceStatus
       ).findOneOrFail({ where: { mediaId, serviceId: 0 } });
       assert.strictEqual(serviceStatus.status, MediaStatus.UNKNOWN);
+      const updatedRequest = await getRepository(MediaRequest).findOneByOrFail({
+        id: serviceRequest.id,
+      });
+      assert.strictEqual(updatedRequest.status, MediaRequestStatus.DECLINED);
     });
   });
 });

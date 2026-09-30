@@ -53,6 +53,7 @@ const messages = defineMessages('components.RequestModal', {
   requestcancelled: 'Request for <strong>{title}</strong> canceled.',
   autoapproval: 'Automatic Approval',
   requesterror: 'Something went wrong while submitting the request.',
+  nochanges: 'No changes were made to this request.',
   pendingapproval: 'Your request is pending approval.',
 });
 
@@ -131,7 +132,7 @@ const TvRequestModal = ({
 
     try {
       if (selectedSeasons.length > 0) {
-        await axios.put(`/api/v1/request/${editRequest.id}`, {
+        const response = await axios.put(`/api/v1/request/${editRequest.id}`, {
           mediaType: 'tv',
           serverId: serverId ?? requestOverrides?.server,
           profileId: requestOverrides?.profile,
@@ -141,6 +142,14 @@ const TvRequestModal = ({
           tags: requestOverrides?.tags,
           seasons: selectedSeasons.sort((a, b) => a - b),
         });
+
+        if (response.status === 202) {
+          addToast(intl.formatMessage(messages.nochanges), {
+            appearance: 'warning',
+            autoDismiss: true,
+          });
+          return;
+        }
 
         if (alsoApproveRequest) {
           await axios.post(`/api/v1/request/${editRequest.id}/approve`);

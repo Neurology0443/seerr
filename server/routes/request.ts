@@ -151,6 +151,18 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
           }
         );
 
+      if (req.query.filter === 'deleted') {
+        query = query.andWhere(
+          '(request.isServiceRequest = false OR (serviceStatuses.serviceId = request.serverId AND serviceStatuses.serviceType = CASE WHEN request.type = :movieType THEN :radarrType ELSE :sonarrType END AND serviceStatuses.status = :deletedStatus))',
+          {
+            movieType: MediaType.MOVIE,
+            radarrType: 'radarr',
+            sonarrType: 'sonarr',
+            deletedStatus: MediaStatus.DELETED,
+          }
+        );
+      }
+
       if (
         !req.user?.hasPermission(
           [Permission.MANAGE_REQUESTS, Permission.REQUEST_VIEW],
