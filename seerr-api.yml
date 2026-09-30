@@ -606,6 +606,12 @@ components:
         preventSearch:
           type: boolean
           example: false
+        buttonLabel:
+          type: string
+          nullable: true
+        animeOnly:
+          type: boolean
+          nullable: true
       required:
         - name
         - hostname
@@ -685,6 +691,12 @@ components:
         preventSearch:
           type: boolean
           example: false
+        buttonLabel:
+          type: string
+          nullable: true
+        animeOnly:
+          type: boolean
+          nullable: true
       required:
         - name
         - hostname

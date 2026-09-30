@@ -1,6 +1,8 @@
 import { MediaServerType } from '@server/constants/server';
 import { Permission } from '@server/lib/permissions';
 import { runMigrations } from '@server/lib/settings/migrator';
+import type { ServiceTargetConfig } from '@server/utils/serviceTarget';
+import { validateServiceTargetConfig } from '@server/utils/serviceTarget';
 import type { AvailableLocale } from '@server/types/languages';
 import { randomBytes, randomUUID } from 'crypto';
 import fs from 'fs/promises';
@@ -13,6 +15,18 @@ const mergeSettings = <T>(current: T, incoming: Partial<T>): T =>
   mergeWith({}, current, incoming, (_objValue, srcValue) =>
     Array.isArray(srcValue) ? srcValue : undefined
   ) as T;
+
+export const assertValidServiceTargets = (
+  type: 'radarr' | 'sonarr',
+  services: (ServiceTargetConfig & { id: number })[]
+): void => {
+  for (const service of services) {
+    const error = validateServiceTargetConfig(service);
+    if (error) {
+      throw new Error(`Invalid ${type} service target ${service.id}: ${error}`);
+    }
+  }
+};
 
 export interface Library {
   id: string;
@@ -711,6 +725,15 @@ class Settings {
     this.data.sonarr = data;
   }
 
+  get nextServiceIds(): ServiceIdCounters {
+    this.data.nextServiceIds ??= { radarr: 0, sonarr: 0 };
+    return this.data.nextServiceIds;
+  }
+
+  set nextServiceIds(data: ServiceIdCounters) {
+    this.data.nextServiceIds = data;
+  }
+
   public async allocateServiceId(
     type: keyof ServiceIdCounters,
     observedMax: number
@@ -860,6 +883,9 @@ class Settings {
       const parsedJson = JSON.parse(data);
       const migratedData = await runMigrations(parsedJson, SETTINGS_PATH);
       const merged = mergeSettings(this.data, migratedData);
+
+      assertValidServiceTargets('radarr', merged.radarr);
+      assertValidServiceTargets('sonarr', merged.sonarr);
 
       if (JSON.stringify(merged) !== JSON.stringify(migratedData)) {
         change = true;

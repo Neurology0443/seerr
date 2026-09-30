@@ -21,6 +21,13 @@ sonarrRoutes.get('/', (_req, res) => {
 
 sonarrRoutes.post('/', async (req, res, next) => {
   const settings = getSettings();
+  if (
+    req.body.buttonLabel !== undefined &&
+    req.body.buttonLabel !== null &&
+    typeof req.body.buttonLabel !== 'string'
+  ) {
+    return next({ status: 400, message: 'buttonLabel must be a string.' });
+  }
   const candidate = {
     ...req.body,
     buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
@@ -94,6 +101,13 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
     return res
       .status(404)
       .json({ status: '404', message: 'Settings instance not found' });
+  }
+  if (
+    req.body.buttonLabel !== undefined &&
+    req.body.buttonLabel !== null &&
+    typeof req.body.buttonLabel !== 'string'
+  ) {
+    return next({ status: 400, message: 'buttonLabel must be a string.' });
   }
   const existing = settings.sonarr[sonarrIndex];
   const candidate = {

@@ -64,17 +64,15 @@ export const hasServiceReferences = async (
   const mediaType = type === 'radarr' ? MediaType.MOVIE : MediaType.TV;
   const grant = `${type}:${id}`;
   const [request, status, rule, users] = await Promise.all([
-    getRepository(MediaRequest).exist({
+    getRepository(MediaRequest).exists({
       where: { serverId: id, type: mediaType },
     }),
-    getRepository(MediaServiceStatus).exist({
+    getRepository(MediaServiceStatus).exists({
       where: { serviceId: id, serviceType: type },
     }),
-    getRepository(OverrideRule).exist({
+    getRepository(OverrideRule).exists({
       where:
-        type === 'radarr'
-          ? { radarrServiceId: id }
-          : { sonarrServiceId: id },
+        type === 'radarr' ? { radarrServiceId: id } : { sonarrServiceId: id },
     }),
     getRepository(User).find({ select: { requestServices: true } }),
   ]);

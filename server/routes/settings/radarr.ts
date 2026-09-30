@@ -21,6 +21,13 @@ radarrRoutes.get('/', (_req, res) => {
 
 radarrRoutes.post('/', async (req, res, next) => {
   const settings = getSettings();
+  if (
+    req.body.buttonLabel !== undefined &&
+    req.body.buttonLabel !== null &&
+    typeof req.body.buttonLabel !== 'string'
+  ) {
+    return next({ status: 400, message: 'buttonLabel must be a string.' });
+  }
   const candidate = {
     ...req.body,
     buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
@@ -96,6 +103,13 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
 
     if (radarrIndex === -1) {
       return next({ status: '404', message: 'Settings instance not found' });
+    }
+    if (
+      req.body.buttonLabel !== undefined &&
+      req.body.buttonLabel !== null &&
+      typeof req.body.buttonLabel !== 'string'
+    ) {
+      return next({ status: 400, message: 'buttonLabel must be a string.' });
     }
     const existing = settings.radarr[radarrIndex];
     const candidate = {
