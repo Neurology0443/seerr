@@ -117,6 +117,15 @@ class SonarrScanner
             seenTmdbIds: this.currentServerTmdbIds,
             serverName: server.name,
             clearSeasonStatuses: true,
+            confirmAbsent: async (_tmdbId, tvdbId) => {
+              if (!tvdbId) return undefined;
+              try {
+                await this.sonarrApi.getSeriesByTvdbId(tvdbId);
+                return false;
+              } catch (error) {
+                return error?.response?.status === 404 ? true : undefined;
+              }
+            },
           });
         } else {
           this.log(`Sync not enabled. Skipping Sonarr server: ${server.name}`);
@@ -173,6 +182,10 @@ class SonarrScanner
       const media = await mediaRepository.findOne({
         where: { tvdbId: sonarrSeries.tvdbId },
       });
+
+      if (media?.tmdbId) {
+        this.currentServerTmdbIds.add(media.tmdbId);
+      }
 
       if (!media || !media.tmdbId) {
         tvShow = await this.tmdb.getShowByTvdbIdForScan({

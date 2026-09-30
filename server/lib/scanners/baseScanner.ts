@@ -980,6 +980,7 @@ class BaseScanner<T> {
     seenTmdbIds,
     serverName,
     clearSeasonStatuses = false,
+    confirmAbsent,
   }: {
     serviceId: number;
     serviceType: 'radarr' | 'sonarr';
@@ -987,6 +988,10 @@ class BaseScanner<T> {
     seenTmdbIds: Set<number>;
     serverName: string;
     clearSeasonStatuses?: boolean;
+    confirmAbsent: (
+      tmdbId: number,
+      tvdbId?: number
+    ) => Promise<boolean | undefined>;
   }): Promise<void> {
     if (seenTmdbIds.size === 0) {
       this.log(
@@ -998,13 +1003,19 @@ class BaseScanner<T> {
 
     const serviceStatusRepository = getRepository(MediaServiceStatus);
 
-    const candidates: { id: number; mediaId: number; tmdbId: number }[] =
+    const candidates: {
+      id: number;
+      mediaId: number;
+      tmdbId: number;
+      tvdbId?: number;
+    }[] =
       await serviceStatusRepository
         .createQueryBuilder('serviceStatus')
         .innerJoin(Media, 'media', 'media.id = serviceStatus.mediaId')
         .select('serviceStatus.id', 'id')
         .addSelect('serviceStatus.mediaId', 'mediaId')
         .addSelect('media.tmdbId', 'tmdbId')
+        .addSelect('media.tvdbId', 'tvdbId')
         .where('serviceStatus.serviceId = :serviceId', { serviceId })
         .andWhere('serviceStatus.serviceType = :serviceType', { serviceType })
         .andWhere('serviceStatus.status NOT IN (:...exempt)', {
@@ -1013,12 +1024,20 @@ class BaseScanner<T> {
         .andWhere('media.mediaType = :mediaType', { mediaType })
         .getRawMany();
 
-    const staleIds = candidates
-      .filter((candidate) => !seenTmdbIds.has(Number(candidate.tmdbId)))
-      .map((candidate) => candidate.id);
-    const staleMediaIds = candidates
-      .filter((candidate) => !seenTmdbIds.has(Number(candidate.tmdbId)))
-      .map((candidate) => Number(candidate.mediaId));
+    const confirmedStale = [];
+    for (const candidate of candidates) {
+      if (seenTmdbIds.has(Number(candidate.tmdbId))) continue;
+      if (
+        !(await confirmAbsent(Number(candidate.tmdbId), candidate.tvdbId))
+      ) {
+        continue;
+      }
+      confirmedStale.push(candidate);
+    }
+    const staleIds = confirmedStale.map((candidate) => candidate.id);
+    const staleMediaIds = confirmedStale.map((candidate) =>
+      Number(candidate.mediaId)
+    );
 
     if (staleMediaIds.length > 0) {
       const requestRepository = getRepository(MediaRequest);

@@ -161,6 +161,19 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
             deletedStatus: MediaStatus.DELETED,
           }
         );
+      } else if (req.query.filter === 'available') {
+        query = query.andWhere(
+          '(request.isServiceRequest = false OR (serviceStatuses.serviceId = request.serverId AND serviceStatuses.serviceType = CASE WHEN request.type = :movieType THEN :radarrType ELSE :sonarrType END AND serviceStatuses.status NOT IN (:...unavailableServiceStatuses)))',
+          {
+            movieType: MediaType.MOVIE,
+            radarrType: 'radarr',
+            sonarrType: 'sonarr',
+            unavailableServiceStatuses: [
+              MediaStatus.UNKNOWN,
+              MediaStatus.DELETED,
+            ],
+          }
+        );
       }
 
       if (

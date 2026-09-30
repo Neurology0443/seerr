@@ -107,6 +107,16 @@ class RadarrScanner
             mediaType: MediaType.MOVIE,
             seenTmdbIds: this.currentServerTmdbIds,
             serverName: server.name,
+            confirmAbsent: async (tmdbId) => {
+              try {
+                return (
+                  (await this.radarrApi.getLibraryMoviesByTmdbId(tmdbId))
+                    .length === 0
+                );
+              } catch {
+                return undefined;
+              }
+            },
           });
         } else {
           this.log(`Sync not enabled. Skipping Radarr server: ${server.name}`);

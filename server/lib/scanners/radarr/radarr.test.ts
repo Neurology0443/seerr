@@ -767,7 +767,7 @@ describe('Radarr Scanner', () => {
       const serviceRequest = await getRepository(MediaRequest).save(
         new MediaRequest({
           type: MediaType.MOVIE,
-          status: MediaRequestStatus.APPROVED,
+          status: MediaRequestStatus.PENDING,
           media,
           requestedBy,
           serverId: 0,
@@ -775,6 +775,9 @@ describe('Radarr Scanner', () => {
           is4k: false,
         })
       );
+      await getRepository(MediaRequest).update(serviceRequest.id, {
+        status: MediaRequestStatus.APPROVED,
+      });
 
       configureRadarr([{ syncEnabled: true }]);
       getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 562, id: 98 })];
