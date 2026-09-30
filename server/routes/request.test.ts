@@ -738,7 +738,9 @@ describe('PUT /request/:requestId (tv)', () => {
     ]);
     const owner = await seedUser('demo@seerr.dev');
     owner.requestServices = ['sonarr:0'];
-    await getRepository(User).save(owner);
+    await getRepository(User).update(owner.id, {
+      requestServices: owner.requestServices,
+    });
     const moving = await seedTvRequest(owner, [1], {
       tmdbId: 67894,
       serverId: 0,
@@ -801,6 +803,45 @@ describe('PUT /request/:requestId (tv)', () => {
     assert.deepStrictEqual(
       saved.seasons.map((season) => season.seasonNumber),
       [2]
+    );
+  });
+
+  it('replaces persisted season rows when moving between services', async () => {
+    configureSonarr([
+      { id: 0, buttonLabel: 'Source', isDefault: false },
+      { id: 1, buttonLabel: 'Destination', isDefault: false },
+    ]);
+    const owner = await seedUser('admin@seerr.dev');
+    const moving = await seedTvRequest(owner, [1, 2], {
+      tmdbId: 67895,
+      serverId: 0,
+      isServiceRequest: true,
+    });
+    const originalSeasonIds = moving.seasons.map((season) => season.id);
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+
+    const res = await agent.put(`/request/${moving.id}`).send({
+      mediaType: MediaType.TV,
+      serverId: 1,
+      seasons: [2, 3],
+    });
+    assert.strictEqual(res.status, 200);
+
+    const saved = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: moving.id },
+    });
+    assert.deepStrictEqual(
+      saved.seasons
+        .map((season) => season.seasonNumber)
+        .sort((a, b) => a - b),
+      [2, 3]
+    );
+    assert.equal(new Set(saved.seasons.map((season) => season.id)).size, 2);
+    assert.strictEqual(
+      await getRepository(SeasonRequest).count({
+        where: originalSeasonIds.map((id) => ({ id })),
+      }),
+      0
     );
   });
 });
@@ -903,6 +944,40 @@ describe('PUT /request/:requestId (season availability)', () => {
 });
 
 describe('PUT /request/:requestId (quota)', () => {
+  it('does not recharge existing seasons when moving between services', async () => {
+    configureSonarr([
+      { id: 0, buttonLabel: 'Source', isDefault: false },
+      { id: 1, buttonLabel: 'Destination', isDefault: false },
+    ]);
+    const owner = await seedUser('demo@seerr.dev', { tvQuotaLimit: 2 });
+    owner.requestServices = ['sonarr:0', 'sonarr:1'];
+    await getRepository(User).update(owner.id, {
+      requestServices: owner.requestServices,
+    });
+    const mediaRequest = await seedTvRequest(owner, [1, 2], {
+      tmdbId: 67896,
+      serverId: 0,
+      isServiceRequest: true,
+    });
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.TV,
+      serverId: 1,
+      seasons: [1, 2],
+    });
+
+    assert.strictEqual(res.status, 200);
+    const saved = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 1);
+    assert.deepStrictEqual(
+      saved.seasons.map((season) => season.seasonNumber).sort((a, b) => a - b),
+      [1, 2]
+    );
+  });
+
   it('rejects adding seasons beyond the season limit', async () => {
     const requestRepo = getRepository(MediaRequest);
     const owner = await seedUser('demo@seerr.dev', { tvQuotaLimit: 2 });

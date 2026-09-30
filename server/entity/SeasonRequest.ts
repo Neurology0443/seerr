@@ -23,6 +23,7 @@ class SeasonRequest {
 
   @ManyToOne(() => MediaRequest, (request) => request.seasons, {
     onDelete: 'CASCADE',
+    orphanedRowAction: 'delete',
   })
   @Index()
   public request: MediaRequest;

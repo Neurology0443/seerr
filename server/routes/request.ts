@@ -564,6 +564,7 @@ requestRoutes.put<{ requestId: string }>(
             ? request.serverId
             : req.body.serverId;
         const destinationChanging = requestedServerId !== request.serverId;
+        const slotChanging = request.isServiceRequest && destinationChanging;
         if (destinationChanging) {
           validateRequestTarget({
             mediaType: request.type,
@@ -654,7 +655,7 @@ requestRoutes.put<{ requestId: string }>(
               );
 
               if (
-                destinationChanging &&
+                slotChanging &&
                 requestedSeasons.some((season) =>
                   existingSeasons.includes(season)
                 )
@@ -665,7 +666,7 @@ requestRoutes.put<{ requestId: string }>(
                 });
               }
 
-              const currentSeasons = destinationChanging
+              const currentSeasons = slotChanging
                 ? []
                 : request.seasons.map((season) => season.seasonNumber);
 
@@ -735,7 +736,6 @@ requestRoutes.put<{ requestId: string }>(
                 }
 
                 const countedAlready =
-                  !destinationChanging &&
                   !ownerChanging &&
                   (!quotas.tv.days || request.createdAt > quotaWindowStart);
                 const priorSeasonCount = countedAlready

@@ -289,14 +289,9 @@ const RequestButton = ({
   }
 
   const servicePrefix = mediaType === 'movie' ? 'radarr' : 'sonarr';
-  const restrictToServices =
-    (user?.requestServices ?? []).some((service) =>
-      service.startsWith(`${servicePrefix}:`)
-    ) && !hasPermission(Permission.MANAGE_REQUESTS);
 
   // Standard request button
   if (
-    !restrictToServices &&
     (!media ||
       media.status === MediaStatus.UNKNOWN ||
       (media.status === MediaStatus.DELETED && !activeRequest)) &&
@@ -320,7 +315,6 @@ const RequestButton = ({
       svg: <ArrowDownTrayIcon />,
     });
   } else if (
-    !restrictToServices &&
     mediaType === 'tv' &&
     (!activeRequest || activeRequest.requestedBy.id !== user?.id) &&
     hasPermission([Permission.REQUEST, Permission.REQUEST_TV], {
@@ -343,7 +337,6 @@ const RequestButton = ({
 
   // 4K request button
   if (
-    !restrictToServices &&
     (!media ||
       media.status4k === MediaStatus.UNKNOWN ||
       (media.status4k === MediaStatus.DELETED && !active4kRequest)) &&
@@ -369,7 +362,6 @@ const RequestButton = ({
       svg: <ArrowDownTrayIcon />,
     });
   } else if (
-    !restrictToServices &&
     mediaType === 'tv' &&
     (!active4kRequest || active4kRequest.requestedBy.id !== user?.id) &&
     hasPermission([Permission.REQUEST_4K, Permission.REQUEST_4K_TV], {
@@ -404,15 +396,37 @@ const RequestButton = ({
     if (
       serviceStatusEntry &&
       serviceStatusEntry.status !== MediaStatus.UNKNOWN &&
-      serviceStatusEntry.status !== MediaStatus.DELETED
+      serviceStatusEntry.status !== MediaStatus.DELETED &&
+      (mediaType !== 'tv' ||
+        serviceStatusEntry.status !== MediaStatus.PARTIALLY_AVAILABLE)
     ) {
       continue;
     }
 
     const serviceIdentifier = `${servicePrefix}:${service.id}`;
+    const hasQualityPermission = service.is4k
+      ? hasPermission(
+          [
+            Permission.REQUEST_4K,
+            mediaType === 'movie'
+              ? Permission.REQUEST_4K_MOVIE
+              : Permission.REQUEST_4K_TV,
+          ],
+          { type: 'or' }
+        )
+      : hasPermission(
+          [
+            Permission.REQUEST,
+            mediaType === 'movie'
+              ? Permission.REQUEST_MOVIE
+              : Permission.REQUEST_TV,
+          ],
+          { type: 'or' }
+        );
     const canUseService =
       hasPermission(Permission.MANAGE_REQUESTS) ||
-      (user?.requestServices ?? []).includes(serviceIdentifier);
+      ((user?.requestServices ?? []).includes(serviceIdentifier) &&
+        hasQualityPermission);
 
     const activeServiceRequests = media?.requests.filter(
       (r) =>
@@ -474,17 +488,7 @@ const RequestButton = ({
           }
         );
       }
-    } else if (
-      hasPermission(
-        [
-          Permission.REQUEST,
-          mediaType === 'movie'
-            ? Permission.REQUEST_MOVIE
-            : Permission.REQUEST_TV,
-        ],
-        { type: 'or' }
-      )
-    ) {
+    } else if (canUseService) {
       buttons.push({
         id: `request-service-${service.id}`,
         text: intl.formatMessage(messages.requestinservice, {
@@ -514,6 +518,9 @@ const RequestButton = ({
     pendingServiceRequests?.find(
       (request) => request.requestedBy.id === user?.id
     ) ?? pendingServiceRequests?.[0];
+  const selectedService = allServices?.find(
+    (service) => service.id === activeServiceModal.serverId
+  );
 
   if (!buttonOne) {
     return null;
@@ -550,6 +557,7 @@ const RequestButton = ({
           show={activeServiceModal.show}
           type={mediaType}
           serverId={activeServiceModal.serverId}
+          is4k={selectedService?.is4k ?? false}
           editRequest={editRequest ? activeServiceRequest : undefined}
           onComplete={() => {
             onUpdate();
