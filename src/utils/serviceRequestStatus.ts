@@ -1,4 +1,4 @@
-import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
+import { MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
 import type { DownloadingItem } from '@server/lib/downloadtracker';
@@ -14,14 +14,7 @@ export const getServiceSlotStatus = (
     (ss) => ss.serviceId === request.serverId
   );
 
-  const status =
-    serviceStatus && serviceStatus.status !== MediaStatus.UNKNOWN
-      ? serviceStatus.status
-      : request.status === MediaRequestStatus.COMPLETED
-        ? MediaStatus.AVAILABLE
-        : request.status === MediaRequestStatus.APPROVED
-          ? MediaStatus.PROCESSING
-          : MediaStatus.PENDING;
+  const status = serviceStatus?.status;
 
   return { status, downloadItem: serviceStatus?.downloadStatus ?? [] };
 };

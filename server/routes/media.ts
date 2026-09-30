@@ -5,7 +5,6 @@ import TheMovieDb from '@server/api/themoviedb';
 import { MediaStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
-import { MediaRequest } from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import Season from '@server/entity/Season';
 import { User } from '@server/entity/User';
@@ -17,6 +16,7 @@ import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { Router } from 'express';
 import type { FindOneOptions } from 'typeorm';
 import { EntityNotFoundError, In, IsNull, Not } from 'typeorm';
@@ -232,6 +232,18 @@ mediaRoutes.delete(
         serviceSettings = isMovie
           ? settings.radarr.find((r) => r.id === explicitServiceId)
           : settings.sonarr.find((s) => s.id === explicitServiceId);
+
+        if (
+          !serviceSettings ||
+          !isMultiServiceTarget(serviceSettings) ||
+          serviceSettings.isDefault ||
+          !serviceSettings.syncEnabled
+        ) {
+          return next({
+            status: 400,
+            message: 'Invalid multi-service target.',
+          });
+        }
       } else {
         if (isMovie) {
           serviceSettings = settings.radarr.find(
@@ -308,22 +320,39 @@ mediaRoutes.delete(
       }
 
       if (isServiceDelete) {
-        await getRepository(MediaServiceStatus)
-          .createQueryBuilder()
-          .delete()
-          .where('mediaId = :mediaId', { mediaId: media.id })
-          .andWhere('serviceId = :serviceId', { serviceId: explicitServiceId })
-          .execute();
+        const serviceStatusRepository = getRepository(MediaServiceStatus);
+        const serviceStatus = await serviceStatusRepository.findOne({
+          where: {
+            mediaId: media.id,
+            serviceId: explicitServiceId,
+          },
+        });
 
-        await getRepository(MediaRequest)
-          .createQueryBuilder()
-          .delete()
-          .where('mediaId = :mediaId', { mediaId: media.id })
-          .andWhere('serverId = :serviceId', { serviceId: explicitServiceId })
-          .andWhere('isServiceRequest = :isServiceRequest', {
-            isServiceRequest: true,
-          })
-          .execute();
+        const deletedServiceStatus =
+          serviceStatus ??
+          new MediaServiceStatus({
+            mediaId: media.id,
+            serviceId: explicitServiceId,
+            serviceType: isMovie ? 'radarr' : 'sonarr',
+          });
+        deletedServiceStatus.status = MediaStatus.DELETED;
+        deletedServiceStatus.externalServiceId = null;
+        deletedServiceStatus.externalServiceSlug = null;
+        if (!isMovie) {
+          const seasonNumbers = new Set([
+            ...Object.keys(deletedServiceStatus.seasonStatuses ?? {}).map(
+              Number
+            ),
+            ...media.seasons.map((season) => season.seasonNumber),
+          ]);
+          deletedServiceStatus.seasonStatuses = Object.fromEntries(
+            [...seasonNumbers].map((seasonNumber) => [
+              seasonNumber,
+              MediaStatus.DELETED,
+            ])
+          );
+        }
+        await serviceStatusRepository.save(deletedServiceStatus);
       } else {
         media[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
         media.resetServiceData(is4k);

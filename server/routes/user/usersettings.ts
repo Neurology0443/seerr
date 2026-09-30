@@ -21,6 +21,7 @@ import {
   isOwnProfile,
   isOwnProfileOrAdmin,
 } from '@server/utils/profileMiddleware';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { Router } from 'express';
 import net from 'net';
 import { Not } from 'typeorm';
@@ -776,9 +777,29 @@ userSettingsRoutes.post<
       user.permissions = req.body.permissions;
 
       if (req.body.requestServices !== undefined) {
-        user.requestServices = req.body.requestServices.filter((s) =>
-          /^(radarr|sonarr):\d+$/.test(s)
-        );
+        if (!Array.isArray(req.body.requestServices)) {
+          return next({ status: 400, message: 'Invalid request services.' });
+        }
+        const settings = getSettings();
+        const validGrants = req.body.requestServices.every((grant) => {
+          const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
+          if (!match) return false;
+          const services =
+            match[1] === 'radarr' ? settings.radarr : settings.sonarr;
+          const target = services.find(
+            (service) => service.id === Number(match[2])
+          );
+          return (
+            target &&
+            isMultiServiceTarget(target) &&
+            !target.isDefault &&
+            target.syncEnabled
+          );
+        });
+        if (!validGrants) {
+          return next({ status: 400, message: 'Invalid request services.' });
+        }
+        user.requestServices = [...new Set(req.body.requestServices)];
       }
 
       await userRepository.save(user);

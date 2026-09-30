@@ -336,7 +336,10 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
             )?.name;
             const serverName =
               r.serverId != null
-                ? settings.radarr.find((s) => s.id === r.serverId)?.name
+                ? (settings.radarr.find((s) => s.id === r.serverId)?.name ??
+                  (r.isServiceRequest
+                    ? `Deleted service (#${r.serverId})`
+                    : undefined))
                 : undefined;
 
             return { ...r, profileName, serverName };
@@ -347,7 +350,10 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
             );
             const serverName =
               r.serverId != null
-                ? settings.sonarr.find((s) => s.id === r.serverId)?.name
+                ? (settings.sonarr.find((s) => s.id === r.serverId)?.name ??
+                  (r.isServiceRequest
+                    ? `Deleted service (#${r.serverId})`
+                    : undefined))
                 : undefined;
 
             return {
@@ -369,22 +375,38 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
               return {
                 ...r,
                 // check if the radarr server for this request is configured
-                canRemove: radarrServers.some(
-                  (server) =>
-                    server.id ===
-                    (r.is4k ? r.media.serviceId4k : r.media.serviceId)
-                ),
+                canRemove: r.isServiceRequest
+                  ? settings.radarr.some(
+                      (server) =>
+                        server.id === r.serverId &&
+                        Boolean(server.buttonLabel?.trim()) &&
+                        !server.isDefault &&
+                        server.syncEnabled
+                    )
+                  : radarrServers.some(
+                      (server) =>
+                        server.id ===
+                        (r.is4k ? r.media.serviceId4k : r.media.serviceId)
+                    ),
               };
             }
             case MediaType.TV: {
               return {
                 ...r,
                 // check if the sonarr server for this request is configured
-                canRemove: sonarrServers.some(
-                  (server) =>
-                    server.id ===
-                    (r.is4k ? r.media.serviceId4k : r.media.serviceId)
-                ),
+                canRemove: r.isServiceRequest
+                  ? settings.sonarr.some(
+                      (server) =>
+                        server.id === r.serverId &&
+                        Boolean(server.buttonLabel?.trim()) &&
+                        !server.isDefault &&
+                        server.syncEnabled
+                    )
+                  : sonarrServers.some(
+                      (server) =>
+                        server.id ===
+                        (r.is4k ? r.media.serviceId4k : r.media.serviceId)
+                    ),
               };
             }
           }
@@ -738,8 +760,11 @@ requestRoutes.put<{ requestId: string }>(
               const otherActiveRequests = media.requests.filter(
                 (other) =>
                   other.id !== request.id &&
-                  other.status !== MediaRequestStatus.DECLINED &&
-                  other.status !== MediaRequestStatus.COMPLETED &&
+                  (request.isServiceRequest
+                    ? other.status === MediaRequestStatus.PENDING ||
+                      other.status === MediaRequestStatus.APPROVED
+                    : other.status !== MediaRequestStatus.DECLINED &&
+                      other.status !== MediaRequestStatus.COMPLETED) &&
                   isSameRequestSlot(
                     other,
                     request.isServiceRequest,
@@ -749,7 +774,10 @@ requestRoutes.put<{ requestId: string }>(
               );
 
               if (request.type === MediaType.MOVIE) {
-                if (destinationChanging && otherActiveRequests.length > 0) {
+                if (
+                  (request.isServiceRequest || destinationChanging) &&
+                  otherActiveRequests.length > 0
+                ) {
                   return next({
                     status: 409,
                     message: 'Request for this media already exists.',
@@ -777,16 +805,11 @@ requestRoutes.put<{ requestId: string }>(
                 return res.status(200).json(request);
               }
 
-              const rawRequestedSeasons = req.body.seasons as
-                | number[]
-                | undefined;
+              const rawRequestedSeasons: unknown = req.body.seasons;
 
-              if (!rawRequestedSeasons || rawRequestedSeasons.length === 0) {
-                throw new Error(
-                  'Missing seasons. If you want to cancel a series request, use the DELETE method.'
-                );
-              }
               if (
+                !Array.isArray(rawRequestedSeasons) ||
+                rawRequestedSeasons.length === 0 ||
                 rawRequestedSeasons.some(
                   (season) => !Number.isInteger(season) || season < 0
                 )
@@ -795,14 +818,16 @@ requestRoutes.put<{ requestId: string }>(
                   'Invalid season selection.'
                 );
               }
-              const requestedSeasons = [...new Set(rawRequestedSeasons)];
+              const requestedSeasons = [
+                ...new Set<number>(rawRequestedSeasons),
+              ];
 
               const existingSeasons = otherActiveRequests.flatMap((other) =>
                 other.seasons.map((season) => season.seasonNumber)
               );
 
               if (
-                slotChanging &&
+                request.isServiceRequest &&
                 requestedSeasons.some((season) =>
                   existingSeasons.includes(season)
                 )
@@ -831,9 +856,7 @@ requestRoutes.put<{ requestId: string }>(
                 coveredSeasons = Object.entries(
                   serviceStatus?.seasonStatuses ?? {}
                 )
-                  .filter(
-                    ([, status]) => status === MediaStatus.AVAILABLE
-                  )
+                  .filter(([, status]) => status === MediaStatus.AVAILABLE)
                   .map(([seasonNumber]) => Number(seasonNumber));
               } else {
                 coveredSeasons = (media.seasons ?? [])

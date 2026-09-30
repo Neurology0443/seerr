@@ -793,7 +793,8 @@ class BaseScanner<T> {
     const orphanedRequests = (media.requests ?? []).filter(
       (request) =>
         !request.isServiceRequest &&
-        request.is4k === is4k && request.status === MediaRequestStatus.APPROVED
+        request.is4k === is4k &&
+        request.status === MediaRequestStatus.APPROVED
     );
 
     for (const request of orphanedRequests) {
@@ -1069,12 +1070,10 @@ class BaseScanner<T> {
   }): Promise<void> {
     if (seenTmdbIds.size === 0) {
       this.log(
-        `No titles were processed for ${serverName}. Stale service status reset will be skipped.`,
-        'warn'
+        `The healthy inventory for ${serverName} is empty. Known titles will be confirmed individually before cleanup.`,
+        'info'
       );
-      return;
     }
-
     const serviceStatusRepository = getRepository(MediaServiceStatus);
 
     const candidates: {
@@ -1082,28 +1081,25 @@ class BaseScanner<T> {
       mediaId: number;
       tmdbId: number;
       tvdbId?: number;
-    }[] =
-      await serviceStatusRepository
-        .createQueryBuilder('serviceStatus')
-        .innerJoin(Media, 'media', 'media.id = serviceStatus.mediaId')
-        .select('serviceStatus.id', 'id')
-        .addSelect('serviceStatus.mediaId', 'mediaId')
-        .addSelect('media.tmdbId', 'tmdbId')
-        .addSelect('media.tvdbId', 'tvdbId')
-        .where('serviceStatus.serviceId = :serviceId', { serviceId })
-        .andWhere('serviceStatus.serviceType = :serviceType', { serviceType })
-        .andWhere('serviceStatus.status NOT IN (:...exempt)', {
-          exempt: [MediaStatus.UNKNOWN, MediaStatus.DELETED],
-        })
-        .andWhere('media.mediaType = :mediaType', { mediaType })
-        .getRawMany();
+    }[] = await serviceStatusRepository
+      .createQueryBuilder('serviceStatus')
+      .innerJoin(Media, 'media', 'media.id = serviceStatus.mediaId')
+      .select('serviceStatus.id', 'id')
+      .addSelect('serviceStatus.mediaId', 'mediaId')
+      .addSelect('media.tmdbId', 'tmdbId')
+      .addSelect('media.tvdbId', 'tvdbId')
+      .where('serviceStatus.serviceId = :serviceId', { serviceId })
+      .andWhere('serviceStatus.serviceType = :serviceType', { serviceType })
+      .andWhere('serviceStatus.status NOT IN (:...exempt)', {
+        exempt: [MediaStatus.UNKNOWN, MediaStatus.DELETED],
+      })
+      .andWhere('media.mediaType = :mediaType', { mediaType })
+      .getRawMany();
 
     const confirmedStale = [];
     for (const candidate of candidates) {
       if (seenTmdbIds.has(Number(candidate.tmdbId))) continue;
-      if (
-        !(await confirmAbsent(Number(candidate.tmdbId), candidate.tvdbId))
-      ) {
+      if (!(await confirmAbsent(Number(candidate.tmdbId), candidate.tvdbId))) {
         continue;
       }
       confirmedStale.push(candidate);
