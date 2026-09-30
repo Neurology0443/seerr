@@ -730,7 +730,10 @@ describe('Radarr Scanner', () => {
   });
 
   describe('per-service status', () => {
-    async function seedServiceStatus(tmdbId: number): Promise<number> {
+    async function seedServiceStatus(
+      tmdbId: number,
+      status = MediaStatus.AVAILABLE
+    ): Promise<number> {
       const media = new Media();
       media.tmdbId = tmdbId;
       media.mediaType = MediaType.MOVIE;
@@ -742,7 +745,7 @@ describe('Radarr Scanner', () => {
           mediaId: media.id,
           serviceId: 0,
           serviceType: 'radarr',
-          status: MediaStatus.AVAILABLE,
+          status,
         })
       );
 
@@ -771,6 +774,31 @@ describe('Radarr Scanner', () => {
       assert.strictEqual(serviceStatus.status, MediaStatus.AVAILABLE);
     });
 
+    it('does not run native cleanup when only a labelled target is scanned', async () => {
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 558,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      configureRadarr([
+        {
+          syncEnabled: true,
+          buttonLabel: 'Deutsch',
+          isDefault: false,
+        },
+      ]);
+      getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 559 })];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      const unchangedMedia = await getRepository(Media).findOneByOrFail({
+        id: media.id,
+      });
+      assert.strictEqual(unchangedMedia.status, MediaStatus.PROCESSING);
+    });
+
     it('keeps per-service status when the server returns no movies', async () => {
       const mediaId = await seedServiceStatus(560);
 
@@ -786,7 +814,7 @@ describe('Radarr Scanner', () => {
     });
 
     it('resets per-service status for a movie removed from the server', async () => {
-      const mediaId = await seedServiceStatus(561);
+      const mediaId = await seedServiceStatus(561, MediaStatus.PROCESSING);
       const media = await getRepository(Media).findOneByOrFail({ id: mediaId });
       const requestedBy = await getRepository(User).findOneOrFail({
         where: { email: 'admin@seerr.dev' },
@@ -802,9 +830,8 @@ describe('Radarr Scanner', () => {
           is4k: false,
         })
       );
-      await getRepository(MediaRequest).update(serviceRequest.id, {
-        status: MediaRequestStatus.APPROVED,
-      });
+      serviceRequest.status = MediaRequestStatus.APPROVED;
+      await getRepository(MediaRequest).save(serviceRequest);
 
       configureRadarr([{ syncEnabled: true }]);
       getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 562, id: 98 })];

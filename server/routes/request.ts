@@ -31,6 +31,7 @@ import {
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import { isPgsql } from '@server/utils/dbType';
 import requestLock, {
   mediaKey,
   mediaLock,
@@ -40,6 +41,61 @@ import requestLock, {
 import { Router } from 'express';
 
 const requestRoutes = Router();
+
+const requestedTvSeasonsAvailable = (serviceRequest: boolean): string => {
+  if (!serviceRequest) {
+    return `NOT EXISTS (
+      SELECT 1 FROM season_request requested_season
+      LEFT JOIN season media_season
+        ON media_season."mediaId" = media.id
+        AND media_season."seasonNumber" = requested_season."seasonNumber"
+      WHERE requested_season."requestId" = request.id
+        AND (
+          media_season.id IS NULL OR
+          CASE WHEN request.is4k = true
+            THEN media_season.status4k
+            ELSE media_season.status
+          END != :availableStatus
+        )
+    )`;
+  }
+
+  const seasonStatus = isPgsql
+    ? `CAST(matched_service_status."seasonStatuses" AS jsonb) ->> CAST(requested_season."seasonNumber" AS text)`
+    : `json_extract(matched_service_status."seasonStatuses", '$."' || requested_season."seasonNumber" || '"')`;
+
+  return `EXISTS (
+    SELECT 1 FROM media_service_status matched_service_status
+    WHERE matched_service_status."mediaId" = media.id
+      AND matched_service_status."serviceId" = request.serverId
+      AND matched_service_status."serviceType" = :sonarrType
+      AND NOT EXISTS (
+        SELECT 1 FROM season_request requested_season
+        WHERE requested_season."requestId" = request.id
+          AND COALESCE(CAST((${seasonStatus}) AS integer), -1) != :availableStatus
+      )
+  )`;
+};
+
+const requestAvailableCondition = `(
+  (request.type = :movieType AND (
+    (request.isServiceRequest = false AND (
+      (request.is4k = false AND media.status = :availableStatus) OR
+      (request.is4k = true AND media.status4k = :availableStatus)
+    )) OR
+    (request.isServiceRequest = true AND EXISTS (
+      SELECT 1 FROM media_service_status matched_service_status
+      WHERE matched_service_status."mediaId" = media.id
+        AND matched_service_status."serviceId" = request.serverId
+        AND matched_service_status."serviceType" = :radarrType
+        AND matched_service_status.status = :availableStatus
+    ))
+  )) OR
+  (request.type = :tvType AND (
+    (request.isServiceRequest = false AND ${requestedTvSeasonsAvailable(false)}) OR
+    (request.isServiceRequest = true AND ${requestedTvSeasonsAvailable(true)})
+  ))
+)`;
 
 requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
   '/',
@@ -143,8 +199,29 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
         .leftJoinAndSelect('request.requestedBy', 'requestedBy')
         .where('request.status IN (:...requestStatus)', {
           requestStatus: statusFilter,
-        })
-        .andWhere(
+        });
+
+      if (req.query.filter === 'available') {
+        query = query.andWhere(requestAvailableCondition, {
+          availableStatus: MediaStatus.AVAILABLE,
+          movieType: MediaType.MOVIE,
+          tvType: MediaType.TV,
+          radarrType: 'radarr',
+          sonarrType: 'sonarr',
+        });
+      } else if (
+        req.query.filter === 'processing' ||
+        req.query.filter === 'unavailable'
+      ) {
+        query = query.andWhere(`NOT ${requestAvailableCondition}`, {
+          availableStatus: MediaStatus.AVAILABLE,
+          movieType: MediaType.MOVIE,
+          tvType: MediaType.TV,
+          radarrType: 'radarr',
+          sonarrType: 'sonarr',
+        });
+      } else if (req.query.filter === 'deleted') {
+        query = query.andWhere(
           `(
             (request.isServiceRequest = false AND (
               (request.is4k = false AND media.status IN (:...mediaStatus)) OR
@@ -168,6 +245,7 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
             sonarrType: 'sonarr',
           }
         );
+      }
 
       if (
         !req.user?.hasPermission(
@@ -425,76 +503,26 @@ requestRoutes.get('/count', async (_req, res, next) => {
       .where('request.status = :requestStatus', {
         requestStatus: MediaRequestStatus.APPROVED,
       })
-      .andWhere(
-        `(
-          (request.isServiceRequest = false AND (
-            (request.is4k = false AND media.status != :availableStatus) OR
-            (request.is4k = true AND media.status4k != :availableStatus)
-          )) OR
-          (request.isServiceRequest = true AND (
-            NOT EXISTS (
-              SELECT 1 FROM media_service_status matchedServiceStatus
-              WHERE matchedServiceStatus.mediaId = media.id
-                AND matchedServiceStatus.serviceId = request.serverId
-                AND matchedServiceStatus.serviceType = CASE
-                  WHEN request.type = :movieType THEN :radarrType
-                  ELSE :sonarrType
-                END
-            ) OR EXISTS (
-              SELECT 1 FROM media_service_status matchedServiceStatus
-              WHERE matchedServiceStatus.mediaId = media.id
-                AND matchedServiceStatus.serviceId = request.serverId
-                AND matchedServiceStatus.serviceType = CASE
-                  WHEN request.type = :movieType THEN :radarrType
-                  ELSE :sonarrType
-                END
-                AND matchedServiceStatus.status IN (:...processingStatuses)
-            )
-          ))
-        )`,
-        {
-          availableStatus: MediaStatus.AVAILABLE,
-          movieType: MediaType.MOVIE,
-          radarrType: 'radarr',
-          sonarrType: 'sonarr',
-          processingStatuses: [
-            MediaStatus.UNKNOWN,
-            MediaStatus.PENDING,
-            MediaStatus.PROCESSING,
-            MediaStatus.PARTIALLY_AVAILABLE,
-          ],
-        }
-      )
+      .andWhere(`NOT ${requestAvailableCondition}`, {
+        availableStatus: MediaStatus.AVAILABLE,
+        movieType: MediaType.MOVIE,
+        tvType: MediaType.TV,
+        radarrType: 'radarr',
+        sonarrType: 'sonarr',
+      })
       .getCount();
 
     const availableCount = await query
       .where('request.status = :requestStatus', {
         requestStatus: MediaRequestStatus.APPROVED,
       })
-      .andWhere(
-        `(
-          (request.isServiceRequest = false AND (
-            (request.is4k = false AND media.status = :availableStatus) OR
-            (request.is4k = true AND media.status4k = :availableStatus)
-          )) OR
-          (request.isServiceRequest = true AND EXISTS (
-            SELECT 1 FROM media_service_status matchedServiceStatus
-            WHERE matchedServiceStatus.mediaId = media.id
-              AND matchedServiceStatus.serviceId = request.serverId
-              AND matchedServiceStatus.serviceType = CASE
-                WHEN request.type = :movieType THEN :radarrType
-                ELSE :sonarrType
-              END
-              AND matchedServiceStatus.status = :availableStatus
-          ))
-        )`,
-        {
-          availableStatus: MediaStatus.AVAILABLE,
-          movieType: MediaType.MOVIE,
-          radarrType: 'radarr',
-          sonarrType: 'sonarr',
-        }
-      )
+      .andWhere(requestAvailableCondition, {
+        availableStatus: MediaStatus.AVAILABLE,
+        movieType: MediaType.MOVIE,
+        tvType: MediaType.TV,
+        radarrType: 'radarr',
+        sonarrType: 'sonarr',
+      })
       .getCount();
 
     const completedCount = await query

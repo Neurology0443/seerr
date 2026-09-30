@@ -83,17 +83,22 @@ class RadarrScanner
           this.currentServerTmdbIds = new Set();
 
           const server4k = this.enable4kMovie && server.is4k;
-          if (server4k) {
-            this.didScan4k = true;
-          } else {
-            this.didScanStandard = true;
+          const isServiceTarget = isMultiServiceTarget(server);
+          if (!isServiceTarget) {
+            if (server4k) {
+              this.didScan4k = true;
+            } else {
+              this.didScanStandard = true;
+            }
           }
 
           if (this.items.length === 0) {
-            if (server4k) {
-              this.server4kReturnedEmpty = true;
-            } else {
-              this.serverReturnedEmpty = true;
+            if (!isServiceTarget) {
+              if (server4k) {
+                this.server4kReturnedEmpty = true;
+              } else {
+                this.serverReturnedEmpty = true;
+              }
             }
             this.log(
               `Radarr server ${server.name} returned no movies. Orphan cleanup for this profile type will be skipped.`,
@@ -128,10 +133,15 @@ class RadarrScanner
       // media that exists on an unscanned server (e.g. separate instances for
       // anime, regional content, or different languages).
       const allStandardScanned = this.servers
-        .filter((s) => !this.enable4kMovie || !s.is4k)
+        .filter(
+          (s) =>
+            !isMultiServiceTarget(s) && (!this.enable4kMovie || !s.is4k)
+        )
         .every((s) => s.syncEnabled);
       const all4kScanned = this.servers
-        .filter((s) => this.enable4kMovie && s.is4k)
+        .filter(
+          (s) => !isMultiServiceTarget(s) && this.enable4kMovie && s.is4k
+        )
         .every((s) => s.syncEnabled);
 
       if (!allStandardScanned) {
@@ -159,10 +169,12 @@ class RadarrScanner
 
   private async processRadarrMovie(radarrMovie: RadarrMovie): Promise<void> {
     const server4k = this.enable4kMovie && this.currentServer.is4k;
-    if (server4k) {
-      this.scanned4kTmdbIds.add(radarrMovie.tmdbId);
-    } else {
-      this.scannedTmdbIds.add(radarrMovie.tmdbId);
+    if (!isMultiServiceTarget(this.currentServer)) {
+      if (server4k) {
+        this.scanned4kTmdbIds.add(radarrMovie.tmdbId);
+      } else {
+        this.scannedTmdbIds.add(radarrMovie.tmdbId);
+      }
     }
     this.currentServerTmdbIds.add(radarrMovie.tmdbId);
 
@@ -191,7 +203,9 @@ class RadarrScanner
   ): Promise<boolean> {
     const servers = this.servers.filter(
       (server) =>
-        server.syncEnabled && (this.enable4kMovie && server.is4k) === is4k
+        server.syncEnabled &&
+        !isMultiServiceTarget(server) &&
+        (this.enable4kMovie && server.is4k) === is4k
     );
 
     for (const server of servers) {

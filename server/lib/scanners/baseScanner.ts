@@ -792,6 +792,7 @@ class BaseScanner<T> {
 
     const orphanedRequests = (media.requests ?? []).filter(
       (request) =>
+        !request.isServiceRequest &&
         request.is4k === is4k && request.status === MediaRequestStatus.APPROVED
     );
 
@@ -1114,6 +1115,10 @@ class BaseScanner<T> {
         const requestRepository = manager.getRepository(MediaRequest);
         const orphanedRequests = await requestRepository
           .createQueryBuilder('request')
+          .innerJoinAndSelect('request.media', 'media')
+          .leftJoinAndSelect('request.seasons', 'seasons')
+          .leftJoinAndSelect('request.requestedBy', 'requestedBy')
+          .leftJoinAndSelect('request.modifiedBy', 'modifiedBy')
           .where('request.isServiceRequest = :isServiceRequest', {
             isServiceRequest: true,
           })
