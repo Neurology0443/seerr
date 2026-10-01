@@ -3,7 +3,6 @@ import { before, beforeEach, describe, it, mock } from 'node:test';
 
 import RadarrAPI from '@server/api/servarr/radarr';
 import SonarrAPI from '@server/api/servarr/sonarr';
-import TheMovieDb from '@server/api/themoviedb';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -34,20 +33,32 @@ const getSeries = mock.method(
   'getSeriesByTvdbId',
   async () => ({ id: 701, title: 'Series' }) as never
 );
-const deleteRequest = mock.fn(async (_path: string) => ({}));
-mock.method(axios, 'create', () => ({
-  delete: deleteRequest,
-  interceptors: { request: { use: () => undefined } },
-}));
-Object.defineProperty(TheMovieDb.prototype, 'getTvShow', {
-  get() {
-    return async () =>
-      ({
+const realAxiosCreate = axios.create.bind(axios);
+const deleteRequest = mock.fn(async (path: string) => ({ path }));
+const getRequest = mock.fn(async (path: string) => {
+  if (path.startsWith('/tv/')) {
+    return {
+      data: {
         external_ids: { tvdb_id: 700 },
-      }) as never;
-  },
-  set() {},
-  configurable: true,
+      },
+    };
+  }
+
+  throw new Error(`Unexpected HTTP GET in media route test: ${path}`);
+});
+const sendNotification = mock.method(
+  MediaRequest,
+  'sendNotification',
+  async () => undefined
+);
+
+mock.method(axios, 'create', (config?: Parameters<typeof axios.create>[0]) => {
+  const instance = realAxiosCreate(config);
+
+  instance.get = getRequest as unknown as typeof instance.get;
+  instance.delete = deleteRequest as unknown as typeof instance.delete;
+
+  return instance;
 });
 
 setupTestDb();
@@ -77,7 +88,9 @@ beforeEach(() => {
   getMovie.mock.resetCalls();
   getSeries.mock.resetCalls();
   deleteRequest.mock.resetCalls();
-  deleteRequest.mock.mockImplementation(async (_path: string) => ({}));
+  getRequest.mock.resetCalls();
+  sendNotification.mock.resetCalls();
+  deleteRequest.mock.mockImplementation(async (path: string) => ({ path }));
   const settings = getSettings();
   settings.radarr = [];
   settings.sonarr = [];
@@ -125,26 +138,21 @@ describe('DELETE /media/:id/file service target', () => {
         serverId: 51,
         isServiceRequest: true,
         is4k: false,
-      })
+      }),
+      { listeners: false }
     );
     const active = await getRepository(MediaRequest).save(
       new MediaRequest({
         type: MediaType.MOVIE,
-        status: MediaRequestStatus.PENDING,
+        status: MediaRequestStatus.APPROVED,
         media,
         requestedBy: user,
         serverId: 51,
         isServiceRequest: true,
         is4k: false,
-      })
+      }),
+      { listeners: false }
     );
-    await getRepository(MediaRequest)
-      .createQueryBuilder()
-      .update(MediaRequest)
-      .set({ status: MediaRequestStatus.APPROVED })
-      .where('id = :id', { id: active.id })
-      .callListeners(false)
-      .execute();
     await getRepository(MediaServiceStatus).save([
       new MediaServiceStatus({
         mediaId: media.id,
@@ -241,8 +249,8 @@ describe('DELETE /media/:id/file service target', () => {
         status: MediaStatus.AVAILABLE,
       })
     );
-    deleteRequest.mock.mockImplementation(async (_path: string) => {
-      throw new Error('Radarr unavailable');
+    deleteRequest.mock.mockImplementation(async (path: string) => {
+      throw new Error(`Radarr unavailable for ${path}`);
     });
 
     await request(app)

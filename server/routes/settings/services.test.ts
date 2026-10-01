@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { before, beforeEach, describe, it } from 'node:test';
 
-import { getRepository } from '@server/datasource';
 import {
   MediaRequestStatus,
   MediaStatus,
   MediaType,
 } from '@server/constants/media';
+import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
@@ -292,7 +292,8 @@ for (const type of ['radarr', 'sonarr'] as const) {
           serverId: 14,
           isServiceRequest: true,
           is4k: false,
-        })
+        }),
+        { listeners: false }
       );
       const beforeState = structuredClone(settings[type]);
 
