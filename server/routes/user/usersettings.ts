@@ -781,8 +781,10 @@ userSettingsRoutes.post<
           return next({ status: 400, message: 'Invalid request services.' });
         }
       }
+      const previousGrants = user.requestServices ?? [];
+      const nextGrants = grants ?? previousGrants;
       const targets: ({ type: 'radarr' | 'sonarr'; id: number } | undefined)[] =
-        (grants ?? user.requestServices ?? []).map((grant) => {
+        [...previousGrants, ...nextGrants].map((grant) => {
           const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
           return match
             ? { type: match[1] as 'radarr' | 'sonarr', id: Number(match[2]) }
@@ -803,7 +805,14 @@ userSettingsRoutes.post<
           const settings = getSettings();
           const validGrants =
             grants === undefined ||
-            targets.every((target) => {
+            nextGrants.every((grant) => {
+              const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
+              const target = match
+                ? {
+                    type: match[1] as 'radarr' | 'sonarr',
+                    id: Number(match[2]),
+                  }
+                : undefined;
               if (!target) return false;
               const configured = settings[target.type].find(
                 (service) => service.id === target.id

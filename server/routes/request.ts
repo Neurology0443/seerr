@@ -638,6 +638,12 @@ requestRoutes.put<{ requestId: string }>(
             : req.body.serverId;
 
         const updateRequest = async () => {
+          const actor = request.isServiceRequest
+            ? await userRepository.findOneOrFail({
+                where: { id: req.user?.id },
+              })
+            : req.user;
+
           if (req.body.mediaType !== request.type) {
             return next({
               status: 400,
@@ -646,10 +652,10 @@ requestRoutes.put<{ requestId: string }>(
           }
 
           if (
-            (request.requestedBy.id !== req.user?.id ||
+            (request.requestedBy.id !== actor?.id ||
               (req.body.mediaType !== 'tv' &&
-                !req.user?.hasPermission(Permission.REQUEST_ADVANCED))) &&
-            !req.user?.hasPermission(Permission.MANAGE_REQUESTS)
+                !actor?.hasPermission(Permission.REQUEST_ADVANCED))) &&
+            !actor?.hasPermission(Permission.MANAGE_REQUESTS)
           ) {
             return next({
               status: 403,
@@ -665,12 +671,16 @@ requestRoutes.put<{ requestId: string }>(
           }
 
           const previousOwnerId = request.requestedBy.id;
-          let requestUser = request.requestedBy;
+          let requestUser = request.isServiceRequest
+            ? await userRepository.findOneOrFail({
+                where: { id: request.requestedBy.id },
+              })
+            : request.requestedBy;
 
           if (
             req.body.userId &&
             req.body.userId !== request.requestedBy.id &&
-            !req.user?.hasPermission([
+            !actor?.hasPermission([
               Permission.MANAGE_USERS,
               Permission.MANAGE_REQUESTS,
             ])
@@ -721,7 +731,6 @@ requestRoutes.put<{ requestId: string }>(
                   ? [Permission.REQUEST_4K, Permission.REQUEST_4K_TV]
                   : [Permission.REQUEST, Permission.REQUEST_TV];
             if (
-              !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
               !requestUser.hasPermission(qualityPermissions, { type: 'or' })
             ) {
               throw new RequestPermissionError(
@@ -730,8 +739,8 @@ requestRoutes.put<{ requestId: string }>(
             }
 
             if (
-              !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
-              !req.user?.requestServices?.includes(
+              !actor?.hasPermission(Permission.MANAGE_REQUESTS) &&
+              !actor?.requestServices?.includes(
                 `${request.type === MediaType.MOVIE ? 'radarr' : 'sonarr'}:${
                   requestedServerId
                 }`
@@ -791,6 +800,29 @@ requestRoutes.put<{ requestId: string }>(
                 );
 
                 if (request.type === MediaType.MOVIE) {
+                  if (request.isServiceRequest && destinationChanging) {
+                    const destinationStatus = await getRepository(
+                      MediaServiceStatus
+                    ).findOne({
+                      where: {
+                        mediaId: media.id,
+                        serviceId: requestedServerId,
+                        serviceType: 'radarr',
+                      },
+                    });
+                    if (
+                      destinationStatus &&
+                      destinationStatus.status !== MediaStatus.UNKNOWN &&
+                      destinationStatus.status !== MediaStatus.DELETED
+                    ) {
+                      return next({
+                        status: 409,
+                        message:
+                          'This media is already present in the selected service.',
+                      });
+                    }
+                  }
+
                   if (
                     (request.isServiceRequest || destinationChanging) &&
                     otherActiveRequests.length > 0

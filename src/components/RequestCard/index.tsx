@@ -87,6 +87,10 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
       ? (requestData?.seasons ?? []).map((season) => season.seasonNumber)
       : []
   );
+  const {
+    status: serviceSlotStatus,
+    downloadItem: serviceDownloadStatus = [],
+  } = getServiceSlotStatus(requestData);
 
   const deleteRequest = async () => {
     await axios.delete(`/api/v1/media/${requestData?.media.id}`);
@@ -158,13 +162,24 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
                   ) : (
                     <StatusBadge
                       status={
-                        requestData.media[
-                          requestData.is4k ? 'status4k' : 'status'
-                        ]
+                        requestData.isServiceRequest
+                          ? (serviceSlotStatus ?? MediaStatus.UNKNOWN)
+                          : requestData.media[
+                              requestData.is4k ? 'status4k' : 'status'
+                            ]
                       }
-                      downloadItem={requestDownloadStatus}
+                      downloadItem={
+                        requestData.isServiceRequest
+                          ? serviceDownloadStatus
+                          : requestDownloadStatus
+                      }
                       title={intl.formatMessage(messages.unknowntitle)}
-                      inProgress={requestDownloadStatus.length > 0}
+                      inProgress={
+                        (requestData.isServiceRequest
+                          ? serviceDownloadStatus
+                          : requestDownloadStatus
+                        ).length > 0
+                      }
                       is4k={requestData.is4k}
                       mediaType={requestData.type}
                       plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
@@ -454,6 +469,7 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                 {intl.formatMessage(globalMessages.failed)}
               </Badge>
             ) : requestData.status === MediaRequestStatus.PENDING &&
+              !requestData.isServiceRequest &&
               requestData.media[requestData.is4k ? 'status4k' : 'status'] ===
                 MediaStatus.DELETED ? (
               <Badge

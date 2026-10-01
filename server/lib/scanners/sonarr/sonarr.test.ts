@@ -13,6 +13,7 @@ import {
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
+import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import Season from '@server/entity/Season';
 import { User } from '@server/entity/User';
 import { sonarrScanner } from '@server/lib/scanners/sonarr';
@@ -929,6 +930,41 @@ describe('Sonarr Scanner', () => {
       assert.strictEqual(updatedMedia.status4k, MediaStatus.UNKNOWN);
       assert.strictEqual(updatedStandard.status, MediaRequestStatus.APPROVED);
       assert.strictEqual(updated4k.status, MediaRequestStatus.DECLINED);
+    });
+  });
+
+  describe('per-service status', () => {
+    it('clears stale specials when the aggregate status is unknown', async () => {
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 3001,
+          tvdbId: 3002,
+          mediaType: MediaType.TV,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      await getRepository(MediaServiceStatus).save(
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 0,
+          serviceType: 'sonarr',
+          status: MediaStatus.UNKNOWN,
+          seasonStatuses: { 0: MediaStatus.AVAILABLE },
+        })
+      );
+      configureSonarr([
+        { buttonLabel: 'Deutsch', isDefault: false, syncEnabled: true },
+      ]);
+      getSeriesImpl = async () => [];
+      getLibrarySeriesByTvdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => sonarrScanner.run());
+
+      const serviceStatus = await getRepository(
+        MediaServiceStatus
+      ).findOneOrFail({ where: { mediaId: media.id, serviceId: 0 } });
+      assert.strictEqual(serviceStatus.status, MediaStatus.DELETED);
+      assert.strictEqual(serviceStatus.seasonStatuses, null);
     });
   });
 });

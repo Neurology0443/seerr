@@ -8,7 +8,8 @@ import { getServiceSlotStatus } from './serviceRequestStatus';
 
 const request = (
   status: MediaRequestStatus,
-  serviceStatus?: MediaStatus
+  serviceStatus?: MediaStatus,
+  downloadStatus: unknown[] = []
 ): NonFunctionProperties<MediaRequest> =>
   ({
     status,
@@ -20,7 +21,7 @@ const request = (
       serviceStatuses:
         serviceStatus === undefined
           ? []
-          : [{ serviceId: 12, status: serviceStatus }],
+          : [{ serviceId: 12, status: serviceStatus, downloadStatus }],
     },
   }) as unknown as NonFunctionProperties<MediaRequest>;
 
@@ -53,5 +54,41 @@ describe('service request status', () => {
       getServiceSlotStatus(request(MediaRequestStatus.COMPLETED)).status,
       undefined
     );
+  });
+
+  for (const liveStatus of [MediaStatus.UNKNOWN, MediaStatus.DELETED]) {
+    it(`falls back from ${liveStatus} to an active request without live downloads`, () => {
+      const pending = getServiceSlotStatus(
+        request(MediaRequestStatus.PENDING, liveStatus, [{}])
+      );
+      assert.equal(pending.status, MediaStatus.PENDING);
+      assert.deepEqual(pending.downloadItem, []);
+
+      const approved = getServiceSlotStatus(
+        request(MediaRequestStatus.APPROVED, liveStatus, [{}])
+      );
+      assert.equal(approved.status, MediaStatus.PROCESSING);
+      assert.deepEqual(approved.downloadItem, []);
+
+      assert.equal(
+        getServiceSlotStatus(
+          request(MediaRequestStatus.COMPLETED, liveStatus, [{}])
+        ).status,
+        undefined
+      );
+    });
+  }
+
+  it('keeps downloads only for a meaningful live status', () => {
+    const downloadStatus = [{}];
+    const result = getServiceSlotStatus(
+      request(
+        MediaRequestStatus.APPROVED,
+        MediaStatus.PROCESSING,
+        downloadStatus
+      )
+    );
+    assert.equal(result.status, MediaStatus.PROCESSING);
+    assert.deepEqual(result.downloadItem, downloadStatus);
   });
 });

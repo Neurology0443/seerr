@@ -10,6 +10,7 @@ import { getSettings } from '@server/lib/settings';
 import { checkUser, isAuthenticated } from '@server/middleware/auth';
 import authRoutes from '@server/routes/auth';
 import { setupTestDb } from '@server/test/db';
+import { serviceTargetLock } from '@server/utils/requestLock';
 import type { Express } from 'express';
 import express from 'express';
 import session from 'express-session';
@@ -203,6 +204,61 @@ describe('POST /user/:id/settings/permissions request services', () => {
           requestServices: [invalid],
         });
       assert.equal(rejected.status, 400);
+    }
+  });
+
+  it('locks a target that is present only in the revoked grants', async () => {
+    const settings = getSettings();
+    settings.radarr = [
+      {
+        id: 41,
+        name: 'German',
+        hostname: 'localhost',
+        port: 7878,
+        apiKey: 'key',
+        baseUrl: '',
+        useSsl: false,
+        activeProfileId: 1,
+        activeProfileName: 'Profile',
+        activeDirectory: '/movies',
+        is4k: false,
+        minimumAvailability: 'released',
+        tags: [],
+        tagRequests: false,
+        overrideRule: [],
+        isDefault: false,
+        syncEnabled: true,
+        preventSearch: false,
+        externalUrl: '',
+        buttonLabel: 'Deutsch',
+      },
+    ];
+    const demo = await getRepository(User).findOneByOrFail({
+      email: 'demo@seerr.dev',
+    });
+    demo.requestServices = ['radarr:41'];
+    await getRepository(User).save(demo);
+    const keys: string[] = [];
+    const dispatch = serviceTargetLock.dispatch.bind(serviceTargetLock);
+    const dispatchMock = mock.method(
+      serviceTargetLock,
+      'dispatch',
+      async <T>(key: string, callback: () => Promise<T>) => {
+        keys.push(key);
+        return dispatch(key, callback);
+      }
+    );
+
+    try {
+      const admin = await loginAs('admin@seerr.dev', 'test1234');
+      const response = await admin.agent
+        .post(`/user/${demo.id}/settings/permissions`)
+        .send({ permissions: demo.permissions, requestServices: [] });
+
+      assert.strictEqual(response.status, 200);
+      assert.ok(keys.includes('radarr:41'));
+    } finally {
+      dispatchMock.mock.restore();
     }
   });
 });

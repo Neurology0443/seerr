@@ -559,6 +559,7 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                   {intl.formatMessage(globalMessages.failed)}
                 </Badge>
               ) : requestData.status === MediaRequestStatus.PENDING &&
+                !requestData.isServiceRequest &&
                 requestData.media[requestData.is4k ? 'status4k' : 'status'] ===
                   MediaStatus.DELETED ? (
                 <Badge

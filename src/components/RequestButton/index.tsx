@@ -446,9 +446,9 @@ const RequestButton = ({
           { type: 'or' }
         );
     const canUseService =
-      hasPermission(Permission.MANAGE_REQUESTS) ||
-      ((user?.requestServices ?? []).includes(serviceIdentifier) &&
-        hasQualityPermission);
+      hasQualityPermission &&
+      (hasPermission(Permission.MANAGE_REQUESTS) ||
+        (user?.requestServices ?? []).includes(serviceIdentifier));
 
     if (!canUseService && !userEditableRequest) {
       continue;
