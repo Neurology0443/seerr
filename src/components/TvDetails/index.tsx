@@ -605,10 +605,10 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 ss.status !== MediaStatus.DELETED
             ) ||
               data.mediaInfo?.requests?.some(
-              (request) =>
-                request.isServiceRequest &&
-                (request.status === MediaRequestStatus.PENDING ||
-                  request.status === MediaRequestStatus.APPROVED)
+                (request) =>
+                  request.isServiceRequest &&
+                  (request.status === MediaRequestStatus.PENDING ||
+                    request.status === MediaRequestStatus.APPROVED)
               )) && (
               <ServiceStatusBadges
                 serviceStatuses={data.mediaInfo.serviceStatuses}
@@ -983,9 +983,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                                 )
                             )) && (
                             <ServiceStatusBadges
-                              serviceStatuses={
-                                data.mediaInfo?.serviceStatuses
-                              }
+                              serviceStatuses={data.mediaInfo?.serviceStatuses}
                               requests={data.mediaInfo?.requests}
                               mediaType="tv"
                               seasonNumber={season.seasonNumber}

@@ -831,9 +831,7 @@ describe('PUT /request/:requestId (tv)', () => {
       where: { id: moving.id },
     });
     assert.deepStrictEqual(
-      saved.seasons
-        .map((season) => season.seasonNumber)
-        .sort((a, b) => a - b),
+      saved.seasons.map((season) => season.seasonNumber).sort((a, b) => a - b),
       [2, 3]
     );
     assert.equal(new Set(saved.seasons.map((season) => season.id)).size, 2);

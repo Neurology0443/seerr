@@ -21,10 +21,7 @@ import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
-import {
-  serviceTargetKey,
-  serviceTargetLock,
-} from '@server/utils/requestLock';
+import { serviceTargetKey, serviceTargetLock } from '@server/utils/requestLock';
 import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { Router } from 'express';
 import type { FindOneOptions } from 'typeorm';
@@ -235,161 +232,161 @@ mediaRoutes.delete(
       const isServiceDelete = explicitServiceId !== undefined;
 
       const deleteFile = async () => {
-      const settings = getSettings();
+        const settings = getSettings();
 
-      let serviceSettings;
+        let serviceSettings;
 
-      if (isServiceDelete) {
-        serviceSettings = isMovie
-          ? settings.radarr.find((r) => r.id === explicitServiceId)
-          : settings.sonarr.find((s) => s.id === explicitServiceId);
+        if (isServiceDelete) {
+          serviceSettings = isMovie
+            ? settings.radarr.find((r) => r.id === explicitServiceId)
+            : settings.sonarr.find((s) => s.id === explicitServiceId);
 
-        if (
-          !serviceSettings ||
-          !isMultiServiceTarget(serviceSettings) ||
-          serviceSettings.isDefault ||
-          !serviceSettings.syncEnabled
-        ) {
-          return next({
-            status: 400,
-            message: 'Invalid multi-service target.',
-          });
-        }
-      } else {
-        if (isMovie) {
-          serviceSettings = settings.radarr.find(
-            (radarr) => radarr.isDefault && radarr.is4k === is4k
-          );
+          if (
+            !serviceSettings ||
+            !isMultiServiceTarget(serviceSettings) ||
+            serviceSettings.isDefault ||
+            !serviceSettings.syncEnabled
+          ) {
+            return next({
+              status: 400,
+              message: 'Invalid multi-service target.',
+            });
+          }
         } else {
-          serviceSettings = settings.sonarr.find(
-            (sonarr) => sonarr.isDefault && sonarr.is4k === is4k
-          );
-        }
-
-        const specificServiceId = is4k ? media.serviceId4k : media.serviceId;
-        if (
-          specificServiceId &&
-          specificServiceId >= 0 &&
-          serviceSettings?.id !== specificServiceId
-        ) {
           if (isMovie) {
             serviceSettings = settings.radarr.find(
-              (radarr) => radarr.id === specificServiceId
+              (radarr) => radarr.isDefault && radarr.is4k === is4k
             );
           } else {
             serviceSettings = settings.sonarr.find(
-              (sonarr) => sonarr.id === specificServiceId
+              (sonarr) => sonarr.isDefault && sonarr.is4k === is4k
             );
           }
-        }
-      }
 
-      if (!serviceSettings) {
-        const arrName = `${is4k ? '4K ' : ''}${isMovie ? 'Radarr' : 'Sonarr'}`;
-        logger.info(
-          `There is no default ${arrName} server configured. Did you set any of your ${arrName} servers as default?`,
-          {
-            label: 'Media Request',
-            mediaId: media.id,
-          }
-        );
-        return next({
-          status: 409,
-          message: `No ${arrName} server configured to delete media files`,
-        });
-      }
-
-      let service;
-      if (isMovie) {
-        service = new RadarrAPI({
-          apiKey: serviceSettings?.apiKey,
-          url: RadarrAPI.buildUrl(serviceSettings, '/api/v3'),
-        });
-      } else {
-        service = new SonarrAPI({
-          apiKey: serviceSettings?.apiKey,
-          url: SonarrAPI.buildUrl(serviceSettings, '/api/v3'),
-        });
-      }
-
-      if (isMovie) {
-        await (service as RadarrAPI).removeMovie(media.tmdbId);
-      } else {
-        const tmdb = new TheMovieDb();
-        const series = await tmdb.getTvShow({ tvId: media.tmdbId });
-        const tvdbId = series.external_ids.tvdb_id ?? media.tvdbId;
-        if (!tvdbId) {
-          throw new Error('TVDB ID not found');
-        }
-        await (service as SonarrAPI).removeSeries(tvdbId);
-
-        if (!isServiceDelete) {
-          for (const season of media.seasons) {
-            season[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
+          const specificServiceId = is4k ? media.serviceId4k : media.serviceId;
+          if (
+            specificServiceId &&
+            specificServiceId >= 0 &&
+            serviceSettings?.id !== specificServiceId
+          ) {
+            if (isMovie) {
+              serviceSettings = settings.radarr.find(
+                (radarr) => radarr.id === specificServiceId
+              );
+            } else {
+              serviceSettings = settings.sonarr.find(
+                (sonarr) => sonarr.id === specificServiceId
+              );
+            }
           }
         }
-      }
 
-      if (isServiceDelete) {
-        await dataSource.transaction(async (manager) => {
-          const serviceStatusRepository =
-            manager.getRepository(MediaServiceStatus);
-          const serviceStatus = await serviceStatusRepository.findOne({
-            where: { mediaId: media.id, serviceId: explicitServiceId },
-          });
-
-          const deletedServiceStatus =
-            serviceStatus ??
-            new MediaServiceStatus({
+        if (!serviceSettings) {
+          const arrName = `${is4k ? '4K ' : ''}${isMovie ? 'Radarr' : 'Sonarr'}`;
+          logger.info(
+            `There is no default ${arrName} server configured. Did you set any of your ${arrName} servers as default?`,
+            {
+              label: 'Media Request',
               mediaId: media.id,
-              serviceId: explicitServiceId,
-              serviceType: isMovie ? 'radarr' : 'sonarr',
-            });
-          deletedServiceStatus.status = MediaStatus.DELETED;
-          deletedServiceStatus.externalServiceId = null;
-          deletedServiceStatus.externalServiceSlug = null;
-          if (!isMovie) {
-            const seasonNumbers = new Set([
-              ...Object.keys(deletedServiceStatus.seasonStatuses ?? {}).map(
-                Number
-              ),
-              ...media.seasons.map((season) => season.seasonNumber),
-            ]);
-            deletedServiceStatus.seasonStatuses = Object.fromEntries(
-              [...seasonNumbers].map((seasonNumber) => [
-                seasonNumber,
-                MediaStatus.DELETED,
-              ])
-            );
-          }
-          await serviceStatusRepository.save(deletedServiceStatus);
-
-          const requests = await manager.getRepository(MediaRequest).find({
-            where: {
-              media: { id: media.id },
-              serverId: explicitServiceId,
-              isServiceRequest: true,
-              status: MediaRequestStatus.APPROVED,
-            },
-            relations: {
-              media: true,
-              seasons: true,
-              requestedBy: true,
-              modifiedBy: true,
-            },
+            }
+          );
+          return next({
+            status: 409,
+            message: `No ${arrName} server configured to delete media files`,
           });
-          for (const request of requests) {
-            request.status = MediaRequestStatus.DECLINED;
-            await manager.getRepository(MediaRequest).save(request);
-          }
-        });
-      } else {
-        media[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
-        media.resetServiceData(is4k);
-        await mediaRepository.save(media);
-      }
+        }
 
-      return res.status(204).send();
+        let service;
+        if (isMovie) {
+          service = new RadarrAPI({
+            apiKey: serviceSettings?.apiKey,
+            url: RadarrAPI.buildUrl(serviceSettings, '/api/v3'),
+          });
+        } else {
+          service = new SonarrAPI({
+            apiKey: serviceSettings?.apiKey,
+            url: SonarrAPI.buildUrl(serviceSettings, '/api/v3'),
+          });
+        }
+
+        if (isMovie) {
+          await (service as RadarrAPI).removeMovie(media.tmdbId);
+        } else {
+          const tmdb = new TheMovieDb();
+          const series = await tmdb.getTvShow({ tvId: media.tmdbId });
+          const tvdbId = series.external_ids.tvdb_id ?? media.tvdbId;
+          if (!tvdbId) {
+            throw new Error('TVDB ID not found');
+          }
+          await (service as SonarrAPI).removeSeries(tvdbId);
+
+          if (!isServiceDelete) {
+            for (const season of media.seasons) {
+              season[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
+            }
+          }
+        }
+
+        if (isServiceDelete) {
+          await dataSource.transaction(async (manager) => {
+            const serviceStatusRepository =
+              manager.getRepository(MediaServiceStatus);
+            const serviceStatus = await serviceStatusRepository.findOne({
+              where: { mediaId: media.id, serviceId: explicitServiceId },
+            });
+
+            const deletedServiceStatus =
+              serviceStatus ??
+              new MediaServiceStatus({
+                mediaId: media.id,
+                serviceId: explicitServiceId,
+                serviceType: isMovie ? 'radarr' : 'sonarr',
+              });
+            deletedServiceStatus.status = MediaStatus.DELETED;
+            deletedServiceStatus.externalServiceId = null;
+            deletedServiceStatus.externalServiceSlug = null;
+            if (!isMovie) {
+              const seasonNumbers = new Set([
+                ...Object.keys(deletedServiceStatus.seasonStatuses ?? {}).map(
+                  Number
+                ),
+                ...media.seasons.map((season) => season.seasonNumber),
+              ]);
+              deletedServiceStatus.seasonStatuses = Object.fromEntries(
+                [...seasonNumbers].map((seasonNumber) => [
+                  seasonNumber,
+                  MediaStatus.DELETED,
+                ])
+              );
+            }
+            await serviceStatusRepository.save(deletedServiceStatus);
+
+            const requests = await manager.getRepository(MediaRequest).find({
+              where: {
+                media: { id: media.id },
+                serverId: explicitServiceId,
+                isServiceRequest: true,
+                status: MediaRequestStatus.APPROVED,
+              },
+              relations: {
+                media: true,
+                seasons: true,
+                requestedBy: true,
+                modifiedBy: true,
+              },
+            });
+            for (const request of requests) {
+              request.status = MediaRequestStatus.DECLINED;
+              await manager.getRepository(MediaRequest).save(request);
+            }
+          });
+        } else {
+          media[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
+          media.resetServiceData(is4k);
+          await mediaRepository.save(media);
+        }
+
+        return res.status(204).send();
       };
 
       if (isServiceDelete) {

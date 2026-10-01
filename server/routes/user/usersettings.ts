@@ -781,40 +781,42 @@ userSettingsRoutes.post<
           return next({ status: 400, message: 'Invalid request services.' });
         }
       }
-      const targets: (
-        | { type: 'radarr' | 'sonarr'; id: number }
-        | undefined
-      )[] = (grants ?? user.requestServices ?? []).map((grant) => {
-        const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
-        return match
-          ? { type: match[1] as 'radarr' | 'sonarr', id: Number(match[2]) }
-          : undefined;
-      });
+      const targets: ({ type: 'radarr' | 'sonarr'; id: number } | undefined)[] =
+        (grants ?? user.requestServices ?? []).map((grant) => {
+          const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
+          return match
+            ? { type: match[1] as 'radarr' | 'sonarr', id: Number(match[2]) }
+            : undefined;
+        });
       if (grants !== undefined && targets.some((target) => !target)) {
         return next({ status: 400, message: 'Invalid request services.' });
       }
 
       return await withServiceTargetLocks(
-        targets.filter((target): target is NonNullable<typeof target> => !!target),
+        targets.filter(
+          (target): target is NonNullable<typeof target> => !!target
+        ),
         async () => {
           const lockedUser = await userRepository.findOneOrFail({
             where: { id: user.id },
           });
           const settings = getSettings();
-          const validGrants = grants === undefined || targets.every((target) => {
-            if (!target) return false;
-            const configured = settings[target.type].find(
-              (service) => service.id === target.id
-            );
-            return (
-              configured &&
-              isMultiServiceTarget(configured) &&
-              !configured.isDefault &&
-              configured.syncEnabled
-            );
-          });
+          const validGrants =
+            grants === undefined ||
+            targets.every((target) => {
+              if (!target) return false;
+              const configured = settings[target.type].find(
+                (service) => service.id === target.id
+              );
+              return (
+                configured &&
+                isMultiServiceTarget(configured) &&
+                !configured.isDefault &&
+                configured.syncEnabled
+              );
+            });
           if (!validGrants) {
-          return next({ status: 400, message: 'Invalid request services.' });
+            return next({ status: 400, message: 'Invalid request services.' });
           }
           if (grants !== undefined) {
             lockedUser.requestServices = [...new Set(grants)];

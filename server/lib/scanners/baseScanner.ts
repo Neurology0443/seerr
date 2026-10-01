@@ -13,10 +13,7 @@ import { upsertMediaServiceStatus } from '@server/lib/mediaServiceStatus';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import AsyncLock from '@server/utils/asyncLock';
-import {
-  serviceTargetKey,
-  serviceTargetLock,
-} from '@server/utils/requestLock';
+import { serviceTargetKey, serviceTargetLock } from '@server/utils/requestLock';
 import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { randomUUID } from 'crypto';
 
@@ -1005,7 +1002,12 @@ class BaseScanner<T> {
             externalServiceSlug: externalServiceSlug ?? null,
             seasonStatuses,
           },
-          ['status', 'externalServiceId', 'externalServiceSlug', 'seasonStatuses']
+          [
+            'status',
+            'externalServiceId',
+            'externalServiceSlug',
+            'seasonStatuses',
+          ]
         );
 
         if (

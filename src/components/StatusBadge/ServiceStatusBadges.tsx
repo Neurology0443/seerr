@@ -78,7 +78,9 @@ const ServiceStatusBadges = ({
     if (items.some(({ server }) => server.id === request.serverId)) {
       continue;
     }
-    if (serviceStatuses?.some((status) => status.serviceId === request.serverId)) {
+    if (
+      serviceStatuses?.some((status) => status.serviceId === request.serverId)
+    ) {
       continue;
     }
     const server = services.find(
@@ -89,10 +91,7 @@ const ServiceStatusBadges = ({
       continue;
     }
     const { status, downloadItem = [] } = getServiceSlotStatus(request);
-    if (
-      status === MediaStatus.PENDING ||
-      status === MediaStatus.PROCESSING
-    ) {
+    if (status === MediaStatus.PENDING || status === MediaStatus.PROCESSING) {
       items.push({ server, status, downloadItem });
     }
   }

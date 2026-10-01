@@ -134,14 +134,11 @@ class RadarrScanner
       // anime, regional content, or different languages).
       const allStandardScanned = this.servers
         .filter(
-          (s) =>
-            !isMultiServiceTarget(s) && (!this.enable4kMovie || !s.is4k)
+          (s) => !isMultiServiceTarget(s) && (!this.enable4kMovie || !s.is4k)
         )
         .every((s) => s.syncEnabled);
       const all4kScanned = this.servers
-        .filter(
-          (s) => !isMultiServiceTarget(s) && this.enable4kMovie && s.is4k
-        )
+        .filter((s) => !isMultiServiceTarget(s) && this.enable4kMovie && s.is4k)
         .every((s) => s.syncEnabled);
 
       if (!allStandardScanned) {

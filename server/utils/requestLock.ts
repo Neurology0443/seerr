@@ -24,7 +24,10 @@ export const withServiceTargetLocks = async <T>(
 ): Promise<T> => {
   const keys = [
     ...new Map(
-      targets.map((target) => [serviceTargetKey(target.type, target.id), target])
+      targets.map((target) => [
+        serviceTargetKey(target.type, target.id),
+        target,
+      ])
     ).values(),
   ]
     .sort((a, b) => a.type.localeCompare(b.type) || a.id - b.id)

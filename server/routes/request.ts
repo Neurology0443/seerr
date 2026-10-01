@@ -9,7 +9,6 @@ import {
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
-import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import {
   BlocklistedMediaError,
   DuplicateMediaRequestError,
@@ -18,6 +17,7 @@ import {
   QuotaRestrictedError,
   RequestPermissionError,
 } from '@server/entity/MediaRequest';
+import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import type {
@@ -633,7 +633,9 @@ requestRoutes.put<{ requestId: string }>(
         }
 
         const requestedServerId =
-          req.body.serverId === undefined ? request.serverId : req.body.serverId;
+          req.body.serverId === undefined
+            ? request.serverId
+            : req.body.serverId;
 
         const updateRequest = async () => {
           if (req.body.mediaType !== request.type) {
@@ -705,7 +707,9 @@ requestRoutes.put<{ requestId: string }>(
               is4k: request.is4k,
             });
             if (target?.is4k !== request.is4k) {
-              throw new InvalidServiceTargetError('Invalid request destination.');
+              throw new InvalidServiceTargetError(
+                'Invalid request destination.'
+              );
             }
 
             const qualityPermissions =
@@ -739,20 +743,22 @@ requestRoutes.put<{ requestId: string }>(
             }
 
             if (target?.animeOnly) {
-            const tmdb = new TheMovieDb();
-            const tmdbMedia =
-              request.type === MediaType.MOVIE
-                ? await tmdb.getMovie({ movieId: request.media.tmdbId })
-                : await tmdb.getTvShow({ tvId: request.media.tmdbId });
-            const keywords =
-              'results' in tmdbMedia.keywords
-                ? tmdbMedia.keywords.results
-                : tmdbMedia.keywords.keywords;
-            if (!keywords.some((keyword) => keyword.id === ANIME_KEYWORD_ID)) {
-              throw new InvalidServiceTargetError(
-                'This request destination is restricted to anime.'
-              );
-            }
+              const tmdb = new TheMovieDb();
+              const tmdbMedia =
+                request.type === MediaType.MOVIE
+                  ? await tmdb.getMovie({ movieId: request.media.tmdbId })
+                  : await tmdb.getTvShow({ tvId: request.media.tmdbId });
+              const keywords =
+                'results' in tmdbMedia.keywords
+                  ? tmdbMedia.keywords.results
+                  : tmdbMedia.keywords.keywords;
+              if (
+                !keywords.some((keyword) => keyword.id === ANIME_KEYWORD_ID)
+              ) {
+                throw new InvalidServiceTargetError(
+                  'This request destination is restricted to anime.'
+                );
+              }
             }
           }
 

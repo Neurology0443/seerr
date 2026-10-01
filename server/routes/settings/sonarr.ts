@@ -97,61 +97,63 @@ sonarrRoutes.post('/test', async (req, res, next) => {
 
 sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
   const id = Number(req.params.id);
-  return serviceTargetLock.dispatch(serviceTargetKey('sonarr', id), async () => {
-  const settings = getSettings();
+  return serviceTargetLock.dispatch(
+    serviceTargetKey('sonarr', id),
+    async () => {
+      const settings = getSettings();
 
-  const sonarrIndex = settings.sonarr.findIndex(
-    (r) => r.id === id
+      const sonarrIndex = settings.sonarr.findIndex((r) => r.id === id);
+
+      if (sonarrIndex === -1) {
+        return res
+          .status(404)
+          .json({ status: '404', message: 'Settings instance not found' });
+      }
+      if (
+        req.body.buttonLabel !== undefined &&
+        req.body.buttonLabel !== null &&
+        typeof req.body.buttonLabel !== 'string'
+      ) {
+        return next({ status: 400, message: 'buttonLabel must be a string.' });
+      }
+      const existing = settings.sonarr[sonarrIndex];
+      const candidate = {
+        ...req.body,
+        id: existing.id,
+        buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
+      } as SonarrSettings;
+      const validationError = validateServiceTargetConfig(candidate);
+      if (validationError)
+        return next({ status: 400, message: validationError });
+      if (
+        (isMultiServiceTarget(existing) !== isMultiServiceTarget(candidate) ||
+          existing.is4k !== candidate.is4k) &&
+        (await hasServiceReferences('sonarr', existing.id))
+      ) {
+        return next({
+          status: 409,
+          message:
+            'This server is already referenced and its request role or 4K identity cannot be changed.',
+        });
+      }
+
+      // If we are setting this as the default, clear any previous defaults for the same type first
+      // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
+      // and are the default
+      if (candidate.isDefault) {
+        settings.sonarr
+          .filter((sonarrInstance) => sonarrInstance.is4k === candidate.is4k)
+          .forEach((sonarrInstance) => {
+            sonarrInstance.isDefault = false;
+          });
+      }
+
+      settings.sonarr[sonarrIndex] = candidate;
+      await settings.save();
+
+      return res.status(200).json(settings.sonarr[sonarrIndex]);
+    }
   );
-
-  if (sonarrIndex === -1) {
-    return res
-      .status(404)
-      .json({ status: '404', message: 'Settings instance not found' });
-  }
-  if (
-    req.body.buttonLabel !== undefined &&
-    req.body.buttonLabel !== null &&
-    typeof req.body.buttonLabel !== 'string'
-  ) {
-    return next({ status: 400, message: 'buttonLabel must be a string.' });
-  }
-  const existing = settings.sonarr[sonarrIndex];
-  const candidate = {
-    ...req.body,
-    id: existing.id,
-    buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
-  } as SonarrSettings;
-  const validationError = validateServiceTargetConfig(candidate);
-  if (validationError) return next({ status: 400, message: validationError });
-  if (
-    (isMultiServiceTarget(existing) !== isMultiServiceTarget(candidate) ||
-      existing.is4k !== candidate.is4k) &&
-    (await hasServiceReferences('sonarr', existing.id))
-  ) {
-    return next({
-      status: 409,
-      message:
-        'This server is already referenced and its request role or 4K identity cannot be changed.',
-    });
-  }
-
-  // If we are setting this as the default, clear any previous defaults for the same type first
-  // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
-  // and are the default
-  if (candidate.isDefault) {
-    settings.sonarr
-      .filter((sonarrInstance) => sonarrInstance.is4k === candidate.is4k)
-      .forEach((sonarrInstance) => {
-        sonarrInstance.isDefault = false;
-      });
-  }
-
-  settings.sonarr[sonarrIndex] = candidate;
-  await settings.save();
-
-  return res.status(200).json(settings.sonarr[sonarrIndex]);
-  });
 });
 
 sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {

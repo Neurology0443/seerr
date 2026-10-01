@@ -583,6 +583,7 @@
   "components.RequestModal.cancel": "Cancel Request",
   "components.RequestModal.edit": "Edit Request",
   "components.RequestModal.errorediting": "Something went wrong while editing the request.",
+  "components.RequestModal.nochanges": "No changes were made to this request.",
   "components.RequestModal.numberofepisodes": "# of Episodes",
   "components.RequestModal.pending4krequest": "Pending 4K Request",
   "components.RequestModal.pendingapproval": "Your request is pending approval.",

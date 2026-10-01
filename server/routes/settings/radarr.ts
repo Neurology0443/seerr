@@ -101,59 +101,67 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
   '/:id',
   async (req, res, next) => {
     const id = Number(req.params.id);
-    return serviceTargetLock.dispatch(serviceTargetKey('radarr', id), async () => {
-    const settings = getSettings();
+    return serviceTargetLock.dispatch(
+      serviceTargetKey('radarr', id),
+      async () => {
+        const settings = getSettings();
 
-    const radarrIndex = settings.radarr.findIndex(
-      (r) => r.id === id
+        const radarrIndex = settings.radarr.findIndex((r) => r.id === id);
+
+        if (radarrIndex === -1) {
+          return next({
+            status: '404',
+            message: 'Settings instance not found',
+          });
+        }
+        if (
+          req.body.buttonLabel !== undefined &&
+          req.body.buttonLabel !== null &&
+          typeof req.body.buttonLabel !== 'string'
+        ) {
+          return next({
+            status: 400,
+            message: 'buttonLabel must be a string.',
+          });
+        }
+        const existing = settings.radarr[radarrIndex];
+        const candidate = {
+          ...req.body,
+          id: existing.id,
+          buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
+        } as RadarrSettings;
+        const validationError = validateServiceTargetConfig(candidate);
+        if (validationError)
+          return next({ status: 400, message: validationError });
+        if (
+          (isMultiServiceTarget(existing) !== isMultiServiceTarget(candidate) ||
+            existing.is4k !== candidate.is4k) &&
+          (await hasServiceReferences('radarr', existing.id))
+        ) {
+          return next({
+            status: 409,
+            message:
+              'This server is already referenced and its request role or 4K identity cannot be changed.',
+          });
+        }
+
+        // If we are setting this as the default, clear any previous defaults for the same type first
+        // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
+        // and are the default
+        if (candidate.isDefault) {
+          settings.radarr
+            .filter((radarrInstance) => radarrInstance.is4k === candidate.is4k)
+            .forEach((radarrInstance) => {
+              radarrInstance.isDefault = false;
+            });
+        }
+
+        settings.radarr[radarrIndex] = candidate;
+        await settings.save();
+
+        return res.status(200).json(settings.radarr[radarrIndex]);
+      }
     );
-
-    if (radarrIndex === -1) {
-      return next({ status: '404', message: 'Settings instance not found' });
-    }
-    if (
-      req.body.buttonLabel !== undefined &&
-      req.body.buttonLabel !== null &&
-      typeof req.body.buttonLabel !== 'string'
-    ) {
-      return next({ status: 400, message: 'buttonLabel must be a string.' });
-    }
-    const existing = settings.radarr[radarrIndex];
-    const candidate = {
-      ...req.body,
-      id: existing.id,
-      buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
-    } as RadarrSettings;
-    const validationError = validateServiceTargetConfig(candidate);
-    if (validationError) return next({ status: 400, message: validationError });
-    if (
-      (isMultiServiceTarget(existing) !== isMultiServiceTarget(candidate) ||
-        existing.is4k !== candidate.is4k) &&
-      (await hasServiceReferences('radarr', existing.id))
-    ) {
-      return next({
-        status: 409,
-        message:
-          'This server is already referenced and its request role or 4K identity cannot be changed.',
-      });
-    }
-
-    // If we are setting this as the default, clear any previous defaults for the same type first
-    // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
-    // and are the default
-    if (candidate.isDefault) {
-      settings.radarr
-        .filter((radarrInstance) => radarrInstance.is4k === candidate.is4k)
-        .forEach((radarrInstance) => {
-          radarrInstance.isDefault = false;
-        });
-    }
-
-    settings.radarr[radarrIndex] = candidate;
-    await settings.save();
-
-    return res.status(200).json(settings.radarr[radarrIndex]);
-    });
   }
 );
 

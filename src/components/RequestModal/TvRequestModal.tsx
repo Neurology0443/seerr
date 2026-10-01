@@ -7,8 +7,8 @@ import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import SearchByNameModal from '@app/components/RequestModal/SearchByNameModal';
 import {
   getDestinationSeasonStatus,
-  isSeasonUnavailableForRequest,
   isRequestInSlot,
+  isSeasonUnavailableForRequest,
 } from '@app/components/RequestModal/tvSeasonSelection';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';

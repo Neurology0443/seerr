@@ -4,8 +4,8 @@ import { describe, it } from 'node:test';
 import { MediaStatus } from '@server/constants/media';
 import {
   getDestinationSeasonStatus,
-  isSeasonUnavailableForRequest,
   isRequestInSlot,
+  isSeasonUnavailableForRequest,
 } from './tvSeasonSelection';
 
 describe('TV request destination selection', () => {
