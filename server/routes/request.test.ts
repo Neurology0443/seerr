@@ -30,6 +30,7 @@ import {
   assertNoCredentials,
   seedUserSettings,
 } from '@server/test/userSettings';
+import { serviceTargetKey, serviceTargetLock } from '@server/utils/requestLock';
 import type { Express } from 'express';
 import express from 'express';
 import session from 'express-session';
@@ -2288,6 +2289,66 @@ describe('POST /request, per-service slots', () => {
     assert.strictEqual(res.status, 403);
   });
 
+  it('uses fresh grants after a waiting service request is revoked', async () => {
+    configureRadarr([
+      { id: 41, buttonLabel: 'Service', isDefault: false, syncEnabled: true },
+    ]);
+    const userRepository = getRepository(User);
+    const actor = await userRepository.findOneByOrFail({
+      email: 'demo@seerr.dev',
+    });
+    actor.requestServices = ['radarr:41'];
+    await userRepository.save(actor);
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+
+    let waitingResponse: Promise<{ status: number }> | undefined;
+    await serviceTargetLock.dispatch(
+      serviceTargetKey('radarr', 41),
+      async () => {
+        const dispatch = serviceTargetLock.dispatch.bind(serviceTargetLock);
+        let requestReachedLock: () => void = () => undefined;
+        const reachedLock = new Promise<void>((resolve) => {
+          requestReachedLock = resolve;
+        });
+        const dispatchMock = mock.method(
+          serviceTargetLock,
+          'dispatch',
+          async <T>(key: string, callback: () => Promise<T>) => {
+            if (key === serviceTargetKey('radarr', 41)) {
+              requestReachedLock();
+            }
+            return dispatch(key, callback);
+          }
+        );
+        waitingResponse = agent
+          .post('/request')
+          .send({
+            mediaType: MediaType.MOVIE,
+            mediaId: 99915,
+            serverId: 41,
+            isServiceRequest: true,
+          })
+          .then((response) => response);
+        await reachedLock;
+        dispatchMock.mock.restore();
+        const lockedActor = await userRepository.findOneByOrFail({
+          id: actor.id,
+        });
+        lockedActor.requestServices = [];
+        await userRepository.save(lockedActor);
+      }
+    );
+
+    assert.ok(waitingResponse);
+    assert.strictEqual((await waitingResponse).status, 403);
+    assert.strictEqual(
+      await getRepository(MediaRequest).count({
+        where: { media: { tmdbId: 99915 }, isServiceRequest: true },
+      }),
+      0
+    );
+  });
+
   it('allows a manager to make service requests without explicit grants', async () => {
     const admin = await loginAs('admin@seerr.dev', 'test1234');
 
@@ -2543,7 +2604,10 @@ describe('POST /request, per-service slots', () => {
   ] as const) {
     it(`serializes concurrent ${mediaType} requests in the same service slot`, async () => {
       await grantServices('demo@seerr.dev', [`${service}:0`]);
-      const actor = await loginAs('demo@seerr.dev', 'test1234');
+      const secondEmail = `same-${mediaType}@seerr.dev`;
+      await createRequester(secondEmail, [`${service}:0`]);
+      const first = await loginAs('demo@seerr.dev', 'test1234');
+      const second = await loginAs(secondEmail, 'test1234');
       const payload = {
         mediaType,
         mediaId,
@@ -2553,14 +2617,17 @@ describe('POST /request, per-service slots', () => {
       };
 
       const responses = await Promise.all([
-        actor.post('/request').send(payload),
-        actor.post('/request').send(payload),
+        first.post('/request').send(payload),
+        second.post('/request').send(payload),
       ]);
 
       assert.deepStrictEqual(
         responses.map((response) => response.status).sort(),
-        [201, 409]
+        mediaType === MediaType.MOVIE ? [201, 409] : [201, 202]
       );
+      const activeRequests = await findServiceRequests(mediaId, mediaType);
+      assert.strictEqual(activeRequests.length, 1);
+      assert.deepStrictEqual(activeRequests[0].seasons, seasons ?? []);
     });
 
     it(`allows concurrent ${mediaType} requests in different service slots`, async () => {
@@ -2590,6 +2657,11 @@ describe('POST /request, per-service slots', () => {
       assert.deepStrictEqual(
         responses.map((response) => response.status).sort(),
         [201, 201]
+      );
+      const activeRequests = await findServiceRequests(mediaId + 10, mediaType);
+      assert.deepStrictEqual(
+        activeRequests.map((activeRequest) => activeRequest.serverId),
+        [0, 1]
       );
     });
   }

@@ -9,7 +9,8 @@ import { getServiceSlotStatus } from './serviceRequestStatus';
 const request = (
   status: MediaRequestStatus,
   serviceStatus?: MediaStatus,
-  downloadStatus: unknown[] = []
+  downloadStatus: unknown[] = [],
+  seasonStatuses?: Record<number, MediaStatus>
 ): NonFunctionProperties<MediaRequest> =>
   ({
     status,
@@ -21,7 +22,14 @@ const request = (
       serviceStatuses:
         serviceStatus === undefined
           ? []
-          : [{ serviceId: 12, status: serviceStatus, downloadStatus }],
+          : [
+              {
+                serviceId: 12,
+                status: serviceStatus,
+                downloadStatus,
+                seasonStatuses,
+              },
+            ],
     },
   }) as unknown as NonFunctionProperties<MediaRequest>;
 
@@ -90,5 +98,52 @@ describe('service request status', () => {
     );
     assert.equal(result.status, MediaStatus.PROCESSING);
     assert.deepEqual(result.downloadItem, downloadStatus);
+  });
+
+  it('uses a season status instead of the aggregate status', () => {
+    assert.equal(
+      getServiceSlotStatus(
+        request(
+          MediaRequestStatus.APPROVED,
+          MediaStatus.PARTIALLY_AVAILABLE,
+          [],
+          { 2: MediaStatus.UNKNOWN }
+        ),
+        2
+      ).status,
+      MediaStatus.PROCESSING
+    );
+    assert.equal(
+      getServiceSlotStatus(
+        request(MediaRequestStatus.PENDING, MediaStatus.AVAILABLE, [], {
+          2: MediaStatus.DELETED,
+        }),
+        2
+      ).status,
+      MediaStatus.PENDING
+    );
+    assert.equal(
+      getServiceSlotStatus(
+        request(
+          MediaRequestStatus.APPROVED,
+          MediaStatus.PARTIALLY_AVAILABLE,
+          [],
+          { 2: MediaStatus.AVAILABLE }
+        ),
+        2
+      ).status,
+      MediaStatus.AVAILABLE
+    );
+  });
+
+  it('does not use aggregate downloads for a season fallback', () => {
+    const result = getServiceSlotStatus(
+      request(MediaRequestStatus.APPROVED, MediaStatus.AVAILABLE, [{}], {
+        2: MediaStatus.UNKNOWN,
+      }),
+      2
+    );
+    assert.equal(result.status, MediaStatus.PROCESSING);
+    assert.deepEqual(result.downloadItem, []);
   });
 });

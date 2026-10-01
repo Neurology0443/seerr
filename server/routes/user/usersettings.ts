@@ -783,21 +783,25 @@ userSettingsRoutes.post<
       }
       const previousGrants = user.requestServices ?? [];
       const nextGrants = grants ?? previousGrants;
-      const targets: ({ type: 'radarr' | 'sonarr'; id: number } | undefined)[] =
-        [...previousGrants, ...nextGrants].map((grant) => {
-          const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
-          return match
-            ? { type: match[1] as 'radarr' | 'sonarr', id: Number(match[2]) }
-            : undefined;
-        });
-      if (grants !== undefined && targets.some((target) => !target)) {
+      const parseGrant = (grant: string) => {
+        const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
+        return match
+          ? { type: match[1] as 'radarr' | 'sonarr', id: Number(match[2]) }
+          : undefined;
+      };
+      const previousTargets = previousGrants
+        .map(parseGrant)
+        .filter((target): target is NonNullable<typeof target> => !!target);
+      const parsedNextTargets = nextGrants.map(parseGrant);
+      if (grants !== undefined && parsedNextTargets.some((target) => !target)) {
         return next({ status: 400, message: 'Invalid request services.' });
       }
+      const nextTargets = parsedNextTargets.filter(
+        (target): target is NonNullable<typeof target> => !!target
+      );
 
       return await withServiceTargetLocks(
-        targets.filter(
-          (target): target is NonNullable<typeof target> => !!target
-        ),
+        [...previousTargets, ...nextTargets],
         async () => {
           const lockedUser = await userRepository.findOneOrFail({
             where: { id: user.id },
@@ -805,15 +809,7 @@ userSettingsRoutes.post<
           const settings = getSettings();
           const validGrants =
             grants === undefined ||
-            nextGrants.every((grant) => {
-              const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
-              const target = match
-                ? {
-                    type: match[1] as 'radarr' | 'sonarr',
-                    id: Number(match[2]),
-                  }
-                : undefined;
-              if (!target) return false;
+            nextTargets.every((target) => {
               const configured = settings[target.type].find(
                 (service) => service.id === target.id
               );

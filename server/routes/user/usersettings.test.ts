@@ -261,4 +261,22 @@ describe('POST /user/:id/settings/permissions request services', () => {
       dispatchMock.mock.restore();
     }
   });
+
+  it('allows an administrator to remove an invalid historical grant', async () => {
+    const demo = await getRepository(User).findOneByOrFail({
+      email: 'demo@seerr.dev',
+    });
+    demo.requestServices = ['legacy-invalid-value'];
+    await getRepository(User).save(demo);
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const response = await admin.agent
+      .post(`/user/${demo.id}/settings/permissions`)
+      .send({ permissions: demo.permissions, requestServices: [] });
+
+    assert.strictEqual(response.status, 200);
+    assert.deepStrictEqual(response.body.requestServices, []);
+    const updated = await getRepository(User).findOneByOrFail({ id: demo.id });
+    assert.deepStrictEqual(updated.requestServices, []);
+  });
 });

@@ -184,9 +184,11 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
                       mediaType={requestData.type}
                       plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
                       serviceUrl={
-                        requestData.is4k
-                          ? requestData.media.serviceUrl4k
-                          : requestData.media.serviceUrl
+                        requestData.isServiceRequest
+                          ? undefined
+                          : requestData.is4k
+                            ? requestData.media.serviceUrl4k
+                            : requestData.media.serviceUrl
                       }
                     />
                   )}

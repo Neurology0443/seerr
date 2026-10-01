@@ -4,7 +4,8 @@ import type { NonFunctionProperties } from '@server/interfaces/api/common';
 import type { DownloadingItem } from '@server/lib/downloadtracker';
 
 export const getServiceSlotStatus = (
-  request?: NonFunctionProperties<MediaRequest>
+  request?: NonFunctionProperties<MediaRequest>,
+  seasonNumber?: number
 ): { status?: MediaStatus; downloadItem?: DownloadingItem[] } => {
   if (!request?.isServiceRequest) {
     return {};
@@ -14,11 +15,15 @@ export const getServiceSlotStatus = (
     (ss) => ss.serviceId === request.serverId
   );
 
+  const rawLiveStatus =
+    seasonNumber === undefined
+      ? serviceStatus?.status
+      : serviceStatus?.seasonStatuses?.[seasonNumber];
   const liveStatus =
-    serviceStatus &&
-    serviceStatus.status !== MediaStatus.UNKNOWN &&
-    serviceStatus.status !== MediaStatus.DELETED
-      ? serviceStatus.status
+    rawLiveStatus !== undefined &&
+    rawLiveStatus !== MediaStatus.UNKNOWN &&
+    rawLiveStatus !== MediaStatus.DELETED
+      ? rawLiveStatus
       : undefined;
   const requestStatus =
     request.status === MediaRequestStatus.PENDING
@@ -30,6 +35,8 @@ export const getServiceSlotStatus = (
   return {
     status: liveStatus ?? requestStatus,
     downloadItem:
-      liveStatus !== undefined ? (serviceStatus?.downloadStatus ?? []) : [],
+      seasonNumber === undefined && liveStatus !== undefined
+        ? (serviceStatus?.downloadStatus ?? [])
+        : [],
   };
 };
