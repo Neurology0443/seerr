@@ -689,48 +689,56 @@ requestRoutes.put<{ requestId: string }>(
 
           const destinationChanging = requestedServerId !== request.serverId;
           const slotChanging = request.isServiceRequest && destinationChanging;
-          const target = validateRequestTarget({
-            mediaType: request.type,
-            serverId: requestedServerId,
-            isServiceRequest: request.isServiceRequest,
-            is4k: request.is4k,
-          });
-          if (request.isServiceRequest && target?.is4k !== request.is4k) {
-            throw new InvalidServiceTargetError('Invalid request destination.');
+          if (!request.isServiceRequest && req.body.serverId !== undefined) {
+            validateRequestTarget({
+              mediaType: request.type,
+              serverId: requestedServerId,
+              isServiceRequest: false,
+              is4k: request.is4k,
+            });
           }
+          if (request.isServiceRequest) {
+            const target = validateRequestTarget({
+              mediaType: request.type,
+              serverId: requestedServerId,
+              isServiceRequest: true,
+              is4k: request.is4k,
+            });
+            if (target?.is4k !== request.is4k) {
+              throw new InvalidServiceTargetError('Invalid request destination.');
+            }
 
-          const qualityPermissions =
-            request.type === MediaType.MOVIE
-              ? request.is4k
-                ? [Permission.REQUEST_4K, Permission.REQUEST_4K_MOVIE]
-                : [Permission.REQUEST, Permission.REQUEST_MOVIE]
-              : request.is4k
-                ? [Permission.REQUEST_4K, Permission.REQUEST_4K_TV]
-                : [Permission.REQUEST, Permission.REQUEST_TV];
-          if (
-            !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
-            !requestUser.hasPermission(qualityPermissions, { type: 'or' })
-          ) {
-            throw new RequestPermissionError(
-              'You do not have permission to request in this service.'
-            );
-          }
+            const qualityPermissions =
+              request.type === MediaType.MOVIE
+                ? request.is4k
+                  ? [Permission.REQUEST_4K, Permission.REQUEST_4K_MOVIE]
+                  : [Permission.REQUEST, Permission.REQUEST_MOVIE]
+                : request.is4k
+                  ? [Permission.REQUEST_4K, Permission.REQUEST_4K_TV]
+                  : [Permission.REQUEST, Permission.REQUEST_TV];
+            if (
+              !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
+              !requestUser.hasPermission(qualityPermissions, { type: 'or' })
+            ) {
+              throw new RequestPermissionError(
+                'You do not have permission to request in this service.'
+              );
+            }
 
-          if (
-            request.isServiceRequest &&
-            !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
-            !req.user?.requestServices?.includes(
-              `${request.type === MediaType.MOVIE ? 'radarr' : 'sonarr'}:${
-                requestedServerId
-              }`
-            )
-          ) {
-            throw new RequestPermissionError(
-              'You do not have permission to request in this service.'
-            );
-          }
+            if (
+              !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
+              !req.user?.requestServices?.includes(
+                `${request.type === MediaType.MOVIE ? 'radarr' : 'sonarr'}:${
+                  requestedServerId
+                }`
+              )
+            ) {
+              throw new RequestPermissionError(
+                'You do not have permission to request in this service.'
+              );
+            }
 
-          if (target?.animeOnly) {
+            if (target?.animeOnly) {
             const tmdb = new TheMovieDb();
             const tmdbMedia =
               request.type === MediaType.MOVIE
@@ -744,6 +752,7 @@ requestRoutes.put<{ requestId: string }>(
               throw new InvalidServiceTargetError(
                 'This request destination is restricted to anime.'
               );
+            }
             }
           }
 
@@ -958,11 +967,8 @@ requestRoutes.put<{ requestId: string }>(
           );
         };
 
-        if (!request.isServiceRequest) {
-          return updateRequest();
-        }
         if (requestedServerId == null) {
-          throw new InvalidServiceTargetError('Invalid request destination.');
+          return updateRequest();
         }
         return serviceTargetLock.dispatch(
           serviceTargetKey(

@@ -1,5 +1,6 @@
 import StatusBadge, { getStatusLabel } from '@app/components/StatusBadge';
 import defineMessages from '@app/utils/defineMessages';
+import { getServiceSlotStatus } from '@app/utils/serviceRequestStatus';
 import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type MediaServiceStatus from '@server/entity/MediaServiceStatus';
@@ -32,19 +33,21 @@ const ServiceStatusBadges = ({
   seasonNumber,
 }: ServiceStatusBadgesProps) => {
   const intl = useIntl();
-  const pendingServiceRequests = (requests ?? []).filter(
+  const activeServiceRequests = (requests ?? []).filter(
     (request) =>
       request.isServiceRequest &&
-      request.status === MediaRequestStatus.PENDING &&
-      seasonNumber === undefined
+      (request.status === MediaRequestStatus.PENDING ||
+        request.status === MediaRequestStatus.APPROVED) &&
+      (seasonNumber === undefined ||
+        request.seasons.some((season) => season.seasonNumber === seasonNumber))
   );
   const { data: services } = useSWR<ServiceCommonServer[]>(
-    serviceStatuses?.length || pendingServiceRequests.length
+    serviceStatuses?.length || activeServiceRequests.length
       ? `/api/v1/service/${mediaType === 'movie' ? 'radarr' : 'sonarr'}`
       : null
   );
 
-  if (!services || (!serviceStatuses?.length && !pendingServiceRequests.length))
+  if (!services || (!serviceStatuses?.length && !activeServiceRequests.length))
     return null;
 
   const items = (serviceStatuses ?? [])
@@ -71,8 +74,11 @@ const ServiceStatusBadges = ({
     })
     .filter((x): x is NonNullable<typeof x> => x !== null);
 
-  for (const request of pendingServiceRequests) {
+  for (const request of activeServiceRequests) {
     if (items.some(({ server }) => server.id === request.serverId)) {
+      continue;
+    }
+    if (serviceStatuses?.some((status) => status.serviceId === request.serverId)) {
       continue;
     }
     const server = services.find(
@@ -82,7 +88,13 @@ const ServiceStatusBadges = ({
     if (!server) {
       continue;
     }
-    items.push({ server, status: MediaStatus.PENDING, downloadItem: [] });
+    const { status, downloadItem = [] } = getServiceSlotStatus(request);
+    if (
+      status === MediaStatus.PENDING ||
+      status === MediaStatus.PROCESSING
+    ) {
+      items.push({ server, status, downloadItem });
+    }
   }
 
   if (!items.length) return null;

@@ -34,7 +34,7 @@ const getSeries = mock.method(
   'getSeriesByTvdbId',
   async () => ({ id: 701, title: 'Series' }) as never
 );
-const deleteRequest = mock.fn(async () => ({}));
+const deleteRequest = mock.fn(async (_path: string) => ({}));
 mock.method(axios, 'create', () => ({
   delete: deleteRequest,
   interceptors: { request: { use: () => undefined } },
@@ -77,7 +77,7 @@ beforeEach(() => {
   getMovie.mock.resetCalls();
   getSeries.mock.resetCalls();
   deleteRequest.mock.resetCalls();
-  deleteRequest.mock.mockImplementation(async () => ({}));
+  deleteRequest.mock.mockImplementation(async (_path: string) => ({}));
   const settings = getSettings();
   settings.radarr = [];
   settings.sonarr = [];
@@ -241,7 +241,7 @@ describe('DELETE /media/:id/file service target', () => {
         status: MediaStatus.AVAILABLE,
       })
     );
-    deleteRequest.mock.mockImplementation(async () => {
+    deleteRequest.mock.mockImplementation(async (_path: string) => {
       throw new Error('Radarr unavailable');
     });
 

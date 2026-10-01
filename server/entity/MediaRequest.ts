@@ -96,7 +96,7 @@ export class MediaRequest {
       );
     };
 
-    if (requestBody.isServiceRequest && requestBody.serverId != null) {
+    if (requestBody.serverId != null) {
       return serviceTargetLock.dispatch(
         serviceTargetKey(
           requestBody.mediaType === MediaType.MOVIE ? 'radarr' : 'sonarr',
@@ -414,6 +414,24 @@ export class MediaRequest {
     }
 
     if (requestBody.mediaType === MediaType.MOVIE) {
+      if (isServiceSpecific && media.id && requestBody.serverId != null) {
+        const serviceStatus = await getRepository(MediaServiceStatus).findOne({
+          where: {
+            mediaId: media.id,
+            serviceId: requestBody.serverId,
+            serviceType: 'radarr',
+          },
+        });
+        if (
+          serviceStatus &&
+          serviceStatus.status !== MediaStatus.UNKNOWN &&
+          serviceStatus.status !== MediaStatus.DELETED
+        ) {
+          throw new DuplicateMediaRequestError(
+            'This media is already present in the selected service.'
+          );
+        }
+      }
       await mediaRepository.save(media);
 
       const request = new MediaRequest({

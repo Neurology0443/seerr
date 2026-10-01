@@ -18,7 +18,6 @@ import { MediaRequest } from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
-import { upsertMediaServiceStatus } from '@server/lib/mediaServiceStatus';
 import notificationManager, { Notification } from '@server/lib/notifications';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -461,6 +460,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         radarr
           .addMovie(radarrMovieOptions)
           .then(async (radarrMovie) => {
+            if (entity.isServiceRequest) return;
             // Needs its own repository as this runs detached from the request transaction
             const mediaRepository = getRepository(Media);
             // We grab media again here to make sure we have the latest version of it
@@ -472,30 +472,15 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               throw new Error('Media data not found');
             }
 
-            if (!entity.isServiceRequest) {
-              media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
-                radarrMovie.id;
-              media[
-                entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
-              ] = radarrMovie.titleSlug;
-              media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
-                radarrSettings?.id;
-              await mediaRepository.save(media);
-            }
+            media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
+              radarrMovie.id;
+            media[
+              entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
+            ] = radarrMovie.titleSlug;
+            media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
+              radarrSettings?.id;
+            await mediaRepository.save(media);
 
-            if (radarrSettings?.id !== undefined) {
-              await upsertMediaServiceStatus(
-                getRepository(MediaServiceStatus),
-                {
-                  mediaId: media.id,
-                  serviceId: radarrSettings.id,
-                  serviceType: 'radarr',
-                  status: MediaStatus.PROCESSING,
-                  externalServiceId: radarrMovie.id,
-                  externalServiceSlug: radarrMovie.titleSlug,
-                }
-              );
-            }
           })
           .catch(async () => {
             try {
@@ -823,6 +808,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         sonarr
           .addSeries(sonarrSeriesOptions)
           .then(async (sonarrSeries) => {
+            if (entity.isServiceRequest) return;
             // Needs its own repository as this runs detached from the request transaction
             const mediaRepository = getRepository(Media);
             // We grab media again here to make sure we have the latest version of it
@@ -834,30 +820,15 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               throw new Error('Media data not found');
             }
 
-            if (!entity.isServiceRequest) {
-              media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
-                sonarrSeries.id;
-              media[
-                entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
-              ] = sonarrSeries.titleSlug;
-              media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
-                sonarrSettings?.id;
-              await mediaRepository.save(media);
-            }
+            media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
+              sonarrSeries.id;
+            media[
+              entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
+            ] = sonarrSeries.titleSlug;
+            media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
+              sonarrSettings?.id;
+            await mediaRepository.save(media);
 
-            if (sonarrSettings?.id !== undefined) {
-              await upsertMediaServiceStatus(
-                getRepository(MediaServiceStatus),
-                {
-                  mediaId: media.id,
-                  serviceId: sonarrSettings.id,
-                  serviceType: 'sonarr',
-                  status: MediaStatus.PROCESSING,
-                  externalServiceId: sonarrSeries.id ?? null,
-                  externalServiceSlug: sonarrSeries.titleSlug ?? null,
-                }
-              );
-            }
           })
           .catch(async () => {
             try {

@@ -2240,6 +2240,49 @@ describe('POST /request, per-service slots', () => {
     assert.strictEqual(media.status4k, MediaStatus.UNKNOWN);
   });
 
+  for (const [status, expected] of [
+    [MediaStatus.UNKNOWN, 201],
+    [MediaStatus.DELETED, 201],
+    [MediaStatus.PROCESSING, 409],
+    [MediaStatus.PARTIALLY_AVAILABLE, 409],
+    [MediaStatus.AVAILABLE, 409],
+  ] as const) {
+    it(`uses the selected movie service status ${status}`, async () => {
+      const tmdbId = 99930 + status;
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      await getRepository(MediaServiceStatus).save([
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 0,
+          serviceType: 'radarr',
+          status,
+        }),
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 1,
+          serviceType: 'radarr',
+          status: MediaStatus.AVAILABLE,
+        }),
+      ]);
+
+      const admin = await loginAs('admin@seerr.dev', 'test1234');
+      const response = await admin.post('/request').send({
+        mediaType: MediaType.MOVIE,
+        mediaId: tmdbId,
+        serverId: 0,
+        isServiceRequest: true,
+      });
+
+      assert.strictEqual(response.status, expected);
+    });
+  }
+
   async function createRequester(email: string, services: string[]) {
     const user = new User({
       email,

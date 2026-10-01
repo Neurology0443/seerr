@@ -21,6 +21,7 @@ import {
   isOwnProfile,
   isOwnProfileOrAdmin,
 } from '@server/utils/profileMiddleware';
+import { withServiceTargetLocks } from '@server/utils/requestLock';
 import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { Router } from 'express';
 import net from 'net';
@@ -774,40 +775,60 @@ userSettingsRoutes.post<
           message: 'You do not have permission to grant this level of access',
         });
       }
-      user.permissions = req.body.permissions;
-
-      if (req.body.requestServices !== undefined) {
-        if (!Array.isArray(req.body.requestServices)) {
+      const grants = req.body.requestServices;
+      if (grants !== undefined) {
+        if (!Array.isArray(grants)) {
           return next({ status: 400, message: 'Invalid request services.' });
         }
-        const settings = getSettings();
-        const validGrants = req.body.requestServices.every((grant) => {
-          const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
-          if (!match) return false;
-          const services =
-            match[1] === 'radarr' ? settings.radarr : settings.sonarr;
-          const target = services.find(
-            (service) => service.id === Number(match[2])
-          );
-          return (
-            target &&
-            isMultiServiceTarget(target) &&
-            !target.isDefault &&
-            target.syncEnabled
-          );
-        });
-        if (!validGrants) {
-          return next({ status: 400, message: 'Invalid request services.' });
-        }
-        user.requestServices = [...new Set(req.body.requestServices)];
+      }
+      const targets: (
+        | { type: 'radarr' | 'sonarr'; id: number }
+        | undefined
+      )[] = (grants ?? user.requestServices ?? []).map((grant) => {
+        const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
+        return match
+          ? { type: match[1] as 'radarr' | 'sonarr', id: Number(match[2]) }
+          : undefined;
+      });
+      if (grants !== undefined && targets.some((target) => !target)) {
+        return next({ status: 400, message: 'Invalid request services.' });
       }
 
-      await userRepository.save(user);
+      return await withServiceTargetLocks(
+        targets.filter((target): target is NonNullable<typeof target> => !!target),
+        async () => {
+          const lockedUser = await userRepository.findOneOrFail({
+            where: { id: user.id },
+          });
+          const settings = getSettings();
+          const validGrants = grants === undefined || targets.every((target) => {
+            if (!target) return false;
+            const configured = settings[target.type].find(
+              (service) => service.id === target.id
+            );
+            return (
+              configured &&
+              isMultiServiceTarget(configured) &&
+              !configured.isDefault &&
+              configured.syncEnabled
+            );
+          });
+          if (!validGrants) {
+          return next({ status: 400, message: 'Invalid request services.' });
+          }
+          if (grants !== undefined) {
+            lockedUser.requestServices = [...new Set(grants)];
+          }
+          lockedUser.permissions = req.body.permissions;
 
-      return res.status(200).json({
-        permissions: user.permissions,
-        requestServices: user.requestServices ?? [],
-      });
+          await userRepository.save(lockedUser);
+
+          return res.status(200).json({
+            permissions: lockedUser.permissions,
+            requestServices: lockedUser.requestServices ?? [],
+          });
+        }
+      );
     } catch (e) {
       next({ status: 500, message: e.message });
     }

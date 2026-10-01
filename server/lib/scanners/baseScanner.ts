@@ -1113,81 +1113,71 @@ class BaseScanner<T> {
       .andWhere('media.mediaType = :mediaType', { mediaType })
       .getRawMany();
 
-    const confirmedStale = [];
+    let staleCount = 0;
     for (const candidate of candidates) {
       if (seenTmdbIds.has(Number(candidate.tmdbId))) continue;
-      if (!(await confirmAbsent(Number(candidate.tmdbId), candidate.tvdbId))) {
-        continue;
-      }
-      confirmedStale.push(candidate);
-    }
-    const staleIds = confirmedStale.map((candidate) => candidate.id);
-    const staleMediaIds = confirmedStale.map((candidate) =>
-      Number(candidate.mediaId)
-    );
+      const cleaned = await serviceTargetLock.dispatch(
+        serviceTargetKey(serviceType, serviceId),
+        async () => {
+          const target = getSettings()[serviceType].find(
+            (service) => service.id === serviceId
+          );
+          if (!target || !isMultiServiceTarget(target) || !target.syncEnabled) {
+            return false;
+          }
+          if (
+            !(await confirmAbsent(Number(candidate.tmdbId), candidate.tvdbId))
+          ) {
+            return false;
+          }
 
-    const cleaned = await serviceTargetLock.dispatch(
-      serviceTargetKey(serviceType, serviceId),
-      async () => {
-      const target = getSettings()[serviceType].find(
-        (service) => service.id === serviceId
-      );
-      if (!target || !isMultiServiceTarget(target) || !target.syncEnabled) {
-        return false;
-      }
+          await dataSource.transaction(async (manager) => {
+            const requestRepository = manager.getRepository(MediaRequest);
+            const orphanedRequests = await requestRepository
+              .createQueryBuilder('request')
+              .innerJoinAndSelect('request.media', 'media')
+              .leftJoinAndSelect('request.seasons', 'seasons')
+              .leftJoinAndSelect('request.requestedBy', 'requestedBy')
+              .leftJoinAndSelect('request.modifiedBy', 'modifiedBy')
+              .where('request.isServiceRequest = :isServiceRequest', {
+                isServiceRequest: true,
+              })
+              .andWhere('request.serverId = :serviceId', { serviceId })
+              .andWhere('request.type = :mediaType', { mediaType })
+              .andWhere('request.status = :status', {
+                status: MediaRequestStatus.APPROVED,
+              })
+              .andWhere('request.mediaId = :mediaId', {
+                mediaId: Number(candidate.mediaId),
+              })
+              .getMany();
 
-      await dataSource.transaction(async (manager) => {
-      if (staleMediaIds.length > 0) {
-        const requestRepository = manager.getRepository(MediaRequest);
-        const orphanedRequests = await requestRepository
-          .createQueryBuilder('request')
-          .innerJoinAndSelect('request.media', 'media')
-          .leftJoinAndSelect('request.seasons', 'seasons')
-          .leftJoinAndSelect('request.requestedBy', 'requestedBy')
-          .leftJoinAndSelect('request.modifiedBy', 'modifiedBy')
-          .where('request.isServiceRequest = :isServiceRequest', {
-            isServiceRequest: true,
-          })
-          .andWhere('request.serverId = :serviceId', { serviceId })
-          .andWhere('request.type = :mediaType', { mediaType })
-          .andWhere('request.status = :status', {
-            status: MediaRequestStatus.APPROVED,
-          })
-          .andWhere('request.mediaId IN (:...mediaIds)', {
-            mediaIds: staleMediaIds,
-          })
-          .getMany();
+            for (const request of orphanedRequests) {
+              request.status = MediaRequestStatus.DECLINED;
+              await requestRepository.save(request);
+            }
 
-        for (const request of orphanedRequests) {
-          request.status = MediaRequestStatus.DECLINED;
-          await requestRepository.save(request);
+            await manager
+              .getRepository(MediaServiceStatus)
+              .createQueryBuilder()
+              .update()
+              .set(
+                clearSeasonStatuses
+                  ? { status: MediaStatus.DELETED, seasonStatuses: null }
+                  : { status: MediaStatus.DELETED }
+              )
+              .where('id = :id', { id: candidate.id })
+              .execute();
+          });
+          return true;
         }
-      }
-
-      const chunkSize = 500;
-      for (let i = 0; i < staleIds.length; i += chunkSize) {
-        await manager
-          .getRepository(MediaServiceStatus)
-          .createQueryBuilder()
-          .update()
-          .set(
-            clearSeasonStatuses
-              ? { status: MediaStatus.DELETED, seasonStatuses: null }
-              : { status: MediaStatus.DELETED }
-          )
-          .whereInIds(staleIds.slice(i, i + chunkSize))
-          .execute();
-      }
-      });
-      return true;
-      }
-    );
-
-    if (!cleaned) return;
+      );
+      if (cleaned) staleCount++;
+    }
 
     this.log(
-      `Reset ${staleIds.length} stale service status entries for ${serverName} (${
-        candidates.length - staleIds.length
+      `Reset ${staleCount} stale service status entries for ${serverName} (${
+        candidates.length - staleCount
       } items retained)`,
       'info'
     );
