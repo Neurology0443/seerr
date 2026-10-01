@@ -1301,6 +1301,18 @@ describe('POST /request/:requestId/:status', () => {
 });
 
 describe('POST /request/:requestId/retry', () => {
+  async function seedFailedServiceRequest(serverId: number) {
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ isServiceRequest: true, serverId })
+      .where('id = :id', { id: failed.id })
+      .callListeners(false)
+      .execute();
+    return failed;
+  }
+
   it('re-approves a failed request and records the acting user', async () => {
     const repo = getRepository(MediaRequest);
     const failed = await seedRequest(MediaRequestStatus.FAILED);
@@ -1334,6 +1346,18 @@ describe('POST /request/:requestId/retry', () => {
 
     const persisted = await repo.findOneOrFail({ where: { id: pending.id } });
     assert.strictEqual(persisted.status, MediaRequestStatus.PENDING);
+  });
+
+  it('refuses a failed service request whose target was deleted', async () => {
+    const repo = getRepository(MediaRequest);
+    const failed = await seedFailedServiceRequest(404);
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 400);
+    const persisted = await repo.findOneByOrFail({ id: failed.id });
+    assert.strictEqual(persisted.status, MediaRequestStatus.FAILED);
   });
 
   it('sends a concurrently retried request to *arr once', async (t) => {
@@ -2215,6 +2239,49 @@ describe('POST /request, per-service slots', () => {
     assert.strictEqual(media.status, MediaStatus.UNKNOWN);
     assert.strictEqual(media.status4k, MediaStatus.UNKNOWN);
   });
+
+  for (const [status, expected] of [
+    [MediaStatus.UNKNOWN, 201],
+    [MediaStatus.DELETED, 201],
+    [MediaStatus.PROCESSING, 409],
+    [MediaStatus.PARTIALLY_AVAILABLE, 409],
+    [MediaStatus.AVAILABLE, 409],
+  ] as const) {
+    it(`uses the selected movie service status ${status}`, async () => {
+      const tmdbId = 99930 + status;
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      await getRepository(MediaServiceStatus).save([
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 0,
+          serviceType: 'radarr',
+          status,
+        }),
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 1,
+          serviceType: 'radarr',
+          status: MediaStatus.AVAILABLE,
+        }),
+      ]);
+
+      const admin = await loginAs('admin@seerr.dev', 'test1234');
+      const response = await admin.post('/request').send({
+        mediaType: MediaType.MOVIE,
+        mediaId: tmdbId,
+        serverId: 0,
+        isServiceRequest: true,
+      });
+
+      assert.strictEqual(response.status, expected);
+    });
+  }
 
   async function createRequester(email: string, services: string[]) {
     const user = new User({

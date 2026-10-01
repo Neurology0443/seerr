@@ -151,13 +151,16 @@ const RequestItemError = ({
                 ) : (
                   <StatusBadge
                     status={
-                      serviceSlotStatus ??
-                      requestData.media[
-                        requestData.is4k ? 'status4k' : 'status'
-                      ]
+                      requestData.isServiceRequest
+                        ? (serviceSlotStatus ?? MediaStatus.UNKNOWN)
+                        : requestData.media[
+                            requestData.is4k ? 'status4k' : 'status'
+                          ]
                     }
                     downloadItem={
-                      serviceDownloadStatus ?? requestDownloadStatus
+                      requestData.isServiceRequest
+                        ? serviceDownloadStatus
+                        : requestDownloadStatus
                     }
                     title={intl.formatMessage(messages.unknowntitle)}
                     inProgress={
@@ -371,8 +374,14 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
   const deleteMediaFile = async () => {
     if (request.media) {
       try {
+        const params = new URLSearchParams({
+          is4k: String(request.is4k),
+        });
+        if (request.isServiceRequest && request.serverId != null) {
+          params.set('serviceId', String(request.serverId));
+        }
         await axios.delete(
-          `/api/v1/media/${request.media.id}/file?is4k=${request.is4k}`
+          `/api/v1/media/${request.media.id}/file?${params.toString()}`
         );
       } catch (e) {
         if (!axios.isAxiosError(e) || e.response?.status !== 404) {
@@ -561,10 +570,17 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
               ) : (
                 <StatusBadge
                   status={
-                    serviceSlotStatus ??
-                    requestData.media[requestData.is4k ? 'status4k' : 'status']
+                    requestData.isServiceRequest
+                      ? (serviceSlotStatus ?? MediaStatus.UNKNOWN)
+                      : requestData.media[
+                          requestData.is4k ? 'status4k' : 'status'
+                        ]
                   }
-                  downloadItem={serviceDownloadStatus ?? requestDownloadStatus}
+                  downloadItem={
+                    requestData.isServiceRequest
+                      ? serviceDownloadStatus
+                      : requestDownloadStatus
+                  }
                   title={isMovie(title) ? title.title : title.name}
                   inProgress={
                     (serviceDownloadStatus ?? requestDownloadStatus).length > 0

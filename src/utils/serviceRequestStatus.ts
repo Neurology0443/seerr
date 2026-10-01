@@ -14,14 +14,13 @@ export const getServiceSlotStatus = (
     (ss) => ss.serviceId === request.serverId
   );
 
-  const status =
-    serviceStatus && serviceStatus.status !== MediaStatus.UNKNOWN
-      ? serviceStatus.status
-      : request.status === MediaRequestStatus.COMPLETED
-        ? MediaStatus.AVAILABLE
-        : request.status === MediaRequestStatus.APPROVED
-          ? MediaStatus.PROCESSING
-          : MediaStatus.PENDING;
+  const status = serviceStatus
+    ? serviceStatus.status
+    : request.status === MediaRequestStatus.PENDING
+      ? MediaStatus.PENDING
+      : request.status === MediaRequestStatus.APPROVED
+        ? MediaStatus.PROCESSING
+        : undefined;
 
   return { status, downloadItem: serviceStatus?.downloadStatus ?? [] };
 };

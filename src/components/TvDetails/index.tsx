@@ -607,7 +607,8 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
               data.mediaInfo?.requests?.some(
               (request) =>
                 request.isServiceRequest &&
-                request.status === MediaRequestStatus.PENDING
+                (request.status === MediaRequestStatus.PENDING ||
+                  request.status === MediaRequestStatus.APPROVED)
               )) && (
               <ServiceStatusBadges
                 serviceStatuses={data.mediaInfo.serviceStatuses}
@@ -946,38 +947,49 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                             mSeason?.status === MediaStatus.AVAILABLE) && (
                             <>
                               <div className="hidden items-center space-x-1 md:flex">
-                                {(data.mediaInfo?.serviceStatuses ?? []).some(
-                                  (ss) => {
-                                    const st =
-                                      ss.seasonStatuses?.[season.seasonNumber];
-                                    return (
-                                      st !== undefined &&
-                                      st !== MediaStatus.UNKNOWN &&
-                                      st !== MediaStatus.DELETED
-                                    );
-                                  }
-                                ) ? (
-                                  <ServiceStatusBadges
-                                    serviceStatuses={
-                                      data.mediaInfo?.serviceStatuses
-                                    }
-                                    mediaType="tv"
-                                    seasonNumber={season.seasonNumber}
-                                  />
-                                ) : (
-                                  <Badge badgeType="success">
-                                    {intl.formatMessage(
-                                      mSeason?.status === MediaStatus.AVAILABLE
-                                        ? globalMessages.available
-                                        : globalMessages.partiallyavailable
-                                    )}
-                                  </Badge>
-                                )}
+                                <Badge badgeType="success">
+                                  {intl.formatMessage(
+                                    mSeason?.status === MediaStatus.AVAILABLE
+                                      ? globalMessages.available
+                                      : globalMessages.partiallyavailable
+                                  )}
+                                </Badge>
                               </div>
                               <div className="flex md:hidden">
                                 <StatusBadgeMini status={mSeason!.status} />
                               </div>
                             </>
+                          )}
+                          {((data.mediaInfo?.serviceStatuses ?? []).some(
+                            (ss) =>
+                              ss.seasonStatuses?.[season.seasonNumber] !==
+                                undefined &&
+                              ss.seasonStatuses?.[season.seasonNumber] !==
+                                MediaStatus.UNKNOWN &&
+                              ss.seasonStatuses?.[season.seasonNumber] !==
+                                MediaStatus.DELETED
+                          ) ||
+                            data.mediaInfo?.requests?.some(
+                              (serviceRequest) =>
+                                serviceRequest.isServiceRequest &&
+                                (serviceRequest.status ===
+                                  MediaRequestStatus.PENDING ||
+                                  serviceRequest.status ===
+                                    MediaRequestStatus.APPROVED) &&
+                                serviceRequest.seasons.some(
+                                  (requestedSeason) =>
+                                    requestedSeason.seasonNumber ===
+                                    season.seasonNumber
+                                )
+                            )) && (
+                            <ServiceStatusBadges
+                              serviceStatuses={
+                                data.mediaInfo?.serviceStatuses
+                              }
+                              requests={data.mediaInfo?.requests}
+                              mediaType="tv"
+                              seasonNumber={season.seasonNumber}
+                            />
                           )}
                           {mSeason?.status === MediaStatus.DELETED &&
                             request?.status !== MediaRequestStatus.APPROVED && (

@@ -43,3 +43,11 @@ export const getDestinationSeasonStatus = ({
   const season = seasons?.find((item) => item.seasonNumber === seasonNumber);
   return season?.[is4k ? 'status4k' : 'status'] ?? MediaStatus.UNKNOWN;
 };
+
+export const isSeasonUnavailableForRequest = (
+  status: MediaStatus,
+  isServiceTarget: boolean
+): boolean =>
+  isServiceTarget
+    ? status === MediaStatus.AVAILABLE
+    : status !== MediaStatus.UNKNOWN && status !== MediaStatus.DELETED;

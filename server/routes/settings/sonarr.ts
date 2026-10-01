@@ -1,14 +1,14 @@
 import SonarrAPI from '@server/api/servarr/sonarr';
-import { removeRequestServiceGrants } from '@server/lib/requestServices';
 import {
   allocateServiceId,
   hasActiveServiceRequests,
   hasServiceReferences,
-  removeLiveServiceReferences,
+  removeServiceTargetReferences,
 } from '@server/lib/serviceId';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
+import { serviceTargetKey, serviceTargetLock } from '@server/utils/requestLock';
 import {
   isMultiServiceTarget,
   normalizeButtonLabel,
@@ -96,10 +96,12 @@ sonarrRoutes.post('/test', async (req, res, next) => {
 });
 
 sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
+  const id = Number(req.params.id);
+  return serviceTargetLock.dispatch(serviceTargetKey('sonarr', id), async () => {
   const settings = getSettings();
 
   const sonarrIndex = settings.sonarr.findIndex(
-    (r) => r.id === Number(req.params.id)
+    (r) => r.id === id
   );
 
   if (sonarrIndex === -1) {
@@ -149,41 +151,52 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
   await settings.save();
 
   return res.status(200).json(settings.sonarr[sonarrIndex]);
+  });
 });
 
 sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
-  const settings = getSettings();
+  const id = Number(req.params.id);
+  return serviceTargetLock.dispatch(
+    serviceTargetKey('sonarr', id),
+    async () => {
+      const settings = getSettings();
 
-  const sonarrIndex = settings.sonarr.findIndex(
-    (r) => r.id === Number(req.params.id)
+      const sonarrIndex = settings.sonarr.findIndex((r) => r.id === id);
+
+      if (sonarrIndex === -1) {
+        return res
+          .status(404)
+          .json({ status: '404', message: 'Settings instance not found' });
+      }
+
+      const existing = settings.sonarr[sonarrIndex];
+      if (
+        isMultiServiceTarget(existing) &&
+        (await hasActiveServiceRequests('sonarr', existing.id))
+      ) {
+        return next({
+          status: 409,
+          message: 'This server is still referenced and cannot be deleted.',
+        });
+      }
+
+      const removed = settings.sonarr.splice(sonarrIndex, 1);
+      try {
+        await settings.save();
+        if (isMultiServiceTarget(existing)) {
+          await removeServiceTargetReferences('sonarr', removed[0].id);
+        }
+      } catch (error) {
+        if (!settings.sonarr.some((server) => server.id === removed[0].id)) {
+          settings.sonarr.splice(sonarrIndex, 0, removed[0]);
+        }
+        await settings.save();
+        throw error;
+      }
+
+      return res.status(200).json(removed[0]);
+    }
   );
-
-  if (sonarrIndex === -1) {
-    return res
-      .status(404)
-      .json({ status: '404', message: 'Settings instance not found' });
-  }
-
-  const existing = settings.sonarr[sonarrIndex];
-  if (
-    isMultiServiceTarget(existing) &&
-    (await hasActiveServiceRequests('sonarr', existing.id))
-  ) {
-    return next({
-      status: 409,
-      message: 'This server is still referenced and cannot be deleted.',
-    });
-  }
-
-  const removed = settings.sonarr.splice(sonarrIndex, 1);
-  await settings.save();
-
-  await removeRequestServiceGrants('sonarr', removed[0].id);
-  if (isMultiServiceTarget(existing)) {
-    await removeLiveServiceReferences('sonarr', removed[0].id);
-  }
-
-  return res.status(200).json(removed[0]);
 });
 
 export default sonarrRoutes;

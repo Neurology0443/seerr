@@ -555,7 +555,8 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
               data.mediaInfo?.requests?.some(
               (request) =>
                 request.isServiceRequest &&
-                request.status === MediaRequestStatus.PENDING
+                (request.status === MediaRequestStatus.PENDING ||
+                  request.status === MediaRequestStatus.APPROVED)
               )) && (
               <ServiceStatusBadges
                 serviceStatuses={data.mediaInfo.serviceStatuses}

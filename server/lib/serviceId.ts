@@ -1,5 +1,5 @@
 import { MediaRequestStatus, MediaType } from '@server/constants/media';
-import { getRepository } from '@server/datasource';
+import dataSource, { getRepository } from '@server/datasource';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import OverrideRule from '@server/entity/OverrideRule';
@@ -109,24 +109,42 @@ export const hasActiveServiceRequests = async (
   );
 };
 
-export const removeLiveServiceReferences = async (
+export const removeServiceTargetReferences = async (
   type: ServiceType,
   id: number
 ): Promise<void> => {
-  await getRepository(MediaServiceStatus).delete({
-    serviceId: id,
-    serviceType: type,
+  const identifier = `${type}:${id}`;
+  await dataSource.transaction(async (manager) => {
+    const users = await manager
+      .getRepository(User)
+      .createQueryBuilder('user')
+      .where('user.requestServices LIKE :identifier', {
+        identifier: `%"${identifier}"%`,
+      })
+      .getMany();
+    for (const user of users) {
+      user.requestServices = (user.requestServices ?? []).filter(
+        (grant) => grant !== identifier
+      );
+      await manager.getRepository(User).save(user);
+    }
+    await manager.getRepository(MediaServiceStatus).delete({
+      serviceId: id,
+      serviceType: type,
+    });
+    await manager
+      .getRepository(OverrideRule)
+      .createQueryBuilder()
+      .update()
+      .set(
+        type === 'radarr'
+          ? { radarrServiceId: () => 'NULL' }
+          : { sonarrServiceId: () => 'NULL' }
+      )
+      .where(
+        `${type === 'radarr' ? 'radarrServiceId' : 'sonarrServiceId'} = :id`,
+        { id }
+      )
+      .execute();
   });
-  await getRepository(OverrideRule)
-    .createQueryBuilder()
-    .update()
-    .set(
-      type === 'radarr'
-        ? { radarrServiceId: () => 'NULL' }
-        : { sonarrServiceId: () => 'NULL' }
-    )
-    .where(`${type === 'radarr' ? 'radarrServiceId' : 'sonarrServiceId'} = :id`, {
-      id,
-    })
-    .execute();
 };

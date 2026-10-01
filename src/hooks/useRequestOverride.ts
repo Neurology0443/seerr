@@ -17,22 +17,32 @@ const useRequestOverride = (request: MediaRequest): OverrideStatus => {
     `/api/v1/service/${request.type === 'movie' ? 'radarr' : 'sonarr'}`
   );
 
+  const activeServer = allServers?.find(
+    (server) => server.id === request.serverId
+  );
+  const isDeletedService =
+    request.isServiceRequest && allServers && !activeServer;
+
   const { data } = useSWR<ServiceCommonServerWithDetails>(
-    `/api/v1/service/${request.type === 'movie' ? 'radarr' : 'sonarr'}/${
-      request.serverId
-    }`
+    isDeletedService
+      ? null
+      : `/api/v1/service/${request.type === 'movie' ? 'radarr' : 'sonarr'}/${
+          request.serverId
+        }`
   );
 
-  if (!data || !allServers) {
+  if (!allServers) {
     return {};
   }
 
+  if (isDeletedService) {
+    return { server: `Deleted service (#${request.serverId})` };
+  }
+
+  if (!data) return {};
+
   const defaultServer = allServers.find(
     (server) => server.is4k === request.is4k && server.isDefault
-  );
-
-  const activeServer = allServers.find(
-    (server) => server.id === request.serverId
   );
 
   return {
