@@ -15,6 +15,7 @@ import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import Season from '@server/entity/Season';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import { sonarrScanner } from '@server/lib/scanners/sonarr';
 import type { SonarrSettings } from '@server/lib/settings';
@@ -934,6 +935,138 @@ describe('Sonarr Scanner', () => {
   });
 
   describe('per-service status', () => {
+    async function seedApprovedServiceRequest({
+      tmdbId,
+      requestedSeasons,
+      seasonStatuses,
+    }: {
+      tmdbId: number;
+      requestedSeasons: number[];
+      seasonStatuses: Record<number, MediaStatus>;
+    }) {
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId,
+          tvdbId: tmdbId + 1000,
+          mediaType: MediaType.TV,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      await getRepository(MediaServiceStatus).save(
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 0,
+          serviceType: 'sonarr',
+          status: MediaStatus.PARTIALLY_AVAILABLE,
+          seasonStatuses,
+        })
+      );
+      const requestedBy = await getRepository(User).findOneByOrFail({
+        email: 'admin@seerr.dev',
+      });
+      const serviceRequest = await getRepository(MediaRequest).save(
+        new MediaRequest({
+          type: MediaType.TV,
+          status: MediaRequestStatus.PENDING,
+          media,
+          requestedBy,
+          serverId: 0,
+          isServiceRequest: true,
+          is4k: false,
+          seasons: requestedSeasons.map(
+            (seasonNumber) =>
+              new SeasonRequest({
+                seasonNumber,
+                status: MediaRequestStatus.PENDING,
+              })
+          ),
+        })
+      );
+      await getRepository(MediaRequest)
+        .createQueryBuilder()
+        .update(MediaRequest)
+        .set({ status: MediaRequestStatus.APPROVED })
+        .where('id = :id', { id: serviceRequest.id })
+        .callListeners(false)
+        .execute();
+      configureSonarr([
+        { buttonLabel: 'Deutsch', isDefault: false, syncEnabled: true },
+      ]);
+      getSeriesImpl = async () => [];
+      getLibrarySeriesByTvdbIdImpl = async () => [];
+
+      return { media, serviceRequest };
+    }
+
+    async function assertStaleResult({
+      mediaId,
+      requestId,
+      requestStatus,
+    }: {
+      mediaId: number;
+      requestId: number;
+      requestStatus: MediaRequestStatus;
+    }) {
+      await runWithMockTimers(() => sonarrScanner.run());
+      const updatedRequest = await getRepository(MediaRequest).findOneByOrFail({
+        id: requestId,
+      });
+      assert.strictEqual(updatedRequest.status, requestStatus);
+      const serviceStatus = await getRepository(
+        MediaServiceStatus
+      ).findOneByOrFail({ mediaId, serviceId: 0 });
+      assert.strictEqual(serviceStatus.status, MediaStatus.DELETED);
+      assert.strictEqual(serviceStatus.seasonStatuses, null);
+    }
+
+    it('preserves a request for a new season absent from stale live state', async () => {
+      const { media, serviceRequest } = await seedApprovedServiceRequest({
+        tmdbId: 3010,
+        requestedSeasons: [2],
+        seasonStatuses: {
+          1: MediaStatus.AVAILABLE,
+          2: MediaStatus.UNKNOWN,
+        },
+      });
+
+      await assertStaleResult({
+        mediaId: media.id,
+        requestId: serviceRequest.id,
+        requestStatus: MediaRequestStatus.APPROVED,
+      });
+    });
+
+    it('declines a request whose season had meaningful stale live state', async () => {
+      const { media, serviceRequest } = await seedApprovedServiceRequest({
+        tmdbId: 3011,
+        requestedSeasons: [2],
+        seasonStatuses: { 2: MediaStatus.PROCESSING },
+      });
+
+      await assertStaleResult({
+        mediaId: media.id,
+        requestId: serviceRequest.id,
+        requestStatus: MediaRequestStatus.DECLINED,
+      });
+    });
+
+    it('declines a multi-season request when any season had live state', async () => {
+      const { media, serviceRequest } = await seedApprovedServiceRequest({
+        tmdbId: 3012,
+        requestedSeasons: [2, 3],
+        seasonStatuses: {
+          2: MediaStatus.UNKNOWN,
+          3: MediaStatus.AVAILABLE,
+        },
+      });
+
+      await assertStaleResult({
+        mediaId: media.id,
+        requestId: serviceRequest.id,
+        requestStatus: MediaRequestStatus.DECLINED,
+      });
+    });
+
     it('clears stale specials when the aggregate status is unknown', async () => {
       const media = await getRepository(Media).save(
         new Media({

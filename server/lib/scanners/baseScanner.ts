@@ -1177,6 +1177,19 @@ class BaseScanner<T> {
               .getMany();
 
             for (const request of orphanedRequests) {
+              const shouldDecline =
+                mediaType === MediaType.MOVIE ||
+                request.seasons.some((season) => {
+                  const status = seasonStatuses?.[season.seasonNumber];
+                  return (
+                    status !== undefined &&
+                    Number(status) !== MediaStatus.UNKNOWN &&
+                    Number(status) !== MediaStatus.DELETED
+                  );
+                });
+              if (!shouldDecline) {
+                continue;
+              }
               request.status = MediaRequestStatus.DECLINED;
               await requestRepository.save(request);
             }

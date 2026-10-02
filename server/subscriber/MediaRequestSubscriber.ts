@@ -44,6 +44,25 @@ const sanitizeDisplayName = (displayName: string): string => {
 
 @EventSubscriber()
 export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRequest> {
+  private async markFailedIfStillApproved(
+    requestId: number
+  ): Promise<MediaRequest | undefined> {
+    const requestRepository = getRepository(MediaRequest);
+    const currentRequest = await requestRepository.findOne({
+      where: { id: requestId },
+    });
+
+    if (
+      !currentRequest ||
+      currentRequest.status !== MediaRequestStatus.APPROVED
+    ) {
+      return;
+    }
+
+    currentRequest.status = MediaRequestStatus.FAILED;
+    return requestRepository.save(currentRequest);
+  }
+
   private getServiceLabel(entity: MediaRequest): string | undefined {
     if (!entity.isServiceRequest || entity.serverId == null) {
       return undefined;
@@ -482,13 +501,9 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             await mediaRepository.save(media);
           })
           .catch(async () => {
+            let failedRequest: MediaRequest | undefined;
             try {
-              const requestRepository = getRepository(MediaRequest);
-
-              if (entity.status !== MediaRequestStatus.FAILED) {
-                entity.status = MediaRequestStatus.FAILED;
-                await requestRepository.save(entity);
-              }
+              failedRequest = await this.markFailedIfStillApproved(entity.id);
             } catch (saveError) {
               logger.error('Failed to mark request as FAILED', {
                 label: 'Media Request',
@@ -498,6 +513,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
                     ? saveError.message
                     : String(saveError),
               });
+            }
+
+            if (!failedRequest) {
+              return;
             }
 
             logger.warn(
@@ -511,7 +530,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             );
 
             MediaRequest.sendNotification(
-              entity,
+              failedRequest,
               media,
               Notification.MEDIA_FAILED
             );
@@ -829,13 +848,9 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             await mediaRepository.save(media);
           })
           .catch(async () => {
+            let failedRequest: MediaRequest | undefined;
             try {
-              const requestRepository = getRepository(MediaRequest);
-
-              if (entity.status !== MediaRequestStatus.FAILED) {
-                entity.status = MediaRequestStatus.FAILED;
-                await requestRepository.save(entity);
-              }
+              failedRequest = await this.markFailedIfStillApproved(entity.id);
             } catch (saveError) {
               logger.error('Failed to mark request as FAILED', {
                 label: 'Media Request',
@@ -845,6 +860,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
                     ? saveError.message
                     : String(saveError),
               });
+            }
+
+            if (!failedRequest) {
+              return;
             }
 
             logger.warn(
@@ -858,7 +877,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             );
 
             MediaRequest.sendNotification(
-              entity,
+              failedRequest,
               media,
               Notification.MEDIA_FAILED
             );
