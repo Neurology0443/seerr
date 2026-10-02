@@ -1179,14 +1179,15 @@ class BaseScanner<T> {
             for (const request of orphanedRequests) {
               const shouldDecline =
                 mediaType === MediaType.MOVIE ||
-                request.seasons.some((season) => {
-                  const status = seasonStatuses?.[season.seasonNumber];
-                  return (
-                    status !== undefined &&
-                    Number(status) !== MediaStatus.UNKNOWN &&
-                    Number(status) !== MediaStatus.DELETED
-                  );
-                });
+                (request.seasons.length > 0 &&
+                  request.seasons.every((season) => {
+                    const status = seasonStatuses?.[season.seasonNumber];
+                    return (
+                      status !== undefined &&
+                      Number(status) !== MediaStatus.UNKNOWN &&
+                      Number(status) !== MediaStatus.DELETED
+                    );
+                  }));
               if (!shouldDecline) {
                 continue;
               }

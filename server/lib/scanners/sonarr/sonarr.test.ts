@@ -1050,12 +1050,29 @@ describe('Sonarr Scanner', () => {
       });
     });
 
-    it('declines a multi-season request when any season had live state', async () => {
+    it('preserves a multi-season request when any season lacks live state', async () => {
       const { media, serviceRequest } = await seedApprovedServiceRequest({
         tmdbId: 3012,
         requestedSeasons: [2, 3],
         seasonStatuses: {
-          2: MediaStatus.UNKNOWN,
+          2: MediaStatus.PROCESSING,
+          3: MediaStatus.UNKNOWN,
+        },
+      });
+
+      await assertStaleResult({
+        mediaId: media.id,
+        requestId: serviceRequest.id,
+        requestStatus: MediaRequestStatus.APPROVED,
+      });
+    });
+
+    it('declines a multi-season request when every season had live state', async () => {
+      const { media, serviceRequest } = await seedApprovedServiceRequest({
+        tmdbId: 3013,
+        requestedSeasons: [2, 3],
+        seasonStatuses: {
+          2: MediaStatus.PROCESSING,
           3: MediaStatus.AVAILABLE,
         },
       });

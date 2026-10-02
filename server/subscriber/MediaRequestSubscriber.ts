@@ -48,19 +48,22 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     requestId: number
   ): Promise<MediaRequest | undefined> {
     const requestRepository = getRepository(MediaRequest);
-    const currentRequest = await requestRepository.findOne({
-      where: { id: requestId },
-    });
+    const result = await requestRepository
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.FAILED })
+      .where('id = :requestId', { requestId })
+      .andWhere('status = :approvedStatus', {
+        approvedStatus: MediaRequestStatus.APPROVED,
+      })
+      .callListeners(false)
+      .execute();
 
-    if (
-      !currentRequest ||
-      currentRequest.status !== MediaRequestStatus.APPROVED
-    ) {
+    if (result.affected !== 1) {
       return;
     }
 
-    currentRequest.status = MediaRequestStatus.FAILED;
-    return requestRepository.save(currentRequest);
+    return requestRepository.findOne({ where: { id: requestId } });
   }
 
   private getServiceLabel(entity: MediaRequest): string | undefined {
@@ -549,15 +552,16 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           mediaId: entity.media.id,
         });
       } catch (e) {
-        const requestRepository = manager.getRepository(MediaRequest);
         const mediaRepository = manager.getRepository(Media);
         const media = await mediaRepository.findOne({
           where: { id: entity.media.id },
         });
 
         if (media) {
-          entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
+          const failedRequest = await this.markFailedIfStillApproved(entity.id);
+          if (!failedRequest) {
+            return;
+          }
 
           logger.warn(
             'Failed to send movie request to Radarr due to connection or configuration error, marking status as FAILED',
@@ -570,7 +574,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           );
 
           MediaRequest.sendNotification(
-            entity,
+            failedRequest,
             media,
             Notification.MEDIA_FAILED
           );
@@ -673,9 +677,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         const tvdbId = series.external_ids.tvdb_id ?? media.tvdbId;
 
         if (!tvdbId) {
-          const requestRepository = manager.getRepository(MediaRequest);
-          entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
           throw new Error('TVDB ID not found');
         }
 
@@ -897,15 +898,16 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           mediaId: entity.media.id,
         });
       } catch (e) {
-        const requestRepository = manager.getRepository(MediaRequest);
         const mediaRepository = manager.getRepository(Media);
         const media = await mediaRepository.findOne({
           where: { id: entity.media.id },
         });
 
         if (media) {
-          entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
+          const failedRequest = await this.markFailedIfStillApproved(entity.id);
+          if (!failedRequest) {
+            return;
+          }
 
           logger.warn(
             'Failed to send series request to Sonarr due to connection or configuration error, marking status as FAILED',
@@ -918,7 +920,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           );
 
           MediaRequest.sendNotification(
-            entity,
+            failedRequest,
             media,
             Notification.MEDIA_FAILED
           );
