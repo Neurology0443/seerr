@@ -45,9 +45,9 @@ const sanitizeDisplayName = (displayName: string): string => {
 @EventSubscriber()
 export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRequest> {
   private async markFailedIfStillApproved(
-    requestId: number
+    requestId: number,
+    requestRepository = getRepository(MediaRequest)
   ): Promise<MediaRequest | undefined> {
-    const requestRepository = getRepository(MediaRequest);
     const result = await requestRepository
       .createQueryBuilder()
       .update(MediaRequest)
@@ -63,7 +63,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       return;
     }
 
-    return requestRepository.findOne({ where: { id: requestId } });
+    return (
+      (await requestRepository.findOne({ where: { id: requestId } })) ??
+      undefined
+    );
   }
 
   private getServiceLabel(entity: MediaRequest): string | undefined {
@@ -558,7 +561,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         });
 
         if (media) {
-          const failedRequest = await this.markFailedIfStillApproved(entity.id);
+          const failedRequest = await this.markFailedIfStillApproved(
+            entity.id,
+            manager.getRepository(MediaRequest)
+          );
           if (!failedRequest) {
             return;
           }
@@ -904,7 +910,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         });
 
         if (media) {
-          const failedRequest = await this.markFailedIfStillApproved(entity.id);
+          const failedRequest = await this.markFailedIfStillApproved(
+            entity.id,
+            manager.getRepository(MediaRequest)
+          );
           if (!failedRequest) {
             return;
           }
