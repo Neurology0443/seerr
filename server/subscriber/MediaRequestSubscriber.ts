@@ -569,6 +569,9 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             return;
           }
 
+          // Keep the current subscriber entity consistent with the persisted transition.
+          entity.status = MediaRequestStatus.FAILED;
+
           logger.warn(
             'Failed to send movie request to Radarr due to connection or configuration error, marking status as FAILED',
             {
@@ -917,6 +920,9 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           if (!failedRequest) {
             return;
           }
+
+          // Keep the current subscriber entity consistent with the persisted transition.
+          entity.status = MediaRequestStatus.FAILED;
 
           logger.warn(
             'Failed to send series request to Sonarr due to connection or configuration error, marking status as FAILED',

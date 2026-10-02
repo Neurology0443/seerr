@@ -923,9 +923,40 @@ describe('asynchronous *Arr failures', () => {
       id: mediaRequest.id,
     });
     assert.strictEqual(persisted.status, MediaRequestStatus.FAILED);
+    assert.deepStrictEqual(
+      persisted.seasons.map((season) => season.status),
+      [MediaRequestStatus.PENDING]
+    );
     assert.ok(
       sendNotificationMock.calls.some(
         (call) => call.arguments[2] === Notification.MEDIA_FAILED
+      )
+    );
+  });
+
+  it('keeps native media unknown after an outer Radarr failure', async () => {
+    configureRadarr([{}]);
+    getMovieImpl = async () => {
+      throw new Error('TMDB failure');
+    };
+    const mediaRequest = await seedRequest();
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const approved = await admin.post(`/request/${mediaRequest.id}/approve`);
+    assert.strictEqual(approved.status, 200);
+    const persistedRequest = await getRepository(
+      MediaRequest
+    ).findOneByOrFail({ id: mediaRequest.id });
+    const persistedMedia = await getRepository(Media).findOneByOrFail({
+      id: mediaRequest.media.id,
+    });
+    assert.strictEqual(persistedRequest.status, MediaRequestStatus.FAILED);
+    assert.strictEqual(persistedMedia.status, MediaStatus.UNKNOWN);
+    assert.ok(
+      sendNotificationMock.calls.some(
+        (call) =>
+          call.arguments[0].id === mediaRequest.id &&
+          call.arguments[2] === Notification.MEDIA_FAILED
       )
     );
   });
