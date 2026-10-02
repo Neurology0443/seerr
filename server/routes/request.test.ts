@@ -934,7 +934,13 @@ describe('asynchronous *Arr failures', () => {
     );
   });
 
-  it('keeps native media unknown after an outer Radarr failure', async () => {
+  it('keeps native media unknown after an outer Radarr failure', async (t) => {
+    const settings = getSettings();
+    const previousRadarr = settings.radarr;
+    t.after(() => {
+      settings.radarr = previousRadarr;
+    });
+
     configureRadarr([{}]);
     getMovieImpl = async () => {
       throw new Error('TMDB failure');
