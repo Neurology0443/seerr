@@ -18,6 +18,7 @@ import axios from 'axios';
 import { useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
+import { canRequestService } from './servicePermissions';
 
 const messages = defineMessages('components.RequestButton', {
   viewrequest: 'View Request',
@@ -445,10 +446,12 @@ const RequestButton = ({
           ],
           { type: 'or' }
         );
-    const canUseService =
-      hasQualityPermission &&
-      (hasPermission(Permission.MANAGE_REQUESTS) ||
-        (user?.requestServices ?? []).includes(serviceIdentifier));
+    const canManageService = hasPermission(Permission.MANAGE_REQUESTS);
+    const canUseService = canRequestService({
+      canManageService,
+      hasGrant: (user?.requestServices ?? []).includes(serviceIdentifier),
+      hasQualityPermission,
+    });
 
     if (!canUseService && !userEditableRequest) {
       continue;

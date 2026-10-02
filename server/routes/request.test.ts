@@ -955,7 +955,7 @@ describe('asynchronous *Arr failures', () => {
     assert.ok(
       sendNotificationMock.calls.some(
         (call) =>
-          call.arguments[0].id === mediaRequest.id &&
+          call.arguments[0]?.id === mediaRequest.id &&
           call.arguments[2] === Notification.MEDIA_FAILED
       )
     );
