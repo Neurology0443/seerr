@@ -1,33 +1,36 @@
-<!--
-    Please read contributing guide before submitting
-    your pull request. Please fill in each section below to help us better prioritize your pull request. Thanks!
--->
-
 ## Description
 
-<!--- Describe your changes in detail -->
-<!--- Why is this change required? What problem does it solve? -->
-<!--- If it fixes an open issue, please link to the issue here. -->
+<!-- Describe what this PR changes and why. -->
 
-- Fixes #XXXX
+## Scope
 
-## How Has This Been Tested?
+<!-- State what is included in this PR and what is intentionally out of scope. -->
 
-<!--- Please describe in detail how you tested your changes. -->
-<!--- Include details of your testing environment, and the tests you ran to -->
-<!--- see how your change affects other areas of the code, etc. -->
+## Tests
 
-## Screenshots / Logs (if applicable)
+<!-- List the automated and/or manual tests performed. -->
 
-## Checklist:
+- [ ] Relevant automated tests added or updated
+- [ ] Existing tests pass
 
-<!--- Go over all the following points, and put an `x` in all the boxes that apply. -->
-<!--- If you're unsure about any of these, don't hesitate to ask. We're here to help! -->
+## Validation
 
-- [ ] I have read and followed the contribution [guidelines](https://github.com/seerr-team/seerr/blob/develop/CONTRIBUTING.md).
-- [ ] Disclosed any use of AI (see our [policy](https://github.com/seerr-team/seerr/blob/develop/CONTRIBUTING.md#ai-assistance-notice))
-- [ ] I have updated the documentation accordingly.
-- [ ] All new and existing tests passed.
-- [ ] Successful build `pnpm build`
-- [ ] Translation keys `pnpm i18n:extract`
-- [ ] Database migration (if required)
+- [ ] Formatting / lint checks pass
+- [ ] TypeScript typecheck passes
+- [ ] Unit tests pass
+- [ ] Application build passes
+- [ ] Cypress passes when applicable
+- [ ] Native Seerr behavior remains unchanged unless explicitly in scope
+
+## Database migration
+
+- [ ] No database migration
+- [ ] SQLite migration included
+- [ ] PostgreSQL migration included
+- [ ] SQLite and PostgreSQL migrations are equivalent
+
+## Screenshots
+
+<!-- Add screenshots for UI changes when applicable. -->
+
+N/A
