@@ -81,6 +81,7 @@ export interface DVRSettings {
   isDefault: boolean;
   externalUrl?: string;
   syncEnabled: boolean;
+  independentRequestDestination: boolean;
   preventSearch: boolean;
   tagRequests: boolean;
   overrideRule: number[];
@@ -385,6 +386,10 @@ export interface AllSettings {
   tautulli: TautulliSettings;
   radarr: RadarrSettings[];
   sonarr: SonarrSettings[];
+  dvrIdCounters: {
+    radarr: number;
+    sonarr: number;
+  };
   public: PublicSettings;
   notifications: NotificationSettings;
   jobs: Record<JobId, JobSettings>;
@@ -463,6 +468,10 @@ class Settings {
       },
       radarr: [],
       sonarr: [],
+      dvrIdCounters: {
+        radarr: 0,
+        sonarr: 0,
+      },
       public: {
         initialized: false,
       },
@@ -700,6 +709,14 @@ class Settings {
 
   set sonarr(data: SonarrSettings[]) {
     this.data.sonarr = data;
+  }
+
+  get dvrIdCounters(): AllSettings['dvrIdCounters'] {
+    return this.data.dvrIdCounters;
+  }
+
+  set dvrIdCounters(data: AllSettings['dvrIdCounters']) {
+    this.data.dvrIdCounters = mergeSettings(this.data.dvrIdCounters, data);
   }
 
   get public(): PublicSettings {

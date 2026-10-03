@@ -3,6 +3,8 @@ import DiscoverSlider from '@server/entity/DiscoverSlider';
 import Issue from '@server/entity/Issue';
 import IssueComment from '@server/entity/IssueComment';
 import Media from '@server/entity/Media';
+import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import OverrideRule from '@server/entity/OverrideRule';
 import Season from '@server/entity/Season';
@@ -30,6 +32,8 @@ const entities = [
   Issue,
   IssueComment,
   Media,
+  MediaDestinationSeasonStatus,
+  MediaDestinationStatus,
   MediaRequest,
   OverrideRule,
   Season,

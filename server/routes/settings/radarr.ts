@@ -1,6 +1,11 @@
 import RadarrAPI from '@server/api/servarr/radarr';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import {
+  allocateDvrServerId,
+  hasActiveDvrRequests,
+  isDvrServerHistoricallyUsed,
+} from '@server/lib/settings/dvrId';
 import logger from '@server/logger';
 import { Router } from 'express';
 
@@ -12,19 +17,33 @@ radarrRoutes.get('/', (_req, res) => {
   res.status(200).json(settings.radarr);
 });
 
-radarrRoutes.post('/', async (req, res) => {
+radarrRoutes.post('/', async (req, res, next) => {
   const settings = getSettings();
 
-  const newRadarr = req.body as RadarrSettings;
-  const lastItem = settings.radarr[settings.radarr.length - 1];
-  newRadarr.id = lastItem ? lastItem.id + 1 : 0;
+  const newRadarr = {
+    ...req.body,
+    independentRequestDestination:
+      req.body.independentRequestDestination ?? false,
+  } as RadarrSettings;
+
+  if (
+    newRadarr.independentRequestDestination === true &&
+    newRadarr.syncEnabled !== true
+  ) {
+    return next({
+      status: 400,
+      message: 'Independent request destinations require sync to be enabled.',
+    });
+  }
+
+  newRadarr.id = await allocateDvrServerId('radarr');
 
   // If we are setting this as the default, clear any previous defaults for the same type first
   // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
   // and are the default
-  if (req.body.isDefault) {
+  if (newRadarr.isDefault) {
     settings.radarr
-      .filter((radarrInstance) => radarrInstance.is4k === req.body.is4k)
+      .filter((radarrInstance) => radarrInstance.is4k === newRadarr.is4k)
       .forEach((radarrInstance) => {
         radarrInstance.isDefault = false;
       });
@@ -84,24 +103,65 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
     );
 
     if (radarrIndex === -1) {
-      return next({ status: '404', message: 'Settings instance not found' });
+      return next({ status: 404, message: 'Settings instance not found' });
+    }
+
+    const currentRadarr = settings.radarr[radarrIndex];
+    const updatedRadarr = {
+      ...currentRadarr,
+      ...req.body,
+      independentRequestDestination:
+        req.body.independentRequestDestination ??
+        currentRadarr.independentRequestDestination ??
+        false,
+      id: currentRadarr.id,
+    } as RadarrSettings;
+
+    if (
+      updatedRadarr.independentRequestDestination === true &&
+      updatedRadarr.syncEnabled !== true
+    ) {
+      return next({
+        status: 400,
+        message:
+          'Independent request destinations require sync to be enabled.',
+      });
+    }
+
+    if (await isDvrServerHistoricallyUsed('radarr', currentRadarr.id)) {
+      if (
+        updatedRadarr.independentRequestDestination !==
+        (currentRadarr.independentRequestDestination ?? false)
+      ) {
+        return next({
+          status: 409,
+          message:
+            'The independent destination role cannot change after this server ID has been used.',
+        });
+      }
+      if (updatedRadarr.is4k !== currentRadarr.is4k) {
+        return next({
+          status: 409,
+          message:
+            'The 4K role cannot change after this server ID has been used.',
+        });
+      }
     }
 
     // If we are setting this as the default, clear any previous defaults for the same type first
     // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
     // and are the default
-    if (req.body.isDefault) {
+    if (updatedRadarr.isDefault) {
       settings.radarr
-        .filter((radarrInstance) => radarrInstance.is4k === req.body.is4k)
+        .filter(
+          (radarrInstance) => radarrInstance.is4k === updatedRadarr.is4k
+        )
         .forEach((radarrInstance) => {
           radarrInstance.isDefault = false;
         });
     }
 
-    settings.radarr[radarrIndex] = {
-      ...req.body,
-      id: Number(req.params.id),
-    } as RadarrSettings;
+    settings.radarr[radarrIndex] = updatedRadarr;
     await settings.save();
 
     return res.status(200).json(settings.radarr[radarrIndex]);
@@ -142,7 +202,15 @@ radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   );
 
   if (radarrIndex === -1) {
-    return next({ status: '404', message: 'Settings instance not found' });
+    return next({ status: 404, message: 'Settings instance not found' });
+  }
+
+  const serverId = settings.radarr[radarrIndex].id;
+  if (await hasActiveDvrRequests('radarr', serverId)) {
+    return next({
+      status: 409,
+      message: 'A server with active requests cannot be deleted.',
+    });
   }
 
   const removed = settings.radarr.splice(radarrIndex, 1);
