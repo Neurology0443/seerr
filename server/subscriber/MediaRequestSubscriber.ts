@@ -44,6 +44,31 @@ const sanitizeDisplayName = (displayName: string): string => {
 
 @EventSubscriber()
 export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRequest> {
+  private async markFailedIfStillApproved(
+    requestId: number,
+    requestRepository = getRepository(MediaRequest)
+  ): Promise<MediaRequest | undefined> {
+    const result = await requestRepository
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.FAILED })
+      .where('id = :requestId', { requestId })
+      .andWhere('status = :approvedStatus', {
+        approvedStatus: MediaRequestStatus.APPROVED,
+      })
+      .callListeners(false)
+      .execute();
+
+    if (result.affected !== 1) {
+      return;
+    }
+
+    return (
+      (await requestRepository.findOne({ where: { id: requestId } })) ??
+      undefined
+    );
+  }
+
   private getServiceLabel(entity: MediaRequest): string | undefined {
     if (!entity.isServiceRequest || entity.serverId == null) {
       return undefined;
@@ -482,13 +507,9 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             await mediaRepository.save(media);
           })
           .catch(async () => {
+            let failedRequest: MediaRequest | undefined;
             try {
-              const requestRepository = getRepository(MediaRequest);
-
-              if (entity.status !== MediaRequestStatus.FAILED) {
-                entity.status = MediaRequestStatus.FAILED;
-                await requestRepository.save(entity);
-              }
+              failedRequest = await this.markFailedIfStillApproved(entity.id);
             } catch (saveError) {
               logger.error('Failed to mark request as FAILED', {
                 label: 'Media Request',
@@ -498,6 +519,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
                     ? saveError.message
                     : String(saveError),
               });
+            }
+
+            if (!failedRequest) {
+              return;
             }
 
             logger.warn(
@@ -511,7 +536,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             );
 
             MediaRequest.sendNotification(
-              entity,
+              failedRequest,
               media,
               Notification.MEDIA_FAILED
             );
@@ -530,15 +555,22 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           mediaId: entity.media.id,
         });
       } catch (e) {
-        const requestRepository = manager.getRepository(MediaRequest);
         const mediaRepository = manager.getRepository(Media);
         const media = await mediaRepository.findOne({
           where: { id: entity.media.id },
         });
 
         if (media) {
+          const failedRequest = await this.markFailedIfStillApproved(
+            entity.id,
+            manager.getRepository(MediaRequest)
+          );
+          if (!failedRequest) {
+            return;
+          }
+
+          // Keep the current subscriber entity consistent with the persisted transition.
           entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
 
           logger.warn(
             'Failed to send movie request to Radarr due to connection or configuration error, marking status as FAILED',
@@ -551,7 +583,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           );
 
           MediaRequest.sendNotification(
-            entity,
+            failedRequest,
             media,
             Notification.MEDIA_FAILED
           );
@@ -654,9 +686,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         const tvdbId = series.external_ids.tvdb_id ?? media.tvdbId;
 
         if (!tvdbId) {
-          const requestRepository = manager.getRepository(MediaRequest);
-          entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
           throw new Error('TVDB ID not found');
         }
 
@@ -829,13 +858,9 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             await mediaRepository.save(media);
           })
           .catch(async () => {
+            let failedRequest: MediaRequest | undefined;
             try {
-              const requestRepository = getRepository(MediaRequest);
-
-              if (entity.status !== MediaRequestStatus.FAILED) {
-                entity.status = MediaRequestStatus.FAILED;
-                await requestRepository.save(entity);
-              }
+              failedRequest = await this.markFailedIfStillApproved(entity.id);
             } catch (saveError) {
               logger.error('Failed to mark request as FAILED', {
                 label: 'Media Request',
@@ -845,6 +870,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
                     ? saveError.message
                     : String(saveError),
               });
+            }
+
+            if (!failedRequest) {
+              return;
             }
 
             logger.warn(
@@ -858,7 +887,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             );
 
             MediaRequest.sendNotification(
-              entity,
+              failedRequest,
               media,
               Notification.MEDIA_FAILED
             );
@@ -878,15 +907,22 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           mediaId: entity.media.id,
         });
       } catch (e) {
-        const requestRepository = manager.getRepository(MediaRequest);
         const mediaRepository = manager.getRepository(Media);
         const media = await mediaRepository.findOne({
           where: { id: entity.media.id },
         });
 
         if (media) {
+          const failedRequest = await this.markFailedIfStillApproved(
+            entity.id,
+            manager.getRepository(MediaRequest)
+          );
+          if (!failedRequest) {
+            return;
+          }
+
+          // Keep the current subscriber entity consistent with the persisted transition.
           entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
 
           logger.warn(
             'Failed to send series request to Sonarr due to connection or configuration error, marking status as FAILED',
@@ -899,7 +935,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           );
 
           MediaRequest.sendNotification(
-            entity,
+            failedRequest,
             media,
             Notification.MEDIA_FAILED
           );

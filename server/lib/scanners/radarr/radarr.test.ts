@@ -842,6 +842,62 @@ describe('Radarr Scanner', () => {
       assert.strictEqual(serviceStatus.status, MediaStatus.AVAILABLE);
     });
 
+    it('does not decline a newly approved request without live target status', async () => {
+      configureRadarr([
+        { syncEnabled: true, buttonLabel: 'Deutsch', isDefault: false },
+      ]);
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 564,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      const requestedBy = await getRepository(User).findOneOrFail({
+        where: { email: 'admin@seerr.dev' },
+      });
+      const freshRequest = await getRepository(MediaRequest).save(
+        new MediaRequest({
+          type: MediaType.MOVIE,
+          status: MediaRequestStatus.PENDING,
+          media,
+          requestedBy,
+          serverId: 0,
+          isServiceRequest: true,
+          is4k: false,
+        })
+      );
+      await getRepository(MediaRequest)
+        .createQueryBuilder()
+        .update(MediaRequest)
+        .set({ status: MediaRequestStatus.APPROVED })
+        .where('id = :id', { id: freshRequest.id })
+        .callListeners(false)
+        .execute();
+      await getRepository(MediaServiceStatus).save(
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 0,
+          serviceType: 'radarr',
+          status: MediaStatus.DELETED,
+        })
+      );
+      getMoviesImpl = async () => [];
+      getLibraryMoviesByTmdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      const updatedRequest = await getRepository(MediaRequest).findOneByOrFail({
+        id: freshRequest.id,
+      });
+      assert.strictEqual(updatedRequest.status, MediaRequestStatus.APPROVED);
+      const serviceStatus = await getRepository(
+        MediaServiceStatus
+      ).findOneByOrFail({ mediaId: media.id, serviceId: 0 });
+      assert.strictEqual(serviceStatus.status, MediaStatus.DELETED);
+      assert.strictEqual(getLibraryMoviesByTmdbIdCalls, 0);
+    });
+
     it('resets per-service status for a movie removed from the server', async () => {
       const mediaId = await seedServiceStatus(561, MediaStatus.PROCESSING);
       configureRadarr([

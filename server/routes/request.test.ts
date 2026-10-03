@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { before, beforeEach, describe, it, mock } from 'node:test';
 
+import RadarrAPI from '@server/api/servarr/radarr';
+import SonarrAPI from '@server/api/servarr/sonarr';
 import TheMovieDb from '@server/api/themoviedb';
 import type {
   TmdbMovieDetails,
@@ -20,6 +22,7 @@ import OverrideRule from '@server/entity/OverrideRule';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import { Notification } from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
@@ -30,6 +33,7 @@ import {
   assertNoCredentials,
   seedUserSettings,
 } from '@server/test/userSettings';
+import { serviceTargetKey, serviceTargetLock } from '@server/utils/requestLock';
 import type { Express } from 'express';
 import express from 'express';
 import session from 'express-session';
@@ -43,7 +47,7 @@ const sendNotificationMock = mock.method(
   async () => undefined
 ).mock;
 
-const getMovieImpl: (args: {
+let getMovieImpl: (args: {
   movieId: number;
   language?: string;
 }) => Promise<TmdbMovieDetails> = async ({ movieId }) => fakeTmdbMovie(movieId);
@@ -57,7 +61,7 @@ Object.defineProperty(TheMovieDb.prototype, 'getMovie', {
   configurable: true,
 });
 
-const getTvShowImpl: (args: {
+let getTvShowImpl: (args: {
   tvId: number;
   language?: string;
 }) => Promise<TmdbTvDetails> = async ({ tvId }) => fakeTmdbShow(tvId);
@@ -74,6 +78,8 @@ Object.defineProperty(TheMovieDb.prototype, 'getTvShow', {
 function fakeTmdbMovie(tmdbId: number): TmdbMovieDetails {
   return {
     id: tmdbId,
+    title: 'Test Movie',
+    release_date: '2024-01-01',
     genres: [],
     original_language: 'en',
     keywords: { keywords: [] },
@@ -84,10 +90,11 @@ function fakeTmdbMovie(tmdbId: number): TmdbMovieDetails {
 function fakeTmdbShow(tmdbId: number): TmdbTvDetails {
   return {
     id: tmdbId,
+    name: 'Test Show',
     genres: [],
     original_language: 'en',
     keywords: { results: [] },
-    external_ids: {},
+    external_ids: { tvdb_id: tmdbId + 1000 },
   } as unknown as TmdbTvDetails;
 }
 
@@ -176,6 +183,8 @@ before(async () => {
 
 beforeEach(() => {
   sendNotificationMock.resetCalls();
+  getMovieImpl = async ({ movieId }) => fakeTmdbMovie(movieId);
+  getTvShowImpl = async ({ tvId }) => fakeTmdbShow(tvId);
 });
 
 setupTestDb();
@@ -455,6 +464,87 @@ describe('PUT /request/:requestId (movie)', () => {
     assert.strictEqual(saved.rootFolder, null);
   });
 
+  for (const [status, expectedStatus] of [
+    [MediaStatus.AVAILABLE, 409],
+    [MediaStatus.PROCESSING, 409],
+    [MediaStatus.UNKNOWN, 200],
+    [MediaStatus.DELETED, 200],
+  ] as const) {
+    it(`checks destination live status ${status} before moving`, async () => {
+      configureRadarr([
+        { id: 0, buttonLabel: 'Source', isDefault: false },
+        { id: 1, buttonLabel: 'Destination', isDefault: false },
+      ]);
+      const owner = await seedUser('admin@seerr.dev');
+      const media = await getRepository(Media).save(
+        new Media({
+          mediaType: MediaType.MOVIE,
+          tmdbId: 12400 + status,
+          status: MediaStatus.UNKNOWN,
+          status4k: MediaStatus.UNKNOWN,
+        })
+      );
+      const moving = await seedServiceMovieRequest(media, owner, 0);
+      await getRepository(MediaServiceStatus).save(
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 1,
+          serviceType: 'radarr',
+          status,
+        })
+      );
+      const agent = await loginAs('admin@seerr.dev', 'test1234');
+
+      const response = await agent.put(`/request/${moving.id}`).send({
+        mediaType: MediaType.MOVIE,
+        serverId: 1,
+        rootFolder: '/destination',
+      });
+      assert.strictEqual(response.status, expectedStatus);
+
+      const saved = await getRepository(MediaRequest).findOneByOrFail({
+        id: moving.id,
+      });
+      assert.strictEqual(saved.serverId, expectedStatus === 200 ? 1 : 0);
+      assert.strictEqual(
+        saved.rootFolder,
+        expectedStatus === 200 ? '/destination' : null
+      );
+    });
+  }
+
+  for (const status of [MediaStatus.PROCESSING, MediaStatus.AVAILABLE]) {
+    it(`allows same-target edits with live status ${status}`, async () => {
+      configureRadarr([{ id: 0, buttonLabel: 'Service', isDefault: false }]);
+      const owner = await seedUser('admin@seerr.dev');
+      const media = await getRepository(Media).save(
+        new Media({
+          mediaType: MediaType.MOVIE,
+          tmdbId: 12500 + status,
+          status: MediaStatus.UNKNOWN,
+          status4k: MediaStatus.UNKNOWN,
+        })
+      );
+      const existing = await seedServiceMovieRequest(media, owner, 0);
+      await getRepository(MediaServiceStatus).save(
+        new MediaServiceStatus({
+          mediaId: media.id,
+          serviceId: 0,
+          serviceType: 'radarr',
+          status,
+        })
+      );
+      const agent = await loginAs('admin@seerr.dev', 'test1234');
+
+      const response = await agent.put(`/request/${existing.id}`).send({
+        mediaType: MediaType.MOVIE,
+        serverId: 0,
+        rootFolder: '/same-target',
+      });
+      assert.strictEqual(response.status, 200);
+    });
+  }
+
   it('allows only one of two concurrent moves into a service slot', async () => {
     configureRadarr([
       { id: 0, buttonLabel: 'First', isDefault: false },
@@ -578,6 +668,305 @@ async function seedTvRequest(
     })
   );
 }
+
+describe('asynchronous *Arr failures', () => {
+  it('does not overwrite a declined request after a late Radarr failure', async (t) => {
+    configureRadarr([{ buttonLabel: 'Service', isDefault: false }]);
+    let rejectAdd: (reason: Error) => void = () => undefined;
+    const pendingAdd = new Promise<never>((_resolve, reject) => {
+      rejectAdd = reject;
+    });
+    t.mock.method(
+      RadarrAPI.prototype,
+      'getMovieByTmdbId',
+      async () => pendingAdd
+    );
+    const subscriberPrototype = MediaRequestSubscriber.prototype as unknown as {
+      markFailedIfStillApproved(
+        requestId: number
+      ): Promise<MediaRequest | undefined>;
+    };
+    const markFailed = subscriberPrototype.markFailedIfStillApproved;
+    let failureHandled: () => void = () => undefined;
+    const handled = new Promise<void>((resolve) => {
+      failureHandled = resolve;
+    });
+    t.mock.method(
+      subscriberPrototype,
+      'markFailedIfStillApproved',
+      async (requestId: number) => {
+        const result = await markFailed(requestId);
+        failureHandled();
+        return result;
+      }
+    );
+    const mediaRequest = await seedRequest();
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ isServiceRequest: true, serverId: 0 })
+      .where('id = :id', { id: mediaRequest.id })
+      .callListeners(false)
+      .execute();
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const approved = await admin.post(`/request/${mediaRequest.id}/approve`);
+    assert.strictEqual(approved.status, 200);
+    const notificationsBeforeFailure = sendNotificationMock.callCount();
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.DECLINED })
+      .where('id = :id', { id: mediaRequest.id })
+      .callListeners(false)
+      .execute();
+
+    rejectAdd(new Error('late Radarr failure'));
+    await handled;
+
+    const persisted = await getRepository(MediaRequest).findOneByOrFail({
+      id: mediaRequest.id,
+    });
+    assert.strictEqual(persisted.status, MediaRequestStatus.DECLINED);
+    assert.strictEqual(
+      sendNotificationMock.callCount(),
+      notificationsBeforeFailure
+    );
+  });
+
+  it('does not overwrite a declined request after a late Sonarr failure', async (t) => {
+    configureSonarr([{ buttonLabel: 'Service', isDefault: false }]);
+    let rejectAdd: (reason: Error) => void = () => undefined;
+    const pendingAdd = new Promise<never>((_resolve, reject) => {
+      rejectAdd = reject;
+    });
+    t.mock.method(SonarrAPI.prototype, 'addSeries', async () => pendingAdd);
+    const subscriberPrototype = MediaRequestSubscriber.prototype as unknown as {
+      markFailedIfStillApproved(
+        requestId: number
+      ): Promise<MediaRequest | undefined>;
+    };
+    const markFailed = subscriberPrototype.markFailedIfStillApproved;
+    let failureHandled: () => void = () => undefined;
+    const handled = new Promise<void>((resolve) => {
+      failureHandled = resolve;
+    });
+    t.mock.method(
+      subscriberPrototype,
+      'markFailedIfStillApproved',
+      async (requestId: number) => {
+        const result = await markFailed(requestId);
+        failureHandled();
+        return result;
+      }
+    );
+    const owner = await seedUser('admin@seerr.dev');
+    const mediaRequest = await seedTvRequest(owner, [1], {
+      tmdbId: 67901,
+      serverId: 0,
+      isServiceRequest: true,
+    });
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const approved = await admin.post(`/request/${mediaRequest.id}/approve`);
+    assert.strictEqual(approved.status, 200);
+    const notificationsBeforeFailure = sendNotificationMock.callCount();
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.DECLINED })
+      .where('id = :id', { id: mediaRequest.id })
+      .callListeners(false)
+      .execute();
+
+    rejectAdd(new Error('late Sonarr failure'));
+    await handled;
+
+    const persisted = await getRepository(MediaRequest).findOneByOrFail({
+      id: mediaRequest.id,
+    });
+    assert.strictEqual(persisted.status, MediaRequestStatus.DECLINED);
+    assert.strictEqual(
+      sendNotificationMock.callCount(),
+      notificationsBeforeFailure
+    );
+  });
+
+  it('marks a still-approved request failed after a Sonarr failure', async (t) => {
+    configureSonarr([{ buttonLabel: 'Service', isDefault: false }]);
+    t.mock.method(SonarrAPI.prototype, 'addSeries', async () => {
+      throw new Error('Sonarr failure');
+    });
+    const subscriberPrototype = MediaRequestSubscriber.prototype as unknown as {
+      markFailedIfStillApproved(
+        requestId: number
+      ): Promise<MediaRequest | undefined>;
+    };
+    const markFailed = subscriberPrototype.markFailedIfStillApproved;
+    let failureHandled: () => void = () => undefined;
+    const handled = new Promise<void>((resolve) => {
+      failureHandled = resolve;
+    });
+    t.mock.method(
+      subscriberPrototype,
+      'markFailedIfStillApproved',
+      async (requestId: number) => {
+        const result = await markFailed(requestId);
+        failureHandled();
+        return result;
+      }
+    );
+    const owner = await seedUser('admin@seerr.dev');
+    const mediaRequest = await seedTvRequest(owner, [1], {
+      tmdbId: 67902,
+      serverId: 0,
+      isServiceRequest: true,
+    });
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const approved = await admin.post(`/request/${mediaRequest.id}/approve`);
+    assert.strictEqual(approved.status, 200);
+    await handled;
+
+    const persisted = await getRepository(MediaRequest).findOneByOrFail({
+      id: mediaRequest.id,
+    });
+    assert.strictEqual(persisted.status, MediaRequestStatus.FAILED);
+    assert.ok(
+      sendNotificationMock.calls.some(
+        (call) => call.arguments[2] === Notification.MEDIA_FAILED
+      )
+    );
+  });
+
+  it('does not overwrite a terminal status won before the atomic failure update', async (t) => {
+    configureSonarr([{ buttonLabel: 'Service', isDefault: false }]);
+    t.mock.method(SonarrAPI.prototype, 'addSeries', async () => {
+      throw new Error('late Sonarr failure');
+    });
+    const subscriberPrototype = MediaRequestSubscriber.prototype as unknown as {
+      markFailedIfStillApproved(
+        requestId: number
+      ): Promise<MediaRequest | undefined>;
+    };
+    const markFailed = subscriberPrototype.markFailedIfStillApproved;
+    let failureReachedUpdate: () => void = () => undefined;
+    const reachedUpdate = new Promise<void>((resolve) => {
+      failureReachedUpdate = resolve;
+    });
+    let allowFailureUpdate: () => void = () => undefined;
+    const mayUpdate = new Promise<void>((resolve) => {
+      allowFailureUpdate = resolve;
+    });
+    let failureHandled: () => void = () => undefined;
+    const handled = new Promise<void>((resolve) => {
+      failureHandled = resolve;
+    });
+    t.mock.method(
+      subscriberPrototype,
+      'markFailedIfStillApproved',
+      async (requestId: number) => {
+        failureReachedUpdate();
+        await mayUpdate;
+        const result = await markFailed(requestId);
+        failureHandled();
+        return result;
+      }
+    );
+    const owner = await seedUser('admin@seerr.dev');
+    const mediaRequest = await seedTvRequest(owner, [1], {
+      tmdbId: 67903,
+      serverId: 0,
+      isServiceRequest: true,
+    });
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const approving = admin
+      .post(`/request/${mediaRequest.id}/approve`)
+      .then((response) => response);
+    await reachedUpdate;
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.COMPLETED })
+      .where('id = :id', { id: mediaRequest.id })
+      .callListeners(false)
+      .execute();
+    const notificationsBeforeFailure = sendNotificationMock.callCount();
+    allowFailureUpdate();
+    await handled;
+    const approved = await approving;
+    assert.strictEqual(approved.status, 200);
+
+    const persisted = await getRepository(MediaRequest).findOneByOrFail({
+      id: mediaRequest.id,
+    });
+    assert.strictEqual(persisted.status, MediaRequestStatus.COMPLETED);
+    assert.strictEqual(
+      sendNotificationMock.callCount(),
+      notificationsBeforeFailure
+    );
+  });
+
+  it('uses the atomic failure transition in the outer Sonarr catch', async () => {
+    configureSonarr([{ buttonLabel: 'Service', isDefault: false }]);
+    getTvShowImpl = async () => {
+      throw new Error('TMDB failure');
+    };
+    const owner = await seedUser('admin@seerr.dev');
+    const mediaRequest = await seedTvRequest(owner, [1], {
+      tmdbId: 67904,
+      serverId: 0,
+      isServiceRequest: true,
+    });
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const approved = await admin.post(`/request/${mediaRequest.id}/approve`);
+    assert.strictEqual(approved.status, 200);
+    const persisted = await getRepository(MediaRequest).findOneByOrFail({
+      id: mediaRequest.id,
+    });
+    assert.strictEqual(persisted.status, MediaRequestStatus.FAILED);
+    assert.deepStrictEqual(
+      persisted.seasons.map((season) => season.status),
+      [MediaRequestStatus.PENDING]
+    );
+    assert.ok(
+      sendNotificationMock.calls.some(
+        (call) => call.arguments[2] === Notification.MEDIA_FAILED
+      )
+    );
+  });
+
+  it('keeps native media unknown after an outer Radarr failure', async (t) => {
+    const settings = getSettings();
+    const previousRadarr = settings.radarr;
+    t.after(() => {
+      settings.radarr = previousRadarr;
+    });
+
+    configureRadarr([{}]);
+    getMovieImpl = async () => {
+      throw new Error('TMDB failure');
+    };
+    const mediaRequest = await seedRequest();
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const approved = await admin.post(`/request/${mediaRequest.id}/approve`);
+    assert.strictEqual(approved.status, 200);
+    const persistedRequest = await getRepository(MediaRequest).findOneByOrFail({
+      id: mediaRequest.id,
+    });
+    const persistedMedia = await getRepository(Media).findOneByOrFail({
+      id: mediaRequest.media.id,
+    });
+    assert.strictEqual(persistedRequest.status, MediaRequestStatus.FAILED);
+    assert.strictEqual(persistedMedia.status, MediaStatus.UNKNOWN);
+    assert.ok(
+      sendNotificationMock.calls.some(
+        (call) =>
+          call.arguments[0]?.id === mediaRequest.id &&
+          call.arguments[2] === Notification.MEDIA_FAILED
+      )
+    );
+  });
+});
 
 describe('PUT /request/:requestId (tv)', () => {
   it('does not add a season held by another request', async () => {
@@ -2207,6 +2596,66 @@ describe('POST /request, per-service slots', () => {
     assert.strictEqual(res.status, 403);
   });
 
+  it('uses fresh grants after a waiting service request is revoked', async () => {
+    configureRadarr([
+      { id: 41, buttonLabel: 'Service', isDefault: false, syncEnabled: true },
+    ]);
+    const userRepository = getRepository(User);
+    const actor = await userRepository.findOneByOrFail({
+      email: 'demo@seerr.dev',
+    });
+    actor.requestServices = ['radarr:41'];
+    await userRepository.save(actor);
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+
+    let waitingResponse: Promise<{ status: number }> | undefined;
+    await serviceTargetLock.dispatch(
+      serviceTargetKey('radarr', 41),
+      async () => {
+        const dispatch = serviceTargetLock.dispatch.bind(serviceTargetLock);
+        let requestReachedLock: () => void = () => undefined;
+        const reachedLock = new Promise<void>((resolve) => {
+          requestReachedLock = resolve;
+        });
+        const dispatchMock = mock.method(
+          serviceTargetLock,
+          'dispatch',
+          async <T>(key: string, callback: () => Promise<T>) => {
+            if (key === serviceTargetKey('radarr', 41)) {
+              requestReachedLock();
+            }
+            return dispatch(key, callback);
+          }
+        );
+        waitingResponse = agent
+          .post('/request')
+          .send({
+            mediaType: MediaType.MOVIE,
+            mediaId: 99915,
+            serverId: 41,
+            isServiceRequest: true,
+          })
+          .then((response) => response);
+        await reachedLock;
+        dispatchMock.mock.restore();
+        const lockedActor = await userRepository.findOneByOrFail({
+          id: actor.id,
+        });
+        lockedActor.requestServices = [];
+        await userRepository.save(lockedActor);
+      }
+    );
+
+    assert.ok(waitingResponse);
+    assert.strictEqual((await waitingResponse).status, 403);
+    assert.strictEqual(
+      await getRepository(MediaRequest).count({
+        where: { media: { tmdbId: 99915 }, isServiceRequest: true },
+      }),
+      0
+    );
+  });
+
   it('allows a manager to make service requests without explicit grants', async () => {
     const admin = await loginAs('admin@seerr.dev', 'test1234');
 
@@ -2217,6 +2666,64 @@ describe('POST /request, per-service slots', () => {
       isServiceRequest: true,
     });
     assert.strictEqual(res.status, 201);
+  });
+
+  it('rejects a manager request for a user without the native quality permission', async () => {
+    const requestUser = await getRepository(User).findOneByOrFail({
+      email: 'demo@seerr.dev',
+    });
+    requestUser.permissions = Permission.NONE;
+    await getRepository(User).save(requestUser);
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const response = await admin.post('/request').send({
+      mediaType: MediaType.MOVIE,
+      mediaId: 99917,
+      serverId: 0,
+      isServiceRequest: true,
+      userId: requestUser.id,
+    });
+
+    assert.strictEqual(response.status, 403);
+  });
+
+  it('allows a manager target access when the request user has quality permission', async () => {
+    const requestUser = await getRepository(User).findOneByOrFail({
+      email: 'demo@seerr.dev',
+    });
+    requestUser.permissions = Permission.REQUEST_MOVIE;
+    requestUser.requestServices = [];
+    await getRepository(User).save(requestUser);
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const response = await admin.post('/request').send({
+      mediaType: MediaType.MOVIE,
+      mediaId: 99918,
+      serverId: 0,
+      isServiceRequest: true,
+      userId: requestUser.id,
+    });
+
+    assert.strictEqual(response.status, 201);
+  });
+
+  it('rejects a granted user without the native quality permission', async () => {
+    const requestUser = await getRepository(User).findOneByOrFail({
+      email: 'demo@seerr.dev',
+    });
+    requestUser.permissions = Permission.NONE;
+    requestUser.requestServices = ['radarr:0'];
+    await getRepository(User).save(requestUser);
+    const actor = await loginAs('demo@seerr.dev', 'test1234');
+
+    const response = await actor.post('/request').send({
+      mediaType: MediaType.MOVIE,
+      mediaId: 99919,
+      serverId: 0,
+      isServiceRequest: true,
+    });
+
+    assert.strictEqual(response.status, 403);
   });
 
   it('does not claim the standard media status slot', async () => {
@@ -2395,6 +2902,74 @@ describe('POST /request, per-service slots', () => {
           seasons: seasons ?? [],
         },
       ]);
+    });
+  }
+
+  for (const [mediaType, service, seasons, mediaId] of [
+    [MediaType.MOVIE, 'radarr', undefined, 99970],
+    [MediaType.TV, 'sonarr', [1], 99971],
+  ] as const) {
+    it(`serializes concurrent ${mediaType} requests in the same service slot`, async () => {
+      await grantServices('demo@seerr.dev', [`${service}:0`]);
+      const secondEmail = `same-${mediaType}@seerr.dev`;
+      await createRequester(secondEmail, [`${service}:0`]);
+      const first = await loginAs('demo@seerr.dev', 'test1234');
+      const second = await loginAs(secondEmail, 'test1234');
+      const payload = {
+        mediaType,
+        mediaId,
+        serverId: 0,
+        isServiceRequest: true,
+        seasons,
+      };
+
+      const responses = await Promise.all([
+        first.post('/request').send(payload),
+        second.post('/request').send(payload),
+      ]);
+
+      assert.deepStrictEqual(
+        responses.map((response) => response.status).sort(),
+        mediaType === MediaType.MOVIE ? [201, 409] : [201, 202]
+      );
+      const activeRequests = await findServiceRequests(mediaId, mediaType);
+      assert.strictEqual(activeRequests.length, 1);
+      assert.deepStrictEqual(activeRequests[0].seasons, seasons ?? []);
+    });
+
+    it(`allows concurrent ${mediaType} requests in different service slots`, async () => {
+      await grantServices('demo@seerr.dev', [`${service}:0`]);
+      const secondEmail = `cross-${mediaType}@seerr.dev`;
+      await createRequester(secondEmail, [`${service}:1`]);
+      const first = await loginAs('demo@seerr.dev', 'test1234');
+      const second = await loginAs(secondEmail, 'test1234');
+
+      const responses = await Promise.all([
+        first.post('/request').send({
+          mediaType,
+          mediaId: mediaId + 10,
+          serverId: 0,
+          isServiceRequest: true,
+          seasons,
+        }),
+        second.post('/request').send({
+          mediaType,
+          mediaId: mediaId + 10,
+          serverId: 1,
+          isServiceRequest: true,
+          seasons,
+        }),
+      ]);
+
+      assert.deepStrictEqual(
+        responses.map((response) => response.status).sort(),
+        [201, 201]
+      );
+      const activeRequests = await findServiceRequests(mediaId + 10, mediaType);
+      assert.deepStrictEqual(
+        activeRequests.map((activeRequest) => activeRequest.serverId),
+        [0, 1]
+      );
     });
   }
 });

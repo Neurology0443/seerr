@@ -1100,6 +1100,8 @@ class BaseScanner<T> {
       mediaId: number;
       tmdbId: number;
       tvdbId?: number;
+      status: MediaStatus;
+      seasonStatuses?: Record<number, MediaStatus> | string | null;
     }[] = await serviceStatusRepository
       .createQueryBuilder('serviceStatus')
       .innerJoin(Media, 'media', 'media.id = serviceStatus.mediaId')
@@ -1107,16 +1109,36 @@ class BaseScanner<T> {
       .addSelect('serviceStatus.mediaId', 'mediaId')
       .addSelect('media.tmdbId', 'tmdbId')
       .addSelect('media.tvdbId', 'tvdbId')
+      .addSelect('serviceStatus.status', 'status')
+      .addSelect('serviceStatus.seasonStatuses', 'seasonStatuses')
       .where('serviceStatus.serviceId = :serviceId', { serviceId })
       .andWhere('serviceStatus.serviceType = :serviceType', { serviceType })
-      .andWhere('serviceStatus.status NOT IN (:...exempt)', {
-        exempt: [MediaStatus.UNKNOWN, MediaStatus.DELETED],
+      .andWhere('serviceStatus.status != :deleted', {
+        deleted: MediaStatus.DELETED,
       })
       .andWhere('media.mediaType = :mediaType', { mediaType })
       .getRawMany();
 
     let staleCount = 0;
     for (const candidate of candidates) {
+      let seasonStatuses = candidate.seasonStatuses;
+      if (typeof seasonStatuses === 'string') {
+        try {
+          seasonStatuses = JSON.parse(seasonStatuses);
+        } catch {
+          seasonStatuses = null;
+        }
+      }
+      if (
+        Number(candidate.status) === MediaStatus.UNKNOWN &&
+        !Object.values(seasonStatuses ?? {}).some(
+          (status) =>
+            Number(status) !== MediaStatus.UNKNOWN &&
+            Number(status) !== MediaStatus.DELETED
+        )
+      ) {
+        continue;
+      }
       if (seenTmdbIds.has(Number(candidate.tmdbId))) continue;
       const cleaned = await serviceTargetLock.dispatch(
         serviceTargetKey(serviceType, serviceId),
@@ -1155,6 +1177,20 @@ class BaseScanner<T> {
               .getMany();
 
             for (const request of orphanedRequests) {
+              const shouldDecline =
+                mediaType === MediaType.MOVIE ||
+                (request.seasons.length > 0 &&
+                  request.seasons.every((season) => {
+                    const status = seasonStatuses?.[season.seasonNumber];
+                    return (
+                      status !== undefined &&
+                      Number(status) !== MediaStatus.UNKNOWN &&
+                      Number(status) !== MediaStatus.DELETED
+                    );
+                  }));
+              if (!shouldDecline) {
+                continue;
+              }
               request.status = MediaRequestStatus.DECLINED;
               await requestRepository.save(request);
             }

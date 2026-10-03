@@ -78,11 +78,6 @@ const ServiceStatusBadges = ({
     if (items.some(({ server }) => server.id === request.serverId)) {
       continue;
     }
-    if (
-      serviceStatuses?.some((status) => status.serviceId === request.serverId)
-    ) {
-      continue;
-    }
     const server = services.find(
       (service) =>
         service.id === request.serverId && isMultiServiceTarget(service)
@@ -90,7 +85,10 @@ const ServiceStatusBadges = ({
     if (!server) {
       continue;
     }
-    const { status, downloadItem = [] } = getServiceSlotStatus(request);
+    const { status, downloadItem = [] } = getServiceSlotStatus(
+      request,
+      seasonNumber
+    );
     if (status === MediaStatus.PENDING || status === MediaStatus.PROCESSING) {
       items.push({ server, status, downloadItem });
     }

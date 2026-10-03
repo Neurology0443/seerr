@@ -119,6 +119,10 @@ export class MediaRequest {
     const userRepository = getRepository(User);
     const settings = getSettings();
 
+    if (requestBody.isServiceRequest) {
+      user = await userRepository.findOneOrFail({ where: { id: user.id } });
+    }
+
     const target = validateRequestTarget({
       mediaType: requestBody.mediaType,
       serverId: requestBody.serverId,
