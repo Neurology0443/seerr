@@ -2,10 +2,10 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { assertValidServiceTargets } from '@server/lib/settings';
-import migrate from './settings/migrations/0009_multi_service_target_invariants';
+import migrate from './migrations/0009_multi_service_target_invariants';
 
 describe('0009 multi-service target invariants', () => {
-  it('normalizes valid labels and restores ambiguous targets to native', () => {
+  it('normalizes valid labels without changing their target role', () => {
     const settings = {
       migrations: [],
       radarr: [
@@ -16,10 +16,8 @@ describe('0009 multi-service target invariants', () => {
           syncEnabled: true,
         },
         { id: 2, buttonLabel: '   ', isDefault: false, syncEnabled: true },
-        { id: 3, buttonLabel: 'Default', isDefault: true, syncEnabled: true },
       ],
       sonarr: [
-        { id: 4, buttonLabel: 'No scan', isDefault: false, syncEnabled: false },
         { id: 5, buttonLabel: 'English', isDefault: false, syncEnabled: true },
       ],
     };
@@ -29,17 +27,44 @@ describe('0009 multi-service target invariants', () => {
 
     assert.equal(once.radarr[0].buttonLabel, 'Deutsch');
     assert.equal(once.radarr[1].buttonLabel, undefined);
-    assert.equal(once.radarr[2].buttonLabel, undefined);
-    assert.equal(once.radarr[2].isDefault, true);
-    assert.equal(once.sonarr[0].buttonLabel, undefined);
-    assert.equal(once.sonarr[0].syncEnabled, false);
-    assert.equal(once.sonarr[1].buttonLabel, 'English');
+    assert.equal(once.sonarr[0].buttonLabel, 'English');
     assert.deepEqual(twice, once);
     assert.equal(
       twice.migrations.filter(
         (name) => name === '0009_multi_service_target_invariants'
       ).length,
       1
+    );
+  });
+
+  it('rejects labelled legacy targets with an incompatible role', () => {
+    assert.throws(() =>
+      migrate({
+        migrations: [],
+        radarr: [
+          {
+            id: 3,
+            buttonLabel: 'Default',
+            isDefault: true,
+            syncEnabled: true,
+          },
+        ],
+        sonarr: [],
+      } as never)
+    );
+    assert.throws(() =>
+      migrate({
+        migrations: [],
+        radarr: [],
+        sonarr: [
+          {
+            id: 4,
+            buttonLabel: 'No scan',
+            isDefault: false,
+            syncEnabled: false,
+          },
+        ],
+      } as never)
     );
   });
 

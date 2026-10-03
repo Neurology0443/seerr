@@ -18,7 +18,6 @@ import { MediaRequest } from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
-import { upsertMediaServiceStatus } from '@server/lib/mediaServiceStatus';
 import notificationManager, { Notification } from '@server/lib/notifications';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -45,6 +44,31 @@ const sanitizeDisplayName = (displayName: string): string => {
 
 @EventSubscriber()
 export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRequest> {
+  private async markFailedIfStillApproved(
+    requestId: number,
+    requestRepository = getRepository(MediaRequest)
+  ): Promise<MediaRequest | undefined> {
+    const result = await requestRepository
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.FAILED })
+      .where('id = :requestId', { requestId })
+      .andWhere('status = :approvedStatus', {
+        approvedStatus: MediaRequestStatus.APPROVED,
+      })
+      .callListeners(false)
+      .execute();
+
+    if (result.affected !== 1) {
+      return;
+    }
+
+    return (
+      (await requestRepository.findOne({ where: { id: requestId } })) ??
+      undefined
+    );
+  }
+
   private getServiceLabel(entity: MediaRequest): string | undefined {
     if (!entity.isServiceRequest || entity.serverId == null) {
       return undefined;
@@ -61,10 +85,53 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     entity: MediaRequest,
     media: Media
   ): Promise<boolean> {
+    if (entity.type === MediaType.TV) {
+      const requestedSeasons = (entity.seasons ?? []).map(
+        (season) => season.seasonNumber
+      );
+      if (requestedSeasons.length === 0) {
+        return false;
+      }
+
+      if (entity.isServiceRequest && entity.serverId != null) {
+        const serviceStatus = await manager
+          .getRepository(MediaServiceStatus)
+          .findOne({
+            where: {
+              mediaId: media.id,
+              serviceId: entity.serverId,
+              serviceType: 'sonarr',
+            },
+          });
+        return requestedSeasons.every(
+          (seasonNumber) =>
+            serviceStatus?.seasonStatuses?.[seasonNumber] ===
+            MediaStatus.AVAILABLE
+        );
+      }
+
+      const mediaWithSeasons = await manager.findOne(Media, {
+        where: { id: media.id },
+        relations: { seasons: true },
+      });
+      return requestedSeasons.every(
+        (seasonNumber) =>
+          mediaWithSeasons?.seasons.find(
+            (season) => season.seasonNumber === seasonNumber
+          )?.[entity.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
+      );
+    }
+
     if (entity.isServiceRequest && entity.serverId != null) {
       const serviceStatus = await manager
         .getRepository(MediaServiceStatus)
-        .findOne({ where: { mediaId: media.id, serviceId: entity.serverId } });
+        .findOne({
+          where: {
+            mediaId: media.id,
+            serviceId: entity.serverId,
+            serviceType: 'radarr',
+          },
+        });
       return serviceStatus?.status === MediaStatus.AVAILABLE;
     }
 
@@ -418,6 +485,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         radarr
           .addMovie(radarrMovieOptions)
           .then(async (radarrMovie) => {
+            if (entity.isServiceRequest) return;
             // Needs its own repository as this runs detached from the request transaction
             const mediaRepository = getRepository(Media);
             // We grab media again here to make sure we have the latest version of it
@@ -429,39 +497,19 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               throw new Error('Media data not found');
             }
 
-            if (!entity.isServiceRequest) {
-              media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
-                radarrMovie.id;
-              media[
-                entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
-              ] = radarrMovie.titleSlug;
-              media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
-                radarrSettings?.id;
-              await mediaRepository.save(media);
-            }
-
-            if (radarrSettings?.id !== undefined) {
-              await upsertMediaServiceStatus(
-                getRepository(MediaServiceStatus),
-                {
-                  mediaId: media.id,
-                  serviceId: radarrSettings.id,
-                  serviceType: 'radarr',
-                  status: MediaStatus.PROCESSING,
-                  externalServiceId: radarrMovie.id,
-                  externalServiceSlug: radarrMovie.titleSlug,
-                }
-              );
-            }
+            media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
+              radarrMovie.id;
+            media[
+              entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
+            ] = radarrMovie.titleSlug;
+            media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
+              radarrSettings?.id;
+            await mediaRepository.save(media);
           })
           .catch(async () => {
+            let failedRequest: MediaRequest | undefined;
             try {
-              const requestRepository = getRepository(MediaRequest);
-
-              if (entity.status !== MediaRequestStatus.FAILED) {
-                entity.status = MediaRequestStatus.FAILED;
-                await requestRepository.save(entity);
-              }
+              failedRequest = await this.markFailedIfStillApproved(entity.id);
             } catch (saveError) {
               logger.error('Failed to mark request as FAILED', {
                 label: 'Media Request',
@@ -471,6 +519,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
                     ? saveError.message
                     : String(saveError),
               });
+            }
+
+            if (!failedRequest) {
+              return;
             }
 
             logger.warn(
@@ -484,7 +536,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             );
 
             MediaRequest.sendNotification(
-              entity,
+              failedRequest,
               media,
               Notification.MEDIA_FAILED
             );
@@ -503,15 +555,22 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           mediaId: entity.media.id,
         });
       } catch (e) {
-        const requestRepository = manager.getRepository(MediaRequest);
         const mediaRepository = manager.getRepository(Media);
         const media = await mediaRepository.findOne({
           where: { id: entity.media.id },
         });
 
         if (media) {
+          const failedRequest = await this.markFailedIfStillApproved(
+            entity.id,
+            manager.getRepository(MediaRequest)
+          );
+          if (!failedRequest) {
+            return;
+          }
+
+          // Keep the current subscriber entity consistent with the persisted transition.
           entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
 
           logger.warn(
             'Failed to send movie request to Radarr due to connection or configuration error, marking status as FAILED',
@@ -524,7 +583,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           );
 
           MediaRequest.sendNotification(
-            entity,
+            failedRequest,
             media,
             Notification.MEDIA_FAILED
           );
@@ -627,9 +686,6 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         const tvdbId = series.external_ids.tvdb_id ?? media.tvdbId;
 
         if (!tvdbId) {
-          const requestRepository = manager.getRepository(MediaRequest);
-          await mediaRepository.remove(media);
-          await requestRepository.remove(entity);
           throw new Error('TVDB ID not found');
         }
 
@@ -780,6 +836,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         sonarr
           .addSeries(sonarrSeriesOptions)
           .then(async (sonarrSeries) => {
+            if (entity.isServiceRequest) return;
             // Needs its own repository as this runs detached from the request transaction
             const mediaRepository = getRepository(Media);
             // We grab media again here to make sure we have the latest version of it
@@ -791,39 +848,19 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               throw new Error('Media data not found');
             }
 
-            if (!entity.isServiceRequest) {
-              media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
-                sonarrSeries.id;
-              media[
-                entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
-              ] = sonarrSeries.titleSlug;
-              media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
-                sonarrSettings?.id;
-              await mediaRepository.save(media);
-            }
-
-            if (sonarrSettings?.id !== undefined) {
-              await upsertMediaServiceStatus(
-                getRepository(MediaServiceStatus),
-                {
-                  mediaId: media.id,
-                  serviceId: sonarrSettings.id,
-                  serviceType: 'sonarr',
-                  status: MediaStatus.PROCESSING,
-                  externalServiceId: sonarrSeries.id ?? null,
-                  externalServiceSlug: sonarrSeries.titleSlug ?? null,
-                }
-              );
-            }
+            media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
+              sonarrSeries.id;
+            media[
+              entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
+            ] = sonarrSeries.titleSlug;
+            media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
+              sonarrSettings?.id;
+            await mediaRepository.save(media);
           })
           .catch(async () => {
+            let failedRequest: MediaRequest | undefined;
             try {
-              const requestRepository = getRepository(MediaRequest);
-
-              if (entity.status !== MediaRequestStatus.FAILED) {
-                entity.status = MediaRequestStatus.FAILED;
-                await requestRepository.save(entity);
-              }
+              failedRequest = await this.markFailedIfStillApproved(entity.id);
             } catch (saveError) {
               logger.error('Failed to mark request as FAILED', {
                 label: 'Media Request',
@@ -833,6 +870,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
                     ? saveError.message
                     : String(saveError),
               });
+            }
+
+            if (!failedRequest) {
+              return;
             }
 
             logger.warn(
@@ -846,7 +887,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             );
 
             MediaRequest.sendNotification(
-              entity,
+              failedRequest,
               media,
               Notification.MEDIA_FAILED
             );
@@ -866,15 +907,22 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           mediaId: entity.media.id,
         });
       } catch (e) {
-        const requestRepository = manager.getRepository(MediaRequest);
         const mediaRepository = manager.getRepository(Media);
         const media = await mediaRepository.findOne({
           where: { id: entity.media.id },
         });
 
         if (media) {
+          const failedRequest = await this.markFailedIfStillApproved(
+            entity.id,
+            manager.getRepository(MediaRequest)
+          );
+          if (!failedRequest) {
+            return;
+          }
+
+          // Keep the current subscriber entity consistent with the persisted transition.
           entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
 
           logger.warn(
             'Failed to send series request to Sonarr due to connection or configuration error, marking status as FAILED',
@@ -887,7 +935,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           );
 
           MediaRequest.sendNotification(
-            entity,
+            failedRequest,
             media,
             Notification.MEDIA_FAILED
           );
@@ -1117,6 +1165,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         fullMedia.requests
           .filter(
             (request) =>
+              !request.isServiceRequest &&
               request.is4k === entity.is4k &&
               request.status !== MediaRequestStatus.COMPLETED &&
               request.status !== MediaRequestStatus.DECLINED

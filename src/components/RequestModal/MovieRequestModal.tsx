@@ -96,9 +96,9 @@ const MovieRequestModal = ({
         mediaId: data?.id,
         mediaType: 'movie',
         is4k,
-        ...(serverId != null ? { serverId, isServiceRequest: true } : {}),
         ignoreQuota: requestOverrides?.ignoreQuota,
         ...overrideParams,
+        ...(serverId != null ? { serverId, isServiceRequest: true } : {}),
       });
       mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
       mutate('/api/v1/request/count');
@@ -183,7 +183,7 @@ const MovieRequestModal = ({
     try {
       await axios.put(`/api/v1/request/${editRequest?.id}`, {
         mediaType: 'movie',
-        serverId: requestOverrides?.server,
+        serverId: serverId ?? requestOverrides?.server,
         profileId: requestOverrides?.profile,
         rootFolder: requestOverrides?.folder,
         userId: requestOverrides?.user?.id,

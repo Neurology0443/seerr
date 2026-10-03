@@ -13,11 +13,34 @@ import overrideRules, {
   type OverrideRulesResult,
 } from '@server/lib/overrideRules';
 import { Permission } from '@server/lib/permissions';
+import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import { withServiceTargetLocks } from '@server/utils/requestLock';
 import { Router } from 'express';
 
 const overrideRuleRoutes = Router();
+
+const getServiceReferences = (body: {
+  radarrServiceId?: number;
+  sonarrServiceId?: number;
+}): { type: 'radarr' | 'sonarr'; id: number }[] => [
+  ...(body.radarrServiceId == null
+    ? []
+    : [{ type: 'radarr' as const, id: body.radarrServiceId }]),
+  ...(body.sonarrServiceId == null
+    ? []
+    : [{ type: 'sonarr' as const, id: body.sonarrServiceId }]),
+];
+
+const serviceReferencesExist = (
+  references: { type: 'radarr' | 'sonarr'; id: number }[]
+): boolean => {
+  const settings = getSettings();
+  return references.every(({ type, id }) =>
+    settings[type].some((service) => service.id === id)
+  );
+};
 
 overrideRuleRoutes.get(
   '/',
@@ -65,9 +88,15 @@ overrideRuleRoutes.post<
       sonarrServiceId: req.body.sonarrServiceId,
     });
 
-    const newRule = await overrideRuleRepository.save(rule);
+    const references = getServiceReferences(req.body);
+    return await withServiceTargetLocks(references, async () => {
+      if (!serviceReferencesExist(references)) {
+        return next({ status: 400, message: 'Invalid service reference.' });
+      }
+      const newRule = await overrideRuleRepository.save(rule);
 
-    return res.status(200).json(newRule);
+      return res.status(200).json(newRule);
+    });
   } catch (e) {
     next({ status: 404, message: e.message });
   }
@@ -232,9 +261,15 @@ overrideRuleRoutes.put<
     rule.radarrServiceId = req.body.radarrServiceId;
     rule.sonarrServiceId = req.body.sonarrServiceId;
 
-    const newRule = await overrideRuleRepository.save(rule);
+    const references = getServiceReferences(req.body);
+    return await withServiceTargetLocks(references, async () => {
+      if (!serviceReferencesExist(references)) {
+        return next({ status: 400, message: 'Invalid service reference.' });
+      }
+      const newRule = await overrideRuleRepository.save(rule);
 
-    return res.status(200).json(newRule);
+      return res.status(200).json(newRule);
+    });
   } catch (e) {
     next({ status: 404, message: e.message });
   }

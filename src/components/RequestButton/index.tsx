@@ -18,6 +18,7 @@ import axios from 'axios';
 import { useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
+import { canRequestService } from './servicePermissions';
 
 const messages = defineMessages('components.RequestButton', {
   viewrequest: 'View Request',
@@ -289,14 +290,9 @@ const RequestButton = ({
   }
 
   const servicePrefix = mediaType === 'movie' ? 'radarr' : 'sonarr';
-  const restrictToServices =
-    (user?.requestServices ?? []).some((service) =>
-      service.startsWith(`${servicePrefix}:`)
-    ) && !hasPermission(Permission.MANAGE_REQUESTS);
 
   // Standard request button
   if (
-    !restrictToServices &&
     (!media ||
       media.status === MediaStatus.UNKNOWN ||
       (media.status === MediaStatus.DELETED && !activeRequest)) &&
@@ -320,7 +316,6 @@ const RequestButton = ({
       svg: <ArrowDownTrayIcon />,
     });
   } else if (
-    !restrictToServices &&
     mediaType === 'tv' &&
     (!activeRequest || activeRequest.requestedBy.id !== user?.id) &&
     hasPermission([Permission.REQUEST, Permission.REQUEST_TV], {
@@ -343,7 +338,6 @@ const RequestButton = ({
 
   // 4K request button
   if (
-    !restrictToServices &&
     (!media ||
       media.status4k === MediaStatus.UNKNOWN ||
       (media.status4k === MediaStatus.DELETED && !active4kRequest)) &&
@@ -369,7 +363,6 @@ const RequestButton = ({
       svg: <ArrowDownTrayIcon />,
     });
   } else if (
-    !restrictToServices &&
     mediaType === 'tv' &&
     (!active4kRequest || active4kRequest.requestedBy.id !== user?.id) &&
     hasPermission([Permission.REQUEST_4K, Permission.REQUEST_4K_TV], {
@@ -401,8 +394,32 @@ const RequestButton = ({
     const serviceStatusEntry = media?.serviceStatuses?.find(
       (ss) => ss.serviceId === service.id
     );
+    const occupiedRequests = media?.requests.filter(
+      (request) =>
+        request.isServiceRequest &&
+        request.serverId === service.id &&
+        (request.status === MediaRequestStatus.PENDING ||
+          request.status === MediaRequestStatus.APPROVED)
+    );
+    const editableRequests = occupiedRequests?.filter(
+      (request) => request.status === MediaRequestStatus.PENDING
+    );
+    const userEditableRequest = editableRequests?.find(
+      (request) => request.requestedBy.id === user?.id
+    );
+    const hasOccupiedMovieSlot =
+      mediaType === 'movie' &&
+      media?.requests.some(
+        (request) =>
+          request.isServiceRequest &&
+          request.serverId === service.id &&
+          (request.status === MediaRequestStatus.PENDING ||
+            request.status === MediaRequestStatus.APPROVED)
+      );
     if (
       serviceStatusEntry &&
+      !occupiedRequests?.length &&
+      mediaType === 'movie' &&
       serviceStatusEntry.status !== MediaStatus.UNKNOWN &&
       serviceStatusEntry.status !== MediaStatus.DELETED
     ) {
@@ -410,28 +427,40 @@ const RequestButton = ({
     }
 
     const serviceIdentifier = `${servicePrefix}:${service.id}`;
-    const canUseService =
-      hasPermission(Permission.MANAGE_REQUESTS) ||
-      (user?.requestServices ?? []).includes(serviceIdentifier);
+    const hasQualityPermission = service.is4k
+      ? hasPermission(
+          [
+            Permission.REQUEST_4K,
+            mediaType === 'movie'
+              ? Permission.REQUEST_4K_MOVIE
+              : Permission.REQUEST_4K_TV,
+          ],
+          { type: 'or' }
+        )
+      : hasPermission(
+          [
+            Permission.REQUEST,
+            mediaType === 'movie'
+              ? Permission.REQUEST_MOVIE
+              : Permission.REQUEST_TV,
+          ],
+          { type: 'or' }
+        );
+    const canManageService = hasPermission(Permission.MANAGE_REQUESTS);
+    const canUseService = canRequestService({
+      canManageService,
+      hasGrant: (user?.requestServices ?? []).includes(serviceIdentifier),
+      hasQualityPermission,
+    });
 
-    const activeServiceRequests = media?.requests.filter(
-      (r) =>
-        r.isServiceRequest &&
-        r.serverId === service.id &&
-        r.status === MediaRequestStatus.PENDING
-    );
-    const userServiceRequest = activeServiceRequests?.find(
-      (r) => r.requestedBy.id === user?.id
-    );
-
-    if (!canUseService && !userServiceRequest) {
+    if (!canUseService && !userEditableRequest) {
       continue;
     }
 
     if (
-      userServiceRequest ||
-      (activeServiceRequests &&
-        activeServiceRequests.length > 0 &&
+      userEditableRequest ||
+      (editableRequests &&
+        editableRequests.length > 0 &&
         hasPermission(Permission.MANAGE_REQUESTS))
     ) {
       buttons.push({
@@ -447,8 +476,8 @@ const RequestButton = ({
       });
 
       if (
-        activeServiceRequests &&
-        activeServiceRequests.length > 0 &&
+        editableRequests &&
+        editableRequests.length > 0 &&
         hasPermission(Permission.MANAGE_REQUESTS)
       ) {
         buttons.push(
@@ -458,7 +487,7 @@ const RequestButton = ({
               label: service.buttonLabel,
             }),
             action: () => {
-              modifyRequests(activeServiceRequests, 'approve');
+              modifyRequests(editableRequests, 'approve');
             },
             svg: <CheckIcon />,
           },
@@ -468,23 +497,13 @@ const RequestButton = ({
               label: service.buttonLabel,
             }),
             action: () => {
-              modifyRequests(activeServiceRequests, 'decline');
+              modifyRequests(editableRequests, 'decline');
             },
             svg: <XMarkIcon />,
           }
         );
       }
-    } else if (
-      hasPermission(
-        [
-          Permission.REQUEST,
-          mediaType === 'movie'
-            ? Permission.REQUEST_MOVIE
-            : Permission.REQUEST_TV,
-        ],
-        { type: 'or' }
-      )
-    ) {
+    } else if (canUseService && !hasOccupiedMovieSlot) {
       buttons.push({
         id: `request-service-${service.id}`,
         text: intl.formatMessage(messages.requestinservice, {
@@ -501,7 +520,7 @@ const RequestButton = ({
 
   const [buttonOne, ...others] = buttons;
 
-  const pendingServiceRequests =
+  const editableServiceRequests =
     activeServiceModal.serverId !== null
       ? media?.requests.filter(
           (request) =>
@@ -511,9 +530,12 @@ const RequestButton = ({
         )
       : undefined;
   const activeServiceRequest =
-    pendingServiceRequests?.find(
+    editableServiceRequests?.find(
       (request) => request.requestedBy.id === user?.id
-    ) ?? pendingServiceRequests?.[0];
+    ) ?? editableServiceRequests?.[0];
+  const selectedService = allServices?.find(
+    (service) => service.id === activeServiceModal.serverId
+  );
 
   if (!buttonOne) {
     return null;
@@ -550,6 +572,7 @@ const RequestButton = ({
           show={activeServiceModal.show}
           type={mediaType}
           serverId={activeServiceModal.serverId}
+          is4k={selectedService?.is4k ?? false}
           editRequest={editRequest ? activeServiceRequest : undefined}
           onComplete={() => {
             onUpdate();

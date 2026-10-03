@@ -1,9 +1,9 @@
 import { MediaServerType } from '@server/constants/server';
 import { Permission } from '@server/lib/permissions';
 import { runMigrations } from '@server/lib/settings/migrator';
+import type { AvailableLocale } from '@server/types/languages';
 import type { ServiceTargetConfig } from '@server/utils/serviceTarget';
 import { validateServiceTargetConfig } from '@server/utils/serviceTarget';
-import type { AvailableLocale } from '@server/types/languages';
 import { randomBytes, randomUUID } from 'crypto';
 import fs from 'fs/promises';
 import { mergeWith } from 'lodash';

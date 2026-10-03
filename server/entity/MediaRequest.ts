@@ -1,4 +1,5 @@
 import TheMovieDb from '@server/api/themoviedb';
+import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -9,12 +10,19 @@ import type { MediaRequestBody } from '@server/interfaces/api/requestInterfaces'
 import notificationManager, { Notification } from '@server/lib/notifications';
 import overrideRules from '@server/lib/overrideRules';
 import { Permission } from '@server/lib/permissions';
+import {
+  InvalidServiceTargetError,
+  isSameRequestSlot,
+  validateRequestTarget,
+} from '@server/lib/requestTarget';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
 import requestLock, {
   mediaKey,
   mediaLock,
+  serviceTargetKey,
+  serviceTargetLock,
   userKey,
 } from '@server/utils/requestLock';
 import { truncate } from 'lodash';
@@ -53,23 +61,51 @@ export class MediaRequest {
     user: User,
     options: MediaRequestOptions = {}
   ): Promise<MediaRequest> {
-    // is4k is optional, and an undefined one binds as null in the duplicate query
-    const body = { ...requestBody, is4k: !!requestBody.is4k };
+    const create = async (): Promise<MediaRequest> => {
+      const target = validateRequestTarget({
+        mediaType: requestBody.mediaType,
+        serverId: requestBody.serverId,
+        isServiceRequest: !!requestBody.isServiceRequest,
+        is4k: !!requestBody.is4k,
+      });
+      // A labelled target owns its quality identity. Native requests retain the
+      // historical body-driven Standard/4K behavior.
+      const body = {
+        ...requestBody,
+        is4k: requestBody.isServiceRequest
+          ? !!target?.is4k
+          : !!requestBody.is4k,
+      };
 
-    // Only a caller allowed to set the request user may queue on their lock
-    const lockUserId =
-      body.userId &&
-      user.hasPermission([Permission.MANAGE_USERS, Permission.MANAGE_REQUESTS])
-        ? body.userId
-        : user.id;
+      // Only a caller allowed to set the request user may queue on their lock
+      const lockUserId =
+        body.userId &&
+        user.hasPermission([
+          Permission.MANAGE_USERS,
+          Permission.MANAGE_REQUESTS,
+        ])
+          ? body.userId
+          : user.id;
 
-    // No is4k in the key: one media row holds both statuses, so a 4k and a
-    // non-4k request for the same title race to create it
-    return requestLock.dispatch(userKey(lockUserId), () =>
-      mediaLock.dispatch(mediaKey(body.mediaType, body.mediaId), () =>
-        MediaRequest.createRequest(body, user, options)
-      )
-    );
+      // No is4k in the key: one media row holds both statuses, so a 4k and a
+      // non-4k request for the same title race to create it
+      return requestLock.dispatch(userKey(lockUserId), () =>
+        mediaLock.dispatch(mediaKey(body.mediaType, body.mediaId), () =>
+          MediaRequest.createRequest(body, user, options)
+        )
+      );
+    };
+
+    if (requestBody.serverId != null) {
+      return serviceTargetLock.dispatch(
+        serviceTargetKey(
+          requestBody.mediaType === MediaType.MOVIE ? 'radarr' : 'sonarr',
+          requestBody.serverId
+        ),
+        create
+      );
+    }
+    return create();
   }
 
   private static async createRequest(
@@ -82,6 +118,17 @@ export class MediaRequest {
     const requestRepository = getRepository(MediaRequest);
     const userRepository = getRepository(User);
     const settings = getSettings();
+
+    if (requestBody.isServiceRequest) {
+      user = await userRepository.findOneOrFail({ where: { id: user.id } });
+    }
+
+    const target = validateRequestTarget({
+      mediaType: requestBody.mediaType,
+      serverId: requestBody.serverId,
+      isServiceRequest: !!requestBody.isServiceRequest,
+      is4k: !!requestBody.is4k,
+    });
 
     let requestUser = user;
 
@@ -172,6 +219,19 @@ export class MediaRequest {
         ? await tmdb.getMovie({ movieId: requestBody.mediaId })
         : await tmdb.getTvShow({ tvId: requestBody.mediaId });
 
+    if (
+      target?.animeOnly &&
+      !(
+        'results' in tmdbMedia.keywords
+          ? tmdbMedia.keywords.results
+          : tmdbMedia.keywords.keywords
+      ).some((keyword) => keyword.id === ANIME_KEYWORD_ID)
+    ) {
+      throw new InvalidServiceTargetError(
+        'This request destination is restricted to anime.'
+      );
+    }
+
     let media = await mediaRepository.findOne({
       where: {
         tmdbId: requestBody.mediaId,
@@ -180,17 +240,7 @@ export class MediaRequest {
       relations: ['requests'],
     });
 
-    const isServiceSpecific =
-      !!requestBody.isServiceRequest &&
-      requestBody.serverId !== undefined &&
-      requestBody.serverId !== null &&
-      requestBody.serverId >= 0;
-
-    if (requestBody.isServiceRequest && !isServiceSpecific) {
-      throw new Error(
-        'Service-specific requests must target a valid serverId.'
-      );
-    }
+    const isServiceSpecific = !!requestBody.isServiceRequest;
 
     if (
       isServiceSpecific &&
@@ -283,8 +333,13 @@ export class MediaRequest {
       // If there is an existing movie request that isn't declined, don't allow a new one.
       if (
         requestBody.mediaType === MediaType.MOVIE &&
-        existing[0].status !== MediaRequestStatus.DECLINED &&
-        existing[0].status !== MediaRequestStatus.COMPLETED
+        existing.some((request) =>
+          isServiceSpecific
+            ? request.status === MediaRequestStatus.PENDING ||
+              request.status === MediaRequestStatus.APPROVED
+            : request.status !== MediaRequestStatus.DECLINED &&
+              request.status !== MediaRequestStatus.COMPLETED
+        )
       ) {
         logger.warn('Duplicate request for media blocked', {
           tmdbId: tmdbMedia.id,
@@ -306,7 +361,10 @@ export class MediaRequest {
           (r) =>
             r.requestedBy.id === requestUser.id &&
             r.isAutoRequest &&
-            r.media?.[statusKey] !== MediaStatus.DELETED
+            (isServiceSpecific
+              ? r.status === MediaRequestStatus.PENDING ||
+                r.status === MediaRequestStatus.APPROVED
+              : r.media?.[statusKey] !== MediaStatus.DELETED)
         )
       ) {
         throw new DuplicateMediaRequestError(
@@ -325,6 +383,7 @@ export class MediaRequest {
       tmdbMedia,
       requestUser,
       tags,
+      serviceId: requestBody.serverId ?? undefined,
     });
     const isAdvanced = user.hasPermission(
       [Permission.MANAGE_REQUESTS, Permission.REQUEST_ADVANCED],
@@ -359,6 +418,24 @@ export class MediaRequest {
     }
 
     if (requestBody.mediaType === MediaType.MOVIE) {
+      if (isServiceSpecific && media.id && requestBody.serverId != null) {
+        const serviceStatus = await getRepository(MediaServiceStatus).findOne({
+          where: {
+            mediaId: media.id,
+            serviceId: requestBody.serverId,
+            serviceType: 'radarr',
+          },
+        });
+        if (
+          serviceStatus &&
+          serviceStatus.status !== MediaStatus.UNKNOWN &&
+          serviceStatus.status !== MediaStatus.DELETED
+        ) {
+          throw new DuplicateMediaRequestError(
+            'This media is already present in the selected service.'
+          );
+        }
+      }
       await mediaRepository.save(media);
 
       const request = new MediaRequest({
@@ -418,7 +495,18 @@ export class MediaRequest {
                   season.season_number !== 0 && season.episode_count > 0
               )
               .map((season) => season.season_number)
-          : (requestBody.seasons as number[]);
+          : requestBody.seasons;
+      if (!Array.isArray(requestedSeasons)) {
+        throw new InvalidServiceTargetError('Invalid season selection.');
+      }
+      if (
+        requestedSeasons.some(
+          (season) => !Number.isInteger(season) || season < 0
+        )
+      ) {
+        throw new InvalidServiceTargetError('Invalid season selection.');
+      }
+      requestedSeasons = [...new Set(requestedSeasons)];
       if (!settings.main.enableSpecialEpisodes) {
         requestedSeasons = requestedSeasons.filter((sn) => sn > 0);
       }
@@ -431,14 +519,18 @@ export class MediaRequest {
       if (media.requests) {
         existingSeasons = media.requests
           .filter((request) => {
-            const sameSlot = isServiceSpecific
-              ? request.isServiceRequest &&
-                request.serverId === requestBody.serverId
-              : !request.isServiceRequest && request.is4k === requestBody.is4k;
             return (
-              sameSlot &&
-              request.status !== MediaRequestStatus.DECLINED &&
-              request.status !== MediaRequestStatus.COMPLETED
+              isSameRequestSlot(
+                request,
+                isServiceSpecific,
+                !!requestBody.is4k,
+                requestBody.serverId
+              ) &&
+              (isServiceSpecific
+                ? request.status === MediaRequestStatus.PENDING ||
+                  request.status === MediaRequestStatus.APPROVED
+                : request.status !== MediaRequestStatus.DECLINED &&
+                  request.status !== MediaRequestStatus.COMPLETED)
             );
           })
           .reduce((seasons, request) => {
@@ -455,17 +547,17 @@ export class MediaRequest {
         if (media.id) {
           const serviceStatus = await getRepository(MediaServiceStatus).findOne(
             {
-              where: { mediaId: media.id, serviceId: requestBody.serverId },
+              where: {
+                mediaId: media.id,
+                serviceId: requestBody.serverId,
+                serviceType: 'sonarr',
+              },
             }
           );
           existingSeasons = [
             ...existingSeasons,
             ...Object.entries(serviceStatus?.seasonStatuses ?? {})
-              .filter(
-                ([, status]) =>
-                  status !== MediaStatus.UNKNOWN &&
-                  status !== MediaStatus.DELETED
-              )
+              .filter(([, status]) => status === MediaStatus.AVAILABLE)
               .map(([seasonNumber]) => Number(seasonNumber)),
           ];
         }
@@ -721,6 +813,7 @@ export class MediaRequest {
       const mediaRepository = getRepository(Media);
       const media = await mediaRepository.findOne({
         where: { id: this.media.id },
+        relations: this.type === MediaType.TV ? { seasons: true } : {},
       });
       if (!media) {
         logger.error('Media data not found', {
@@ -731,9 +824,22 @@ export class MediaRequest {
         return;
       }
 
+      const isNativeRequestAvailable =
+        !this.isServiceRequest &&
+        (this.type === MediaType.MOVIE
+          ? media[this.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
+          : (this.seasons ?? []).length > 0 &&
+            (this.seasons ?? []).every(
+              (requestedSeason) =>
+                media.seasons.find(
+                  (season) =>
+                    season.seasonNumber === requestedSeason.seasonNumber
+                )?.[this.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
+            ));
+
       if (
         this.status === MediaRequestStatus.APPROVED &&
-        media[this.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
+        isNativeRequestAvailable
       ) {
         logger.info(
           'Media is already available. Sending availability notification instead of approval.',

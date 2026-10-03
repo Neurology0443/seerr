@@ -4,7 +4,7 @@ import {
   MediaStatus,
   MediaType,
 } from '@server/constants/media';
-import { getRepository } from '@server/datasource';
+import dataSource, { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
 import MediaServiceStatus from '@server/entity/MediaServiceStatus';
@@ -13,6 +13,8 @@ import { upsertMediaServiceStatus } from '@server/lib/mediaServiceStatus';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import AsyncLock from '@server/utils/asyncLock';
+import { serviceTargetKey, serviceTargetLock } from '@server/utils/requestLock';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { randomUUID } from 'crypto';
 
 // Default scan rates (can be overidden)
@@ -49,6 +51,7 @@ interface ProcessOptions {
   title?: string;
   processing?: boolean;
   hasFile?: boolean;
+  isServiceTarget?: boolean;
 }
 
 export interface ProcessableSeason {
@@ -113,6 +116,7 @@ class BaseScanner<T> {
       processing = false,
       title = 'Unknown Title',
       hasFile = true,
+      isServiceTarget = false,
     }: ProcessOptions = {}
   ): Promise<void> {
     const mediaRepository = getRepository(Media);
@@ -121,7 +125,9 @@ class BaseScanner<T> {
       const existing = await this.getExisting(tmdbId, MediaType.MOVIE);
       let mediaId: number;
 
-      if (existing) {
+      if (existing && isServiceTarget) {
+        mediaId = existing.id;
+      } else if (existing) {
         let changedExisting = false;
 
         if (existing[is4k ? 'status4k' : 'status'] !== MediaStatus.AVAILABLE) {
@@ -225,25 +231,31 @@ class BaseScanner<T> {
         newMedia.tmdbId = tmdbId;
         newMedia.imdbId = imdbId;
 
-        newMedia.status =
-          !is4k && !processing
+        newMedia.status = isServiceTarget
+          ? MediaStatus.UNKNOWN
+          : !is4k && !processing
             ? MediaStatus.AVAILABLE
             : !is4k && processing
               ? MediaStatus.PROCESSING
               : MediaStatus.UNKNOWN;
-        newMedia.status4k =
-          is4k && this.enable4kMovie && !processing
+        newMedia.status4k = isServiceTarget
+          ? MediaStatus.UNKNOWN
+          : is4k && this.enable4kMovie && !processing
             ? MediaStatus.AVAILABLE
             : is4k && this.enable4kMovie && processing
               ? MediaStatus.PROCESSING
               : MediaStatus.UNKNOWN;
         newMedia.mediaType = MediaType.MOVIE;
-        newMedia.serviceId = !is4k ? serviceId : undefined;
-        newMedia.serviceId4k = is4k ? serviceId : undefined;
-        newMedia.externalServiceId = !is4k ? externalServiceId : undefined;
-        newMedia.externalServiceId4k = is4k ? externalServiceId : undefined;
-        newMedia.externalServiceSlug = !is4k ? externalServiceSlug : undefined;
-        newMedia.externalServiceSlug4k = is4k ? externalServiceSlug : undefined;
+        newMedia.serviceId = !isServiceTarget && !is4k ? serviceId : undefined;
+        newMedia.serviceId4k = !isServiceTarget && is4k ? serviceId : undefined;
+        newMedia.externalServiceId =
+          !isServiceTarget && !is4k ? externalServiceId : undefined;
+        newMedia.externalServiceId4k =
+          !isServiceTarget && is4k ? externalServiceId : undefined;
+        newMedia.externalServiceSlug =
+          !isServiceTarget && !is4k ? externalServiceSlug : undefined;
+        newMedia.externalServiceSlug4k =
+          !isServiceTarget && is4k ? externalServiceSlug : undefined;
 
         if (mediaAddedAt) {
           newMedia.mediaAddedAt = mediaAddedAt;
@@ -306,6 +318,7 @@ class BaseScanner<T> {
       externalServiceId,
       externalServiceSlug,
       is4k = false,
+      isServiceTarget = false,
       title = 'Unknown Title',
     }: ProcessOptions = {}
   ): Promise<void> {
@@ -313,6 +326,65 @@ class BaseScanner<T> {
 
     await this.asyncLock.dispatch(tmdbId, async () => {
       const media = await this.getExisting(tmdbId, MediaType.TV);
+
+      if (isServiceTarget && serviceId !== undefined) {
+        let serviceMedia = media;
+        if (!serviceMedia) {
+          serviceMedia = await mediaRepository.save(
+            new Media({
+              mediaType: MediaType.TV,
+              tmdbId,
+              tvdbId,
+              status: MediaStatus.UNKNOWN,
+              status4k: MediaStatus.UNKNOWN,
+              seasons: seasons.map(
+                (season) =>
+                  new Season({
+                    seasonNumber: season.seasonNumber,
+                    status: MediaStatus.UNKNOWN,
+                    status4k: MediaStatus.UNKNOWN,
+                  })
+              ),
+            })
+          );
+        } else {
+          const missingSeasons = seasons.filter(
+            (season) =>
+              !serviceMedia?.seasons.some(
+                (existingSeason) =>
+                  existingSeason.seasonNumber === season.seasonNumber
+              )
+          );
+          if (missingSeasons.length > 0) {
+            serviceMedia.seasons.push(
+              ...missingSeasons.map(
+                (season) =>
+                  new Season({
+                    seasonNumber: season.seasonNumber,
+                    status: MediaStatus.UNKNOWN,
+                    status4k: MediaStatus.UNKNOWN,
+                  })
+              )
+            );
+            await mediaRepository.save(serviceMedia);
+          }
+        }
+
+        const { overall, perSeason } = this.computeSeasonServiceStatuses(
+          seasons,
+          is4k
+        );
+        await this.upsertServiceStatus(
+          serviceMedia.id,
+          serviceId,
+          'sonarr',
+          overall,
+          externalServiceId,
+          externalServiceSlug,
+          perSeason
+        );
+        return;
+      }
 
       const newSeasons: Season[] = [];
 
@@ -722,7 +794,9 @@ class BaseScanner<T> {
 
     const orphanedRequests = (media.requests ?? []).filter(
       (request) =>
-        request.is4k === is4k && request.status === MediaRequestStatus.APPROVED
+        !request.isServiceRequest &&
+        request.is4k === is4k &&
+        request.status === MediaRequestStatus.APPROVED
     );
 
     for (const request of orphanedRequests) {
@@ -906,34 +980,51 @@ class BaseScanner<T> {
     externalServiceSlug: string | undefined,
     seasonStatuses: Record<number, MediaStatus> | null = null
   ): Promise<void> {
-    const repo = getRepository(MediaServiceStatus);
-    await upsertMediaServiceStatus(
-      repo,
-      {
-        mediaId,
-        serviceId,
-        serviceType,
-        status,
-        externalServiceId: externalServiceId ?? null,
-        externalServiceSlug: externalServiceSlug ?? null,
-        seasonStatuses,
-      },
-      ['status', 'externalServiceId', 'externalServiceSlug', 'seasonStatuses']
-    );
+    await serviceTargetLock.dispatch(
+      serviceTargetKey(serviceType, serviceId),
+      async () => {
+        const target = getSettings()[serviceType].find(
+          (service) => service.id === serviceId
+        );
+        if (!target || !isMultiServiceTarget(target) || !target.syncEnabled) {
+          return;
+        }
 
-    if (
-      status === MediaStatus.AVAILABLE ||
-      Object.values(seasonStatuses ?? {}).some(
-        (seasonStatus) => seasonStatus === MediaStatus.AVAILABLE
-      )
-    ) {
-      await this.completeAvailableServiceRequests(
-        mediaId,
-        serviceId,
-        status,
-        seasonStatuses
-      );
-    }
+        const repo = getRepository(MediaServiceStatus);
+        await upsertMediaServiceStatus(
+          repo,
+          {
+            mediaId,
+            serviceId,
+            serviceType,
+            status,
+            externalServiceId: externalServiceId ?? null,
+            externalServiceSlug: externalServiceSlug ?? null,
+            seasonStatuses,
+          },
+          [
+            'status',
+            'externalServiceId',
+            'externalServiceSlug',
+            'seasonStatuses',
+          ]
+        );
+
+        if (
+          status === MediaStatus.AVAILABLE ||
+          Object.values(seasonStatuses ?? {}).some(
+            (seasonStatus) => seasonStatus === MediaStatus.AVAILABLE
+          )
+        ) {
+          await this.completeAvailableServiceRequests(
+            mediaId,
+            serviceId,
+            status,
+            seasonStatuses
+          );
+        }
+      }
+    );
   }
 
   private async completeAvailableServiceRequests(
@@ -964,6 +1055,9 @@ class BaseScanner<T> {
 
       if (isComplete) {
         request.status = MediaRequestStatus.COMPLETED;
+        request.seasons.forEach((season) => {
+          season.status = MediaRequestStatus.COMPLETED;
+        });
         await requestRepository.save(request);
         this.log(
           `Service request ${request.id} marked as completed (service ${serviceId})`,
@@ -980,6 +1074,7 @@ class BaseScanner<T> {
     seenTmdbIds,
     serverName,
     clearSeasonStatuses = false,
+    confirmAbsent,
   }: {
     serviceId: number;
     serviceType: 'radarr' | 'sonarr';
@@ -987,52 +1082,140 @@ class BaseScanner<T> {
     seenTmdbIds: Set<number>;
     serverName: string;
     clearSeasonStatuses?: boolean;
+    confirmAbsent: (
+      tmdbId: number,
+      tvdbId?: number
+    ) => Promise<boolean | undefined>;
   }): Promise<void> {
     if (seenTmdbIds.size === 0) {
       this.log(
-        `No titles were processed for ${serverName}. Stale service status reset will be skipped.`,
-        'warn'
+        `The healthy inventory for ${serverName} is empty. Known titles will be confirmed individually before cleanup.`,
+        'info'
       );
-      return;
     }
-
     const serviceStatusRepository = getRepository(MediaServiceStatus);
 
-    const candidates: { id: number; tmdbId: number }[] =
-      await serviceStatusRepository
-        .createQueryBuilder('serviceStatus')
-        .innerJoin(Media, 'media', 'media.id = serviceStatus.mediaId')
-        .select('serviceStatus.id', 'id')
-        .addSelect('media.tmdbId', 'tmdbId')
-        .where('serviceStatus.serviceId = :serviceId', { serviceId })
-        .andWhere('serviceStatus.serviceType = :serviceType', { serviceType })
-        .andWhere('serviceStatus.status NOT IN (:...exempt)', {
-          exempt: [MediaStatus.UNKNOWN, MediaStatus.DELETED],
-        })
-        .andWhere('media.mediaType = :mediaType', { mediaType })
-        .getRawMany();
+    const candidates: {
+      id: number;
+      mediaId: number;
+      tmdbId: number;
+      tvdbId?: number;
+      status: MediaStatus;
+      seasonStatuses?: Record<number, MediaStatus> | string | null;
+    }[] = await serviceStatusRepository
+      .createQueryBuilder('serviceStatus')
+      .innerJoin(Media, 'media', 'media.id = serviceStatus.mediaId')
+      .select('serviceStatus.id', 'id')
+      .addSelect('serviceStatus.mediaId', 'mediaId')
+      .addSelect('media.tmdbId', 'tmdbId')
+      .addSelect('media.tvdbId', 'tvdbId')
+      .addSelect('serviceStatus.status', 'status')
+      .addSelect('serviceStatus.seasonStatuses', 'seasonStatuses')
+      .where('serviceStatus.serviceId = :serviceId', { serviceId })
+      .andWhere('serviceStatus.serviceType = :serviceType', { serviceType })
+      .andWhere('serviceStatus.status != :deleted', {
+        deleted: MediaStatus.DELETED,
+      })
+      .andWhere('media.mediaType = :mediaType', { mediaType })
+      .getRawMany();
 
-    const staleIds = candidates
-      .filter((candidate) => !seenTmdbIds.has(Number(candidate.tmdbId)))
-      .map((candidate) => candidate.id);
-
-    const chunkSize = 500;
-    for (let i = 0; i < staleIds.length; i += chunkSize) {
-      await serviceStatusRepository
-        .createQueryBuilder()
-        .update()
-        .set(
-          clearSeasonStatuses
-            ? { status: MediaStatus.UNKNOWN, seasonStatuses: null }
-            : { status: MediaStatus.UNKNOWN }
+    let staleCount = 0;
+    for (const candidate of candidates) {
+      let seasonStatuses = candidate.seasonStatuses;
+      if (typeof seasonStatuses === 'string') {
+        try {
+          seasonStatuses = JSON.parse(seasonStatuses);
+        } catch {
+          seasonStatuses = null;
+        }
+      }
+      if (
+        Number(candidate.status) === MediaStatus.UNKNOWN &&
+        !Object.values(seasonStatuses ?? {}).some(
+          (status) =>
+            Number(status) !== MediaStatus.UNKNOWN &&
+            Number(status) !== MediaStatus.DELETED
         )
-        .whereInIds(staleIds.slice(i, i + chunkSize))
-        .execute();
+      ) {
+        continue;
+      }
+      if (seenTmdbIds.has(Number(candidate.tmdbId))) continue;
+      const cleaned = await serviceTargetLock.dispatch(
+        serviceTargetKey(serviceType, serviceId),
+        async () => {
+          const target = getSettings()[serviceType].find(
+            (service) => service.id === serviceId
+          );
+          if (!target || !isMultiServiceTarget(target) || !target.syncEnabled) {
+            return false;
+          }
+          if (
+            !(await confirmAbsent(Number(candidate.tmdbId), candidate.tvdbId))
+          ) {
+            return false;
+          }
+
+          await dataSource.transaction(async (manager) => {
+            const requestRepository = manager.getRepository(MediaRequest);
+            const orphanedRequests = await requestRepository
+              .createQueryBuilder('request')
+              .innerJoinAndSelect('request.media', 'media')
+              .leftJoinAndSelect('request.seasons', 'seasons')
+              .leftJoinAndSelect('request.requestedBy', 'requestedBy')
+              .leftJoinAndSelect('request.modifiedBy', 'modifiedBy')
+              .where('request.isServiceRequest = :isServiceRequest', {
+                isServiceRequest: true,
+              })
+              .andWhere('request.serverId = :serviceId', { serviceId })
+              .andWhere('request.type = :mediaType', { mediaType })
+              .andWhere('request.status = :status', {
+                status: MediaRequestStatus.APPROVED,
+              })
+              .andWhere('request.mediaId = :mediaId', {
+                mediaId: Number(candidate.mediaId),
+              })
+              .getMany();
+
+            for (const request of orphanedRequests) {
+              const shouldDecline =
+                mediaType === MediaType.MOVIE ||
+                (request.seasons.length > 0 &&
+                  request.seasons.every((season) => {
+                    const status = seasonStatuses?.[season.seasonNumber];
+                    return (
+                      status !== undefined &&
+                      Number(status) !== MediaStatus.UNKNOWN &&
+                      Number(status) !== MediaStatus.DELETED
+                    );
+                  }));
+              if (!shouldDecline) {
+                continue;
+              }
+              request.status = MediaRequestStatus.DECLINED;
+              await requestRepository.save(request);
+            }
+
+            await manager
+              .getRepository(MediaServiceStatus)
+              .createQueryBuilder()
+              .update()
+              .set(
+                clearSeasonStatuses
+                  ? { status: MediaStatus.DELETED, seasonStatuses: null }
+                  : { status: MediaStatus.DELETED }
+              )
+              .where('id = :id', { id: candidate.id })
+              .execute();
+          });
+          return true;
+        }
+      );
+      if (cleaned) staleCount++;
     }
 
     this.log(
-      `Reset ${staleIds.length} stale service status entries for ${serverName} (${
-        candidates.length - staleIds.length
+      `Reset ${staleCount} stale service status entries for ${serverName} (${
+        candidates.length - staleCount
       } items retained)`,
       'info'
     );

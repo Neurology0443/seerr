@@ -1,9 +1,14 @@
 import RadarrAPI from '@server/api/servarr/radarr';
-import { removeRequestServiceGrants } from '@server/lib/requestServices';
-import { allocateServiceId, hasServiceReferences } from '@server/lib/serviceId';
+import {
+  allocateServiceId,
+  hasActiveServiceRequests,
+  hasServiceReferences,
+  removeServiceTargetReferences,
+} from '@server/lib/serviceId';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
+import { serviceTargetKey, serviceTargetLock } from '@server/utils/requestLock';
 import {
   isMultiServiceTarget,
   normalizeButtonLabel,
@@ -95,57 +100,68 @@ radarrRoutes.post<
 radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
   '/:id',
   async (req, res, next) => {
-    const settings = getSettings();
+    const id = Number(req.params.id);
+    return serviceTargetLock.dispatch(
+      serviceTargetKey('radarr', id),
+      async () => {
+        const settings = getSettings();
 
-    const radarrIndex = settings.radarr.findIndex(
-      (r) => r.id === Number(req.params.id)
+        const radarrIndex = settings.radarr.findIndex((r) => r.id === id);
+
+        if (radarrIndex === -1) {
+          return next({
+            status: '404',
+            message: 'Settings instance not found',
+          });
+        }
+        if (
+          req.body.buttonLabel !== undefined &&
+          req.body.buttonLabel !== null &&
+          typeof req.body.buttonLabel !== 'string'
+        ) {
+          return next({
+            status: 400,
+            message: 'buttonLabel must be a string.',
+          });
+        }
+        const existing = settings.radarr[radarrIndex];
+        const candidate = {
+          ...req.body,
+          id: existing.id,
+          buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
+        } as RadarrSettings;
+        const validationError = validateServiceTargetConfig(candidate);
+        if (validationError)
+          return next({ status: 400, message: validationError });
+        if (
+          (isMultiServiceTarget(existing) !== isMultiServiceTarget(candidate) ||
+            existing.is4k !== candidate.is4k) &&
+          (await hasServiceReferences('radarr', existing.id))
+        ) {
+          return next({
+            status: 409,
+            message:
+              'This server is already referenced and its request role or 4K identity cannot be changed.',
+          });
+        }
+
+        // If we are setting this as the default, clear any previous defaults for the same type first
+        // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
+        // and are the default
+        if (candidate.isDefault) {
+          settings.radarr
+            .filter((radarrInstance) => radarrInstance.is4k === candidate.is4k)
+            .forEach((radarrInstance) => {
+              radarrInstance.isDefault = false;
+            });
+        }
+
+        settings.radarr[radarrIndex] = candidate;
+        await settings.save();
+
+        return res.status(200).json(settings.radarr[radarrIndex]);
+      }
     );
-
-    if (radarrIndex === -1) {
-      return next({ status: '404', message: 'Settings instance not found' });
-    }
-    if (
-      req.body.buttonLabel !== undefined &&
-      req.body.buttonLabel !== null &&
-      typeof req.body.buttonLabel !== 'string'
-    ) {
-      return next({ status: 400, message: 'buttonLabel must be a string.' });
-    }
-    const existing = settings.radarr[radarrIndex];
-    const candidate = {
-      ...req.body,
-      id: existing.id,
-      buttonLabel: normalizeButtonLabel(req.body.buttonLabel),
-    } as RadarrSettings;
-    const validationError = validateServiceTargetConfig(candidate);
-    if (validationError) return next({ status: 400, message: validationError });
-    if (
-      (isMultiServiceTarget(existing) !== isMultiServiceTarget(candidate) ||
-        existing.is4k !== candidate.is4k) &&
-      (await hasServiceReferences('radarr', existing.id))
-    ) {
-      return next({
-        status: 409,
-        message:
-          'This server is already referenced and its request role or 4K identity cannot be changed. Delete and recreate the server instead.',
-      });
-    }
-
-    // If we are setting this as the default, clear any previous defaults for the same type first
-    // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
-    // and are the default
-    if (candidate.isDefault) {
-      settings.radarr
-        .filter((radarrInstance) => radarrInstance.is4k === candidate.is4k)
-        .forEach((radarrInstance) => {
-          radarrInstance.isDefault = false;
-        });
-    }
-
-    settings.radarr[radarrIndex] = candidate;
-    await settings.save();
-
-    return res.status(200).json(settings.radarr[radarrIndex]);
   }
 );
 
@@ -176,22 +192,46 @@ radarrRoutes.get<{ id: string }>('/:id/profiles', async (req, res, next) => {
 });
 
 radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
-  const settings = getSettings();
+  const id = Number(req.params.id);
+  return serviceTargetLock.dispatch(
+    serviceTargetKey('radarr', id),
+    async () => {
+      const settings = getSettings();
 
-  const radarrIndex = settings.radarr.findIndex(
-    (r) => r.id === Number(req.params.id)
+      const radarrIndex = settings.radarr.findIndex((r) => r.id === id);
+
+      if (radarrIndex === -1) {
+        return next({ status: '404', message: 'Settings instance not found' });
+      }
+
+      const existing = settings.radarr[radarrIndex];
+      if (
+        isMultiServiceTarget(existing) &&
+        (await hasActiveServiceRequests('radarr', existing.id))
+      ) {
+        return next({
+          status: 409,
+          message: 'This server is still referenced and cannot be deleted.',
+        });
+      }
+
+      const removed = settings.radarr.splice(radarrIndex, 1);
+      try {
+        await settings.save();
+        if (isMultiServiceTarget(existing)) {
+          await removeServiceTargetReferences('radarr', removed[0].id);
+        }
+      } catch (error) {
+        if (!settings.radarr.some((server) => server.id === removed[0].id)) {
+          settings.radarr.splice(radarrIndex, 0, removed[0]);
+        }
+        await settings.save();
+        throw error;
+      }
+
+      return res.status(200).json(removed[0]);
+    }
   );
-
-  if (radarrIndex === -1) {
-    return next({ status: '404', message: 'Settings instance not found' });
-  }
-
-  const removed = settings.radarr.splice(radarrIndex, 1);
-  await settings.save();
-
-  await removeRequestServiceGrants('radarr', removed[0].id);
-
-  return res.status(200).json(removed[0]);
 });
 
 export default radarrRoutes;

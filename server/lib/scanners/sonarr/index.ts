@@ -19,6 +19,7 @@ import type {
 import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -91,17 +92,22 @@ class SonarrScanner
           this.currentServerTmdbIds = new Set();
 
           const server4k = this.enable4kShow && server.is4k;
-          if (server4k) {
-            this.didScan4k = true;
-          } else {
-            this.didScanStandard = true;
+          const isServiceTarget = isMultiServiceTarget(server);
+          if (!isServiceTarget) {
+            if (server4k) {
+              this.didScan4k = true;
+            } else {
+              this.didScanStandard = true;
+            }
           }
 
           if (this.items.length === 0) {
-            if (server4k) {
-              this.server4kReturnedEmpty = true;
-            } else {
-              this.serverReturnedEmpty = true;
+            if (!isServiceTarget) {
+              if (server4k) {
+                this.server4kReturnedEmpty = true;
+              } else {
+                this.serverReturnedEmpty = true;
+              }
             }
             this.log(
               `Sonarr server ${server.name} returned no series. Orphan cleanup for this profile type will be skipped.`,
@@ -117,6 +123,16 @@ class SonarrScanner
             seenTmdbIds: this.currentServerTmdbIds,
             serverName: server.name,
             clearSeasonStatuses: true,
+            confirmAbsent: async (_tmdbId, tvdbId) => {
+              if (!tvdbId) return undefined;
+              try {
+                const series =
+                  await this.sonarrApi.getLibrarySeriesByTvdbId(tvdbId);
+                return !series.some((item) => item.tvdbId === tvdbId);
+              } catch {
+                return undefined;
+              }
+            },
           });
         } else {
           this.log(`Sync not enabled. Skipping Sonarr server: ${server.name}`);
@@ -128,10 +144,12 @@ class SonarrScanner
       // media that exists on an unscanned server (e.g. separate instances for
       // anime, regional content, or different languages).
       const allStandardScanned = this.servers
-        .filter((s) => !this.enable4kShow || !s.is4k)
+        .filter(
+          (s) => !isMultiServiceTarget(s) && (!this.enable4kShow || !s.is4k)
+        )
         .every((s) => s.syncEnabled);
       const all4kScanned = this.servers
-        .filter((s) => this.enable4kShow && s.is4k)
+        .filter((s) => !isMultiServiceTarget(s) && this.enable4kShow && s.is4k)
         .every((s) => s.syncEnabled);
 
       if (!allStandardScanned) {
@@ -159,10 +177,12 @@ class SonarrScanner
 
   private async processSonarrSeries(sonarrSeries: SonarrSeries) {
     const server4k = this.enable4kShow && this.currentServer.is4k;
-    if (server4k) {
-      this.scanned4kTvdbIds.add(sonarrSeries.tvdbId);
-    } else {
-      this.scannedTvdbIds.add(sonarrSeries.tvdbId);
+    if (!isMultiServiceTarget(this.currentServer)) {
+      if (server4k) {
+        this.scanned4kTvdbIds.add(sonarrSeries.tvdbId);
+      } else {
+        this.scannedTvdbIds.add(sonarrSeries.tvdbId);
+      }
     }
 
     try {
@@ -173,6 +193,10 @@ class SonarrScanner
       const media = await mediaRepository.findOne({
         where: { tvdbId: sonarrSeries.tvdbId },
       });
+
+      if (media?.tmdbId) {
+        this.currentServerTmdbIds.add(media.tmdbId);
+      }
 
       if (!media || !media.tmdbId) {
         tvShow = await this.tmdb.getShowByTvdbIdForScan({
@@ -239,6 +263,7 @@ class SonarrScanner
         externalServiceSlug: sonarrSeries.titleSlug,
         title: sonarrSeries.title,
         is4k: server4k,
+        isServiceTarget: isMultiServiceTarget(this.currentServer),
       });
     } catch (e) {
       this.log('Failed to process Sonarr media', 'error', {
@@ -254,7 +279,9 @@ class SonarrScanner
   ): Promise<boolean> {
     const servers = this.servers.filter(
       (server) =>
-        server.syncEnabled && (this.enable4kShow && server.is4k) === is4k
+        server.syncEnabled &&
+        !isMultiServiceTarget(server) &&
+        (this.enable4kShow && server.is4k) === is4k
     );
 
     for (const server of servers) {

@@ -290,6 +290,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
     const requestedSeasons = (data?.mediaInfo?.requests ?? [])
       .filter(
         (request) =>
+          !request.isServiceRequest &&
           request.is4k === is4k &&
           request.status !== MediaRequestStatus.DECLINED &&
           request.status !== MediaRequestStatus.COMPLETED
@@ -565,16 +566,50 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
         </div>
         <div className="media-title">
           <div className="media-status">
-            {data.mediaInfo?.serviceStatuses?.some(
+            <StatusBadge
+              status={data.mediaInfo?.status}
+              downloadItem={data.mediaInfo?.downloadStatus}
+              title={data.name}
+              inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
+              tmdbId={data.mediaInfo?.tmdbId}
+              mediaType="tv"
+              plexUrl={plexUrl}
+              serviceUrl={data.mediaInfo?.serviceUrl}
+            />
+            {settings.currentSettings.series4kEnabled &&
+              hasPermission(
+                [
+                  Permission.MANAGE_REQUESTS,
+                  Permission.REQUEST_4K,
+                  Permission.REQUEST_4K_TV,
+                ],
+                { type: 'or' }
+              ) && (
+                <StatusBadge
+                  status={data.mediaInfo?.status4k}
+                  downloadItem={data.mediaInfo?.downloadStatus4k}
+                  title={data.name}
+                  is4k
+                  inProgress={
+                    (data.mediaInfo?.downloadStatus4k ?? []).length > 0
+                  }
+                  tmdbId={data.mediaInfo?.tmdbId}
+                  mediaType="tv"
+                  plexUrl={plexUrl4k}
+                  serviceUrl={data.mediaInfo?.serviceUrl4k}
+                />
+              )}
+            {(data.mediaInfo?.serviceStatuses?.some(
               (ss) =>
                 ss.status !== MediaStatus.UNKNOWN &&
                 ss.status !== MediaStatus.DELETED
             ) ||
-            data.mediaInfo?.requests?.some(
-              (request) =>
-                request.isServiceRequest &&
-                request.status === MediaRequestStatus.PENDING
-            ) ? (
+              data.mediaInfo?.requests?.some(
+                (request) =>
+                  request.isServiceRequest &&
+                  (request.status === MediaRequestStatus.PENDING ||
+                    request.status === MediaRequestStatus.APPROVED)
+              )) && (
               <ServiceStatusBadges
                 serviceStatuses={data.mediaInfo.serviceStatuses}
                 requests={data.mediaInfo.requests}
@@ -583,42 +618,6 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 tmdbId={data.mediaInfo.tmdbId}
                 title={data.name}
               />
-            ) : (
-              <>
-                <StatusBadge
-                  status={data.mediaInfo?.status}
-                  downloadItem={data.mediaInfo?.downloadStatus}
-                  title={data.name}
-                  inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
-                  tmdbId={data.mediaInfo?.tmdbId}
-                  mediaType="tv"
-                  plexUrl={plexUrl}
-                  serviceUrl={data.mediaInfo?.serviceUrl}
-                />
-                {settings.currentSettings.series4kEnabled &&
-                  hasPermission(
-                    [
-                      Permission.MANAGE_REQUESTS,
-                      Permission.REQUEST_4K,
-                      Permission.REQUEST_4K_TV,
-                    ],
-                    { type: 'or' }
-                  ) && (
-                    <StatusBadge
-                      status={data.mediaInfo?.status4k}
-                      downloadItem={data.mediaInfo?.downloadStatus4k}
-                      title={data.name}
-                      is4k
-                      inProgress={
-                        (data.mediaInfo?.downloadStatus4k ?? []).length > 0
-                      }
-                      tmdbId={data.mediaInfo?.tmdbId}
-                      mediaType="tv"
-                      plexUrl={plexUrl4k}
-                      serviceUrl={data.mediaInfo?.serviceUrl4k}
-                    />
-                  )}
-              </>
             )}
           </div>
           <h1 data-testid="media-title">
@@ -860,9 +859,11 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 const request = (data.mediaInfo?.requests ?? [])
                   .filter(
                     (r) =>
+                      !r.isServiceRequest &&
                       !!r.seasons.find(
                         (s) => s.seasonNumber === season.seasonNumber
-                      ) && !r.is4k
+                      ) &&
+                      !r.is4k
                   )
                   .sort(
                     (a, b) =>
@@ -872,9 +873,11 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 const request4k = (data.mediaInfo?.requests ?? [])
                   .filter(
                     (r) =>
+                      !r.isServiceRequest &&
                       !!r.seasons.find(
                         (s) => s.seasonNumber === season.seasonNumber
-                      ) && r.is4k
+                      ) &&
+                      r.is4k
                   )
                   .sort(
                     (a, b) =>
@@ -948,38 +951,47 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                             mSeason?.status === MediaStatus.AVAILABLE) && (
                             <>
                               <div className="hidden items-center space-x-1 md:flex">
-                                {(data.mediaInfo?.serviceStatuses ?? []).some(
-                                  (ss) => {
-                                    const st =
-                                      ss.seasonStatuses?.[season.seasonNumber];
-                                    return (
-                                      st !== undefined &&
-                                      st !== MediaStatus.UNKNOWN &&
-                                      st !== MediaStatus.DELETED
-                                    );
-                                  }
-                                ) ? (
-                                  <ServiceStatusBadges
-                                    serviceStatuses={
-                                      data.mediaInfo?.serviceStatuses
-                                    }
-                                    mediaType="tv"
-                                    seasonNumber={season.seasonNumber}
-                                  />
-                                ) : (
-                                  <Badge badgeType="success">
-                                    {intl.formatMessage(
-                                      mSeason?.status === MediaStatus.AVAILABLE
-                                        ? globalMessages.available
-                                        : globalMessages.partiallyavailable
-                                    )}
-                                  </Badge>
-                                )}
+                                <Badge badgeType="success">
+                                  {intl.formatMessage(
+                                    mSeason?.status === MediaStatus.AVAILABLE
+                                      ? globalMessages.available
+                                      : globalMessages.partiallyavailable
+                                  )}
+                                </Badge>
                               </div>
                               <div className="flex md:hidden">
                                 <StatusBadgeMini status={mSeason!.status} />
                               </div>
                             </>
+                          )}
+                          {((data.mediaInfo?.serviceStatuses ?? []).some(
+                            (ss) =>
+                              ss.seasonStatuses?.[season.seasonNumber] !==
+                                undefined &&
+                              ss.seasonStatuses?.[season.seasonNumber] !==
+                                MediaStatus.UNKNOWN &&
+                              ss.seasonStatuses?.[season.seasonNumber] !==
+                                MediaStatus.DELETED
+                          ) ||
+                            data.mediaInfo?.requests?.some(
+                              (serviceRequest) =>
+                                serviceRequest.isServiceRequest &&
+                                (serviceRequest.status ===
+                                  MediaRequestStatus.PENDING ||
+                                  serviceRequest.status ===
+                                    MediaRequestStatus.APPROVED) &&
+                                serviceRequest.seasons.some(
+                                  (requestedSeason) =>
+                                    requestedSeason.seasonNumber ===
+                                    season.seasonNumber
+                                )
+                            )) && (
+                            <ServiceStatusBadges
+                              serviceStatuses={data.mediaInfo?.serviceStatuses}
+                              requests={data.mediaInfo?.requests}
+                              mediaType="tv"
+                              seasonNumber={season.seasonNumber}
+                            />
                           )}
                           {mSeason?.status === MediaStatus.DELETED &&
                             request?.status !== MediaRequestStatus.APPROVED && (

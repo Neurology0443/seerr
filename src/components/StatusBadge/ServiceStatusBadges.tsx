@@ -1,9 +1,11 @@
 import StatusBadge, { getStatusLabel } from '@app/components/StatusBadge';
 import defineMessages from '@app/utils/defineMessages';
+import { getServiceSlotStatus } from '@app/utils/serviceRequestStatus';
 import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type MediaServiceStatus from '@server/entity/MediaServiceStatus';
 import type { ServiceCommonServer } from '@server/interfaces/api/serviceInterfaces';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
@@ -31,24 +33,29 @@ const ServiceStatusBadges = ({
   seasonNumber,
 }: ServiceStatusBadgesProps) => {
   const intl = useIntl();
-  const pendingServiceRequests = (requests ?? []).filter(
+  const activeServiceRequests = (requests ?? []).filter(
     (request) =>
       request.isServiceRequest &&
-      request.status === MediaRequestStatus.PENDING &&
-      seasonNumber === undefined
+      (request.status === MediaRequestStatus.PENDING ||
+        request.status === MediaRequestStatus.APPROVED) &&
+      (seasonNumber === undefined ||
+        request.seasons.some((season) => season.seasonNumber === seasonNumber))
   );
   const { data: services } = useSWR<ServiceCommonServer[]>(
-    serviceStatuses?.length || pendingServiceRequests.length
+    serviceStatuses?.length || activeServiceRequests.length
       ? `/api/v1/service/${mediaType === 'movie' ? 'radarr' : 'sonarr'}`
       : null
   );
 
-  if (!services || (!serviceStatuses?.length && !pendingServiceRequests.length))
+  if (!services || (!serviceStatuses?.length && !activeServiceRequests.length))
     return null;
 
   const items = (serviceStatuses ?? [])
     .map((ss) => {
-      const server = services.find((s) => s.id === ss.serviceId);
+      const server = services.find(
+        (service) =>
+          service.id === ss.serviceId && isMultiServiceTarget(service)
+      );
       if (!server) return null;
       const status =
         seasonNumber !== undefined
@@ -67,15 +74,24 @@ const ServiceStatusBadges = ({
     })
     .filter((x): x is NonNullable<typeof x> => x !== null);
 
-  for (const request of pendingServiceRequests) {
+  for (const request of activeServiceRequests) {
     if (items.some(({ server }) => server.id === request.serverId)) {
       continue;
     }
-    const server = services.find((s) => s.id === request.serverId);
+    const server = services.find(
+      (service) =>
+        service.id === request.serverId && isMultiServiceTarget(service)
+    );
     if (!server) {
       continue;
     }
-    items.push({ server, status: MediaStatus.PENDING, downloadItem: [] });
+    const { status, downloadItem = [] } = getServiceSlotStatus(
+      request,
+      seasonNumber
+    );
+    if (status === MediaStatus.PENDING || status === MediaStatus.PROCESSING) {
+      items.push({ server, status, downloadItem });
+    }
   }
 
   if (!items.length) return null;

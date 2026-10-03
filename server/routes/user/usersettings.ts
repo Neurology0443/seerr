@@ -21,6 +21,8 @@ import {
   isOwnProfile,
   isOwnProfileOrAdmin,
 } from '@server/utils/profileMiddleware';
+import { withServiceTargetLocks } from '@server/utils/requestLock';
+import { isMultiServiceTarget } from '@server/utils/serviceTarget';
 import { Router } from 'express';
 import net from 'net';
 import { Not } from 'typeorm';
@@ -773,20 +775,67 @@ userSettingsRoutes.post<
           message: 'You do not have permission to grant this level of access',
         });
       }
-      user.permissions = req.body.permissions;
-
-      if (req.body.requestServices !== undefined) {
-        user.requestServices = req.body.requestServices.filter((s) =>
-          /^(radarr|sonarr):\d+$/.test(s)
-        );
+      const grants = req.body.requestServices;
+      if (grants !== undefined) {
+        if (!Array.isArray(grants)) {
+          return next({ status: 400, message: 'Invalid request services.' });
+        }
       }
+      const previousGrants = user.requestServices ?? [];
+      const nextGrants = grants ?? previousGrants;
+      const parseGrant = (grant: string) => {
+        const match = /^(radarr|sonarr):(\d+)$/.exec(grant);
+        return match
+          ? { type: match[1] as 'radarr' | 'sonarr', id: Number(match[2]) }
+          : undefined;
+      };
+      const previousTargets = previousGrants
+        .map(parseGrant)
+        .filter((target): target is NonNullable<typeof target> => !!target);
+      const parsedNextTargets = nextGrants.map(parseGrant);
+      if (grants !== undefined && parsedNextTargets.some((target) => !target)) {
+        return next({ status: 400, message: 'Invalid request services.' });
+      }
+      const nextTargets = parsedNextTargets.filter(
+        (target): target is NonNullable<typeof target> => !!target
+      );
 
-      await userRepository.save(user);
+      return await withServiceTargetLocks(
+        [...previousTargets, ...nextTargets],
+        async () => {
+          const lockedUser = await userRepository.findOneOrFail({
+            where: { id: user.id },
+          });
+          const settings = getSettings();
+          const validGrants =
+            grants === undefined ||
+            nextTargets.every((target) => {
+              const configured = settings[target.type].find(
+                (service) => service.id === target.id
+              );
+              return (
+                configured &&
+                isMultiServiceTarget(configured) &&
+                !configured.isDefault &&
+                configured.syncEnabled
+              );
+            });
+          if (!validGrants) {
+            return next({ status: 400, message: 'Invalid request services.' });
+          }
+          if (grants !== undefined) {
+            lockedUser.requestServices = [...new Set(grants)];
+          }
+          lockedUser.permissions = req.body.permissions;
 
-      return res.status(200).json({
-        permissions: user.permissions,
-        requestServices: user.requestServices ?? [],
-      });
+          await userRepository.save(lockedUser);
+
+          return res.status(200).json({
+            permissions: lockedUser.permissions,
+            requestServices: lockedUser.requestServices ?? [],
+          });
+        }
+      );
     } catch (e) {
       next({ status: 500, message: e.message });
     }

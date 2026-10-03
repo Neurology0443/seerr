@@ -101,4 +101,14 @@ describe('service ID allocation', () => {
     await requestWithServer(MediaType.MOVIE, 12);
     assert.ok((await allocateServiceId('radarr')) >= 13);
   });
+
+  it('allocates distinct IDs to concurrent creations in each namespace', async () => {
+    const [radarrIds, sonarrIds] = await Promise.all([
+      Promise.all(Array.from({ length: 5 }, () => allocateServiceId('radarr'))),
+      Promise.all(Array.from({ length: 5 }, () => allocateServiceId('sonarr'))),
+    ]);
+
+    assert.equal(new Set(radarrIds).size, radarrIds.length);
+    assert.equal(new Set(sonarrIds).size, sonarrIds.length);
+  });
 });

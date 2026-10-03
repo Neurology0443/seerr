@@ -108,8 +108,7 @@ const AdvancedRequester = ({
       : null
   );
   const selectableServers = useMemo(
-    () =>
-      getSelectableServers(data, serverFixed, defaultOverrides?.server),
+    () => getSelectableServers(data, serverFixed, defaultOverrides?.server),
     [data, serverFixed, defaultOverrides?.server]
   );
   const [selectedProfile, setSelectedProfile] = useState<number>(
@@ -521,63 +520,60 @@ const AdvancedRequester = ({
                 </select>
               </div>
             )}
-            {!serverFixed &&
-              (isValidating ||
-                !serverData ||
-                serverData.rootFolders.length > 1) && (
-                <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
-                  <label htmlFor="folder">
-                    {intl.formatMessage(messages.rootfolder)}
-                  </label>
-                  <select
-                    id="folder"
-                    name="folder"
-                    value={selectedFolder}
-                    onChange={(e) => setSelectedFolder(e.target.value)}
-                    onBlur={(e) => setSelectedFolder(e.target.value)}
-                    className="border-gray-700 bg-gray-800"
-                    disabled={isValidating || !serverData}
-                  >
-                    {(isValidating || !serverData) && (
-                      <option value="">
-                        {intl.formatMessage(globalMessages.loading)}
-                      </option>
-                    )}
-                    {!isValidating &&
-                      serverData &&
-                      serverData.rootFolders.map((folder) => (
-                        <option
-                          key={`folder-list${folder.id}`}
-                          value={folder.path}
-                        >
-                          {isAnime &&
-                          serverData.server.activeAnimeDirectory === folder.path
+            {(isValidating ||
+              !serverData ||
+              serverData.rootFolders.length > 1) && (
+              <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
+                <label htmlFor="folder">
+                  {intl.formatMessage(messages.rootfolder)}
+                </label>
+                <select
+                  id="folder"
+                  name="folder"
+                  value={selectedFolder}
+                  onChange={(e) => setSelectedFolder(e.target.value)}
+                  onBlur={(e) => setSelectedFolder(e.target.value)}
+                  className="border-gray-700 bg-gray-800"
+                  disabled={isValidating || !serverData}
+                >
+                  {(isValidating || !serverData) && (
+                    <option value="">
+                      {intl.formatMessage(globalMessages.loading)}
+                    </option>
+                  )}
+                  {!isValidating &&
+                    serverData &&
+                    serverData.rootFolders.map((folder) => (
+                      <option
+                        key={`folder-list${folder.id}`}
+                        value={folder.path}
+                      >
+                        {isAnime &&
+                        serverData.server.activeAnimeDirectory === folder.path
+                          ? intl.formatMessage(messages.default, {
+                              name: intl.formatMessage(messages.folder, {
+                                path: folder.path,
+                                space: formatBytes(folder.freeSpace ?? 0),
+                              }),
+                            })
+                          : !isAnime &&
+                              serverData.server.activeDirectory === folder.path
                             ? intl.formatMessage(messages.default, {
                                 name: intl.formatMessage(messages.folder, {
                                   path: folder.path,
                                   space: formatBytes(folder.freeSpace ?? 0),
                                 }),
                               })
-                            : !isAnime &&
-                                serverData.server.activeDirectory ===
-                                  folder.path
-                              ? intl.formatMessage(messages.default, {
-                                  name: intl.formatMessage(messages.folder, {
-                                    path: folder.path,
-                                    space: formatBytes(folder.freeSpace ?? 0),
-                                  }),
-                                })
-                              : intl.formatMessage(messages.folder, {
-                                  path: folder.path,
-                                  space: formatBytes(folder.freeSpace ?? 0),
-                                })}
-                        </option>
-                      ))}
-                  </select>
-                </div>
-              )}
-            {!serverFixed &&
-              type === 'tv' &&
+                            : intl.formatMessage(messages.folder, {
+                                path: folder.path,
+                                space: formatBytes(folder.freeSpace ?? 0),
+                              })}
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
+            {type === 'tv' &&
               (isValidating ||
                 !serverData ||
                 (serverData.languageProfiles ?? []).length > 1) && (
