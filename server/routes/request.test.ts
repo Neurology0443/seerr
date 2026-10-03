@@ -950,9 +950,9 @@ describe('asynchronous *Arr failures', () => {
 
     const approved = await admin.post(`/request/${mediaRequest.id}/approve`);
     assert.strictEqual(approved.status, 200);
-    const persistedRequest = await getRepository(
-      MediaRequest
-    ).findOneByOrFail({ id: mediaRequest.id });
+    const persistedRequest = await getRepository(MediaRequest).findOneByOrFail({
+      id: mediaRequest.id,
+    });
     const persistedMedia = await getRepository(Media).findOneByOrFail({
       id: mediaRequest.media.id,
     });
