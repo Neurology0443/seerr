@@ -12,18 +12,9 @@ describe('0009_add_independent_request_destination', () => {
 
     const migrated = migrateIndependentDestinations(settings);
 
-    assert.strictEqual(
-      migrated.radarr[0].independentRequestDestination,
-      false
-    );
-    assert.strictEqual(
-      migrated.radarr[1].independentRequestDestination,
-      true
-    );
-    assert.strictEqual(
-      migrated.sonarr[0].independentRequestDestination,
-      false
-    );
+    assert.strictEqual(migrated.radarr[0].independentRequestDestination, false);
+    assert.strictEqual(migrated.radarr[1].independentRequestDestination, true);
+    assert.strictEqual(migrated.sonarr[0].independentRequestDestination, false);
   });
 
   it('records its ID and is idempotent on a second execution', () => {

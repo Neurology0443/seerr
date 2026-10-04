@@ -9,10 +9,7 @@ import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSea
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
-import type {
-  RadarrSettings,
-  SonarrSettings,
-} from '@server/lib/settings';
+import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
 import type { Express } from 'express';
@@ -233,12 +230,10 @@ for (const kind of ['radarr', 'sonarr'] as const) {
       setServers(kind, [serverFixture(kind, 8)]);
       await seedHistoricalMedia(kind, 8);
 
-      const independentChange = await request(app)
-        .put(`/${kind}/8`)
-        .send({
-          independentRequestDestination: true,
-          syncEnabled: true,
-        });
+      const independentChange = await request(app).put(`/${kind}/8`).send({
+        independentRequestDestination: true,
+        syncEnabled: true,
+      });
       const is4kChange = await request(app)
         .put(`/${kind}/8`)
         .send({ is4k: true });

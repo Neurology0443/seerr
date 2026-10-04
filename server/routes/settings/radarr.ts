@@ -123,8 +123,7 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
     ) {
       return next({
         status: 400,
-        message:
-          'Independent request destinations require sync to be enabled.',
+        message: 'Independent request destinations require sync to be enabled.',
       });
     }
 
@@ -153,9 +152,7 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
     // and are the default
     if (updatedRadarr.isDefault) {
       settings.radarr
-        .filter(
-          (radarrInstance) => radarrInstance.is4k === updatedRadarr.is4k
-        )
+        .filter((radarrInstance) => radarrInstance.is4k === updatedRadarr.is4k)
         .forEach((radarrInstance) => {
           radarrInstance.isDefault = false;
         });

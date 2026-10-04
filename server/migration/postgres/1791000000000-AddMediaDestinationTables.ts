@@ -1,8 +1,6 @@
 import type { MigrationInterface, QueryRunner } from 'typeorm';
 
-export class AddMediaDestinationTables1791000000000
-  implements MigrationInterface
-{
+export class AddMediaDestinationTables1791000000000 implements MigrationInterface {
   name = 'AddMediaDestinationTables1791000000000';
 
   public async up(queryRunner: QueryRunner): Promise<void> {

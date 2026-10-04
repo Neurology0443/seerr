@@ -138,7 +138,8 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
     if (updatedSonarr.is4k !== currentSonarr.is4k) {
       return next({
         status: 409,
-        message: 'The 4K role cannot change after this server ID has been used.',
+        message:
+          'The 4K role cannot change after this server ID has been used.',
       });
     }
   }
@@ -148,9 +149,7 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
   // and are the default
   if (updatedSonarr.isDefault) {
     settings.sonarr
-      .filter(
-        (sonarrInstance) => sonarrInstance.is4k === updatedSonarr.is4k
-      )
+      .filter((sonarrInstance) => sonarrInstance.is4k === updatedSonarr.is4k)
       .forEach((sonarrInstance) => {
         sonarrInstance.isDefault = false;
       });
