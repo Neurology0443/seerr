@@ -1,6 +1,15 @@
 import SonarrAPI from '@server/api/servarr/sonarr';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import {
+  allocateDvrServerId,
+  hasActiveDvrRequests,
+  isDvrServerHistoricallyUsed,
+} from '@server/lib/settings/dvrId';
+import {
+  hasIndependentRequestDestination,
+  hasValidIndependentRequestDestination,
+} from '@server/lib/settings/dvrValidation';
 import logger from '@server/logger';
 import { Router } from 'express';
 
@@ -12,19 +21,40 @@ sonarrRoutes.get('/', (_req, res) => {
   res.status(200).json(settings.sonarr);
 });
 
-sonarrRoutes.post('/', async (req, res) => {
+sonarrRoutes.post('/', async (req, res, next) => {
+  if (!hasValidIndependentRequestDestination(req.body)) {
+    return next({
+      status: 400,
+      message: 'Independent request destination must be a boolean.',
+    });
+  }
+
   const settings = getSettings();
 
-  const newSonarr = req.body as SonarrSettings;
-  const lastItem = settings.sonarr[settings.sonarr.length - 1];
-  newSonarr.id = lastItem ? lastItem.id + 1 : 0;
+  const newSonarr = {
+    ...req.body,
+    independentRequestDestination:
+      req.body.independentRequestDestination ?? false,
+  } as SonarrSettings;
+
+  if (
+    newSonarr.independentRequestDestination === true &&
+    newSonarr.syncEnabled !== true
+  ) {
+    return next({
+      status: 400,
+      message: 'Independent request destinations require sync to be enabled.',
+    });
+  }
+
+  newSonarr.id = await allocateDvrServerId('sonarr');
 
   // If we are setting this as the default, clear any previous defaults for the same type first
   // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
   // and are the default
-  if (req.body.isDefault) {
+  if (newSonarr.isDefault) {
     settings.sonarr
-      .filter((sonarrInstance) => sonarrInstance.is4k === req.body.is4k)
+      .filter((sonarrInstance) => sonarrInstance.is4k === newSonarr.is4k)
       .forEach((sonarrInstance) => {
         sonarrInstance.isDefault = false;
       });
@@ -73,7 +103,14 @@ sonarrRoutes.post('/test', async (req, res, next) => {
   }
 });
 
-sonarrRoutes.put<{ id: string }>('/:id', async (req, res) => {
+sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
+  if (!hasValidIndependentRequestDestination(req.body)) {
+    return next({
+      status: 400,
+      message: 'Independent request destination must be a boolean.',
+    });
+  }
+
   const settings = getSettings();
 
   const sonarrIndex = settings.sonarr.findIndex(
@@ -81,32 +118,73 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res) => {
   );
 
   if (sonarrIndex === -1) {
-    return res
-      .status(404)
-      .json({ status: '404', message: 'Settings instance not found' });
+    return next({ status: 404, message: 'Settings instance not found' });
+  }
+
+  const currentSonarr = settings.sonarr[sonarrIndex];
+  const currentIndependentRequestDestination =
+    currentSonarr.independentRequestDestination ?? false;
+  const updatedSonarr = {
+    ...req.body,
+    independentRequestDestination: hasIndependentRequestDestination(req.body)
+      ? req.body.independentRequestDestination
+      : currentIndependentRequestDestination,
+    id: currentSonarr.id,
+  } as SonarrSettings;
+
+  if (
+    updatedSonarr.independentRequestDestination === true &&
+    updatedSonarr.syncEnabled !== true
+  ) {
+    return next({
+      status: 400,
+      message: 'Independent request destinations require sync to be enabled.',
+    });
+  }
+
+  const independentRoleChanged =
+    updatedSonarr.independentRequestDestination !==
+    currentIndependentRequestDestination;
+  const is4kRoleChanged = updatedSonarr.is4k !== currentSonarr.is4k;
+
+  if (
+    (independentRoleChanged || is4kRoleChanged) &&
+    (await isDvrServerHistoricallyUsed('sonarr', currentSonarr.id))
+  ) {
+    if (independentRoleChanged) {
+      return next({
+        status: 409,
+        message:
+          'The independent destination role cannot change after this server ID has been used.',
+      });
+    }
+    if (is4kRoleChanged) {
+      return next({
+        status: 409,
+        message:
+          'The 4K role cannot change after this server ID has been used.',
+      });
+    }
   }
 
   // If we are setting this as the default, clear any previous defaults for the same type first
   // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
   // and are the default
-  if (req.body.isDefault) {
+  if (updatedSonarr.isDefault) {
     settings.sonarr
-      .filter((sonarrInstance) => sonarrInstance.is4k === req.body.is4k)
+      .filter((sonarrInstance) => sonarrInstance.is4k === updatedSonarr.is4k)
       .forEach((sonarrInstance) => {
         sonarrInstance.isDefault = false;
       });
   }
 
-  settings.sonarr[sonarrIndex] = {
-    ...req.body,
-    id: Number(req.params.id),
-  } as SonarrSettings;
+  settings.sonarr[sonarrIndex] = updatedSonarr;
   await settings.save();
 
   return res.status(200).json(settings.sonarr[sonarrIndex]);
 });
 
-sonarrRoutes.delete<{ id: string }>('/:id', async (req, res) => {
+sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   const settings = getSettings();
 
   const sonarrIndex = settings.sonarr.findIndex(
@@ -114,9 +192,15 @@ sonarrRoutes.delete<{ id: string }>('/:id', async (req, res) => {
   );
 
   if (sonarrIndex === -1) {
-    return res
-      .status(404)
-      .json({ status: '404', message: 'Settings instance not found' });
+    return next({ status: 404, message: 'Settings instance not found' });
+  }
+
+  const serverId = settings.sonarr[sonarrIndex].id;
+  if (await hasActiveDvrRequests('sonarr', serverId)) {
+    return next({
+      status: 409,
+      message: 'A server with active requests cannot be deleted.',
+    });
   }
 
   const removed = settings.sonarr.splice(sonarrIndex, 1);
