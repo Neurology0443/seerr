@@ -98,10 +98,20 @@ const setServers = (kind: DvrKind, servers: DvrSettings[]) => {
 const getServers = (kind: DvrKind): DvrSettings[] =>
   kind === 'radarr' ? getSettings().radarr : getSettings().sonarr;
 
-const withoutIndependentFlag = (server: DvrSettings) => {
+const serverPayload = (
+  server: DvrSettings,
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> => {
+  // IDs are path parameters for PUT and are assigned by the backend for POST.
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { independentRequestDestination, ...payload } = server;
-  return payload;
+  const { id, ...payload } = server;
+  return { ...payload, ...overrides };
+};
+
+const withoutIndependentFlag = (payload: Record<string, unknown>) => {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { independentRequestDestination, ...remaining } = payload;
+  return remaining;
 };
 
 const mockSettingsSave = (t: TestContext) =>
@@ -154,7 +164,7 @@ for (const kind of ['radarr', 'sonarr'] as const) {
       mockSettingsSave(t);
       const response = await request(app)
         .post(`/${kind}`)
-        .send(withoutIndependentFlag(serverFixture(kind, 999)));
+        .send(withoutIndependentFlag(serverPayload(serverFixture(kind, 999))));
 
       assert.strictEqual(response.status, 201);
       assert.strictEqual(response.body.id, 0);
@@ -166,7 +176,7 @@ for (const kind of ['radarr', 'sonarr'] as const) {
       const response = await request(app)
         .post(`/${kind}`)
         .send(
-          serverFixture(kind, 999, {
+          serverPayload(serverFixture(kind, 999), {
             independentRequestDestination: true,
             syncEnabled: false,
           })
@@ -177,19 +187,36 @@ for (const kind of ['radarr', 'sonarr'] as const) {
       assert.strictEqual(getServers(kind).length, 0);
     });
 
+    for (const invalidValue of ['true', null]) {
+      it(`rejects POST independent value ${String(invalidValue)} before allocating`, async (t) => {
+        mockSettingsSave(t);
+        const response = await request(app)
+          .post(`/${kind}`)
+          .send(
+            serverPayload(serverFixture(kind, 999), {
+              independentRequestDestination: invalidValue,
+            })
+          );
+
+        assert.strictEqual(response.status, 400);
+        assert.strictEqual(getSettings().dvrIdCounters[kind], 0);
+        assert.strictEqual(getServers(kind).length, 0);
+      });
+    }
+
     it('accepts independent POST with sync and native POST without sync', async (t) => {
       mockSettingsSave(t);
       const independent = await request(app)
         .post(`/${kind}`)
         .send(
-          serverFixture(kind, 999, {
+          serverPayload(serverFixture(kind, 999), {
             independentRequestDestination: true,
             syncEnabled: true,
           })
         );
       const native = await request(app)
         .post(`/${kind}`)
-        .send(serverFixture(kind, 999));
+        .send(serverPayload(serverFixture(kind, 999)));
 
       assert.strictEqual(independent.status, 201);
       assert.strictEqual(native.status, 201);
@@ -209,42 +236,118 @@ for (const kind of ['radarr', 'sonarr'] as const) {
 
     it('preserves the independent flag and ID when PUT omits it', async (t) => {
       mockSettingsSave(t);
-      setServers(kind, [
-        serverFixture(kind, 7, {
-          independentRequestDestination: true,
-          syncEnabled: true,
-        }),
-      ]);
+      const currentServer = serverFixture(kind, 7, {
+        independentRequestDestination: true,
+        syncEnabled: true,
+      });
+      setServers(kind, [currentServer]);
 
       const response = await request(app)
         .put(`/${kind}/7`)
-        .send({ name: 'renamed' });
+        .send(
+          withoutIndependentFlag(
+            serverPayload(currentServer, { name: 'renamed' })
+          )
+        );
 
       assert.strictEqual(response.status, 200);
       assert.strictEqual(response.body.id, 7);
       assert.strictEqual(response.body.independentRequestDestination, true);
     });
 
+    if (kind === 'sonarr') {
+      it('does not restore an optional field omitted from a complete PUT', async (t) => {
+        mockSettingsSave(t);
+        const currentServer = serverFixture(kind, 13, {
+          activeAnimeProfileId: 42,
+        } as Partial<SonarrSettings>);
+        setServers(kind, [currentServer]);
+        const payload = serverPayload(currentServer);
+        delete payload.activeAnimeProfileId;
+
+        const response = await request(app).put(`/${kind}/13`).send(payload);
+
+        assert.strictEqual(response.status, 200);
+        assert.ok(!('activeAnimeProfileId' in response.body));
+        assert.ok(!('activeAnimeProfileId' in getServers(kind)[0]));
+      });
+    }
+
+    it('accepts a valid boolean independent value on PUT', async (t) => {
+      mockSettingsSave(t);
+      const currentServer = serverFixture(kind, 11);
+      setServers(kind, [currentServer]);
+
+      const response = await request(app)
+        .put(`/${kind}/11`)
+        .send(
+          serverPayload(currentServer, {
+            independentRequestDestination: true,
+            syncEnabled: true,
+          })
+        );
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(response.body.id, 11);
+      assert.strictEqual(response.body.independentRequestDestination, true);
+    });
+
+    for (const invalidValue of ['false', null]) {
+      it(`rejects PUT independent value ${String(invalidValue)} without mutation`, async (t) => {
+        const save = mockSettingsSave(t);
+        const currentServer = serverFixture(kind, 12);
+        setServers(kind, [currentServer]);
+
+        const response = await request(app)
+          .put(`/${kind}/12`)
+          .send(
+            serverPayload(currentServer, {
+              independentRequestDestination: invalidValue,
+            })
+          );
+
+        assert.strictEqual(response.status, 400);
+        assert.deepStrictEqual(getServers(kind), [currentServer]);
+        assert.strictEqual(getServers(kind)[0].id, 12);
+        assert.strictEqual(save.mock.callCount(), 0);
+      });
+    }
+
     it('blocks role changes after historical use but allows technical edits', async (t) => {
       mockSettingsSave(t);
-      setServers(kind, [serverFixture(kind, 8)]);
+      const currentServer = serverFixture(kind, 8);
+      setServers(kind, [currentServer]);
       await seedHistoricalMedia(kind, 8);
+      const historicalRequestLookup = t.mock.method(
+        getRepository(MediaRequest),
+        'existsBy'
+      );
 
-      const independentChange = await request(app).put(`/${kind}/8`).send({
-        independentRequestDestination: true,
-        syncEnabled: true,
-      });
+      const independentChange = await request(app)
+        .put(`/${kind}/8`)
+        .send(
+          serverPayload(currentServer, {
+            independentRequestDestination: true,
+            syncEnabled: true,
+          })
+        );
       const is4kChange = await request(app)
         .put(`/${kind}/8`)
-        .send({ is4k: true });
+        .send(serverPayload(currentServer, { is4k: true }));
+      const roleLookupCount = historicalRequestLookup.mock.callCount();
       const technicalChange = await request(app)
         .put(`/${kind}/8`)
-        .send({ hostname: 'new-host' });
+        .send(serverPayload(currentServer, { hostname: 'new-host' }));
 
       assert.strictEqual(independentChange.status, 409);
       assert.strictEqual(is4kChange.status, 409);
+      assert.strictEqual(roleLookupCount, 2);
       assert.strictEqual(technicalChange.status, 200);
       assert.strictEqual(technicalChange.body.hostname, 'new-host');
+      assert.strictEqual(
+        historicalRequestLookup.mock.callCount(),
+        roleLookupCount
+      );
     });
 
     for (const status of [

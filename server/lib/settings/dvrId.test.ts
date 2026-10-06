@@ -5,6 +5,7 @@ import { beforeEach, describe, it } from 'node:test';
 import { MediaRequestStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
 import type { RadarrSettings } from '@server/lib/settings';
@@ -61,6 +62,17 @@ async function seedRequest(
     })
     .callListeners(false)
     .execute();
+}
+
+async function seedDestination(
+  mediaType: MediaType,
+  serverId: number,
+  tmdbId: number
+): Promise<void> {
+  const media = await seedMedia(mediaType, tmdbId);
+  await getRepository(MediaDestinationStatus).save(
+    new MediaDestinationStatus({ mediaId: media.id, serverId })
+  );
 }
 
 describe('allocateDvrServerId', () => {
@@ -122,6 +134,27 @@ describe('allocateDvrServerId', () => {
   it('keeps high history from the other media type isolated', async (t) => {
     await mockSettingsSave(t);
     await seedMedia(MediaType.MOVIE, 30001, 90, 91);
+
+    assert.strictEqual(await allocateDvrServerId('sonarr'), 0);
+  });
+
+  it('bootstraps Radarr from Movie destination history', async (t) => {
+    await mockSettingsSave(t);
+    await seedDestination(MediaType.MOVIE, 80, 40001);
+
+    assert.strictEqual(await allocateDvrServerId('radarr'), 81);
+  });
+
+  it('bootstraps Sonarr from TV destination history', async (t) => {
+    await mockSettingsSave(t);
+    await seedDestination(MediaType.TV, 90, 40002);
+
+    assert.strictEqual(await allocateDvrServerId('sonarr'), 91);
+  });
+
+  it('keeps Movie destination history isolated from Sonarr', async (t) => {
+    await mockSettingsSave(t);
+    await seedDestination(MediaType.MOVIE, 100, 40003);
 
     assert.strictEqual(await allocateDvrServerId('sonarr'), 0);
   });

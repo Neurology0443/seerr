@@ -28,22 +28,30 @@ export const allocateDvrServerId = async (kind: DvrKind): Promise<number> =>
     const settings = getSettings();
     const mediaType = mediaTypeForKind(kind);
 
-    const [requestResult, serviceResult] = await Promise.all([
-      getRepository(MediaRequest)
-        .createQueryBuilder('request')
-        .select('MAX(request.serverId)', 'maximum')
-        .where('request.type = :mediaType', { mediaType })
-        .getRawOne<{ maximum: number | string | null }>(),
-      getRepository(Media)
-        .createQueryBuilder('media')
-        .select('MAX(media.serviceId)', 'serviceMaximum')
-        .addSelect('MAX(media.serviceId4k)', 'service4kMaximum')
-        .where('media.mediaType = :mediaType', { mediaType })
-        .getRawOne<{
-          serviceMaximum: number | string | null;
-          service4kMaximum: number | string | null;
-        }>(),
-    ]);
+    const [requestResult, serviceResult, destinationResult] = await Promise.all(
+      [
+        getRepository(MediaRequest)
+          .createQueryBuilder('request')
+          .select('MAX(request.serverId)', 'maximum')
+          .where('request.type = :mediaType', { mediaType })
+          .getRawOne<{ maximum: number | string | null }>(),
+        getRepository(Media)
+          .createQueryBuilder('media')
+          .select('MAX(media.serviceId)', 'serviceMaximum')
+          .addSelect('MAX(media.serviceId4k)', 'service4kMaximum')
+          .where('media.mediaType = :mediaType', { mediaType })
+          .getRawOne<{
+            serviceMaximum: number | string | null;
+            service4kMaximum: number | string | null;
+          }>(),
+        getRepository(MediaDestinationStatus)
+          .createQueryBuilder('destination')
+          .select('MAX(destination.serverId)', 'maximum')
+          .innerJoin('destination.media', 'media')
+          .where('media.mediaType = :mediaType', { mediaType })
+          .getRawOne<{ maximum: number | string | null }>(),
+      ]
+    );
 
     const configuredMaximum = settings[kind].reduce(
       (maximum, server) => Math.max(maximum, server.id),
@@ -54,7 +62,8 @@ export const allocateDvrServerId = async (kind: DvrKind): Promise<number> =>
       configuredMaximum + 1,
       toMaximum(requestResult?.maximum) + 1,
       toMaximum(serviceResult?.serviceMaximum) + 1,
-      toMaximum(serviceResult?.service4kMaximum) + 1
+      toMaximum(serviceResult?.service4kMaximum) + 1,
+      toMaximum(destinationResult?.maximum) + 1
     );
 
     settings.dvrIdCounters[kind] = id + 1;

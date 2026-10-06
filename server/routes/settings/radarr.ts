@@ -6,6 +6,10 @@ import {
   hasActiveDvrRequests,
   isDvrServerHistoricallyUsed,
 } from '@server/lib/settings/dvrId';
+import {
+  hasIndependentRequestDestination,
+  hasValidIndependentRequestDestination,
+} from '@server/lib/settings/dvrValidation';
 import logger from '@server/logger';
 import { Router } from 'express';
 
@@ -18,6 +22,13 @@ radarrRoutes.get('/', (_req, res) => {
 });
 
 radarrRoutes.post('/', async (req, res, next) => {
+  if (!hasValidIndependentRequestDestination(req.body)) {
+    return next({
+      status: 400,
+      message: 'Independent request destination must be a boolean.',
+    });
+  }
+
   const settings = getSettings();
 
   const newRadarr = {
@@ -96,6 +107,13 @@ radarrRoutes.post<
 radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
   '/:id',
   async (req, res, next) => {
+    if (!hasValidIndependentRequestDestination(req.body)) {
+      return next({
+        status: 400,
+        message: 'Independent request destination must be a boolean.',
+      });
+    }
+
     const settings = getSettings();
 
     const radarrIndex = settings.radarr.findIndex(
@@ -107,13 +125,13 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
     }
 
     const currentRadarr = settings.radarr[radarrIndex];
+    const currentIndependentRequestDestination =
+      currentRadarr.independentRequestDestination ?? false;
     const updatedRadarr = {
-      ...currentRadarr,
       ...req.body,
-      independentRequestDestination:
-        req.body.independentRequestDestination ??
-        currentRadarr.independentRequestDestination ??
-        false,
+      independentRequestDestination: hasIndependentRequestDestination(req.body)
+        ? req.body.independentRequestDestination
+        : currentIndependentRequestDestination,
       id: currentRadarr.id,
     } as RadarrSettings;
 
@@ -127,18 +145,23 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
       });
     }
 
-    if (await isDvrServerHistoricallyUsed('radarr', currentRadarr.id)) {
-      if (
-        updatedRadarr.independentRequestDestination !==
-        (currentRadarr.independentRequestDestination ?? false)
-      ) {
+    const independentRoleChanged =
+      updatedRadarr.independentRequestDestination !==
+      currentIndependentRequestDestination;
+    const is4kRoleChanged = updatedRadarr.is4k !== currentRadarr.is4k;
+
+    if (
+      (independentRoleChanged || is4kRoleChanged) &&
+      (await isDvrServerHistoricallyUsed('radarr', currentRadarr.id))
+    ) {
+      if (independentRoleChanged) {
         return next({
           status: 409,
           message:
             'The independent destination role cannot change after this server ID has been used.',
         });
       }
-      if (updatedRadarr.is4k !== currentRadarr.is4k) {
+      if (is4kRoleChanged) {
         return next({
           status: 409,
           message:

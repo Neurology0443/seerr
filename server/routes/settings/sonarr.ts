@@ -6,6 +6,10 @@ import {
   hasActiveDvrRequests,
   isDvrServerHistoricallyUsed,
 } from '@server/lib/settings/dvrId';
+import {
+  hasIndependentRequestDestination,
+  hasValidIndependentRequestDestination,
+} from '@server/lib/settings/dvrValidation';
 import logger from '@server/logger';
 import { Router } from 'express';
 
@@ -18,6 +22,13 @@ sonarrRoutes.get('/', (_req, res) => {
 });
 
 sonarrRoutes.post('/', async (req, res, next) => {
+  if (!hasValidIndependentRequestDestination(req.body)) {
+    return next({
+      status: 400,
+      message: 'Independent request destination must be a boolean.',
+    });
+  }
+
   const settings = getSettings();
 
   const newSonarr = {
@@ -93,6 +104,13 @@ sonarrRoutes.post('/test', async (req, res, next) => {
 });
 
 sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
+  if (!hasValidIndependentRequestDestination(req.body)) {
+    return next({
+      status: 400,
+      message: 'Independent request destination must be a boolean.',
+    });
+  }
+
   const settings = getSettings();
 
   const sonarrIndex = settings.sonarr.findIndex(
@@ -104,13 +122,13 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
   }
 
   const currentSonarr = settings.sonarr[sonarrIndex];
+  const currentIndependentRequestDestination =
+    currentSonarr.independentRequestDestination ?? false;
   const updatedSonarr = {
-    ...currentSonarr,
     ...req.body,
-    independentRequestDestination:
-      req.body.independentRequestDestination ??
-      currentSonarr.independentRequestDestination ??
-      false,
+    independentRequestDestination: hasIndependentRequestDestination(req.body)
+      ? req.body.independentRequestDestination
+      : currentIndependentRequestDestination,
     id: currentSonarr.id,
   } as SonarrSettings;
 
@@ -124,18 +142,23 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
     });
   }
 
-  if (await isDvrServerHistoricallyUsed('sonarr', currentSonarr.id)) {
-    if (
-      updatedSonarr.independentRequestDestination !==
-      (currentSonarr.independentRequestDestination ?? false)
-    ) {
+  const independentRoleChanged =
+    updatedSonarr.independentRequestDestination !==
+    currentIndependentRequestDestination;
+  const is4kRoleChanged = updatedSonarr.is4k !== currentSonarr.is4k;
+
+  if (
+    (independentRoleChanged || is4kRoleChanged) &&
+    (await isDvrServerHistoricallyUsed('sonarr', currentSonarr.id))
+  ) {
+    if (independentRoleChanged) {
       return next({
         status: 409,
         message:
           'The independent destination role cannot change after this server ID has been used.',
       });
     }
-    if (updatedSonarr.is4k !== currentSonarr.is4k) {
+    if (is4kRoleChanged) {
       return next({
         status: 409,
         message:
