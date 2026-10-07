@@ -3,6 +3,11 @@ import RadarrAPI from '@server/api/servarr/radarr';
 import { MediaStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import {
+  findIndependentDestinationCandidates,
+  markMissingMovieDestination,
+  updateIndependentMovieDestination,
+} from '@server/lib/destinationAvailability';
 import type {
   RunnableScanner,
   StatusBase,
@@ -80,18 +85,23 @@ class RadarrScanner
           this.items = await this.radarrApi.getMovies();
 
           const server4k = this.enable4kMovie && server.is4k;
-          if (server4k) {
-            this.didScan4k = true;
-          } else {
-            this.didScanStandard = true;
+          if (server.independentRequestDestination !== true) {
+            if (server4k) {
+              this.didScan4k = true;
+            } else {
+              this.didScanStandard = true;
+            }
+
+            if (this.items.length === 0) {
+              if (server4k) {
+                this.server4kReturnedEmpty = true;
+              } else {
+                this.serverReturnedEmpty = true;
+              }
+            }
           }
 
           if (this.items.length === 0) {
-            if (server4k) {
-              this.server4kReturnedEmpty = true;
-            } else {
-              this.serverReturnedEmpty = true;
-            }
             this.log(
               `Radarr server ${server.name} returned no movies. Orphan cleanup for this profile type will be skipped.`,
               'warn'
@@ -99,6 +109,12 @@ class RadarrScanner
           }
 
           await this.loop(this.processRadarrMovie.bind(this), { sessionId });
+          if (
+            server.independentRequestDestination === true &&
+            this.items.length > 0
+          ) {
+            await this.cleanupIndependentOrphanedMovies(server, this.items);
+          }
         } else {
           this.log(`Sync not enabled. Skipping Radarr server: ${server.name}`);
         }
@@ -109,10 +125,19 @@ class RadarrScanner
       // media that exists on an unscanned server (e.g. separate instances for
       // anime, regional content, or different languages).
       const allStandardScanned = this.servers
-        .filter((s) => !this.enable4kMovie || !s.is4k)
+        .filter(
+          (s) =>
+            s.independentRequestDestination !== true &&
+            (!this.enable4kMovie || !s.is4k)
+        )
         .every((s) => s.syncEnabled);
       const all4kScanned = this.servers
-        .filter((s) => this.enable4kMovie && s.is4k)
+        .filter(
+          (s) =>
+            s.independentRequestDestination !== true &&
+            this.enable4kMovie &&
+            s.is4k
+        )
         .every((s) => s.syncEnabled);
 
       if (!allStandardScanned) {
@@ -140,13 +165,29 @@ class RadarrScanner
 
   private async processRadarrMovie(radarrMovie: RadarrMovie): Promise<void> {
     const server4k = this.enable4kMovie && this.currentServer.is4k;
-    if (server4k) {
-      this.scanned4kTmdbIds.add(radarrMovie.tmdbId);
-    } else {
-      this.scannedTmdbIds.add(radarrMovie.tmdbId);
+    if (this.currentServer.independentRequestDestination !== true) {
+      if (server4k) {
+        this.scanned4kTmdbIds.add(radarrMovie.tmdbId);
+      } else {
+        this.scannedTmdbIds.add(radarrMovie.tmdbId);
+      }
     }
 
     try {
+      if (this.currentServer.independentRequestDestination === true) {
+        await this.asyncLock.dispatch(radarrMovie.tmdbId, () =>
+          updateIndependentMovieDestination({
+            tmdbId: radarrMovie.tmdbId,
+            serverId: this.currentServer.id,
+            externalServiceId: radarrMovie.id,
+            externalServiceSlug: radarrMovie.titleSlug,
+            hasFile: radarrMovie.hasFile,
+            monitored: radarrMovie.monitored,
+          })
+        );
+        return;
+      }
+
       await this.processMovie(radarrMovie.tmdbId, {
         is4k: server4k,
         serviceId: this.currentServer.id,
@@ -164,13 +205,15 @@ class RadarrScanner
     }
   }
 
-  private async existsInAnyServer(
+  private async existsInAnyNativeServer(
     tmdbId: number,
     is4k: boolean
   ): Promise<boolean> {
     const servers = this.servers.filter(
       (server) =>
-        server.syncEnabled && (this.enable4kMovie && server.is4k) === is4k
+        server.independentRequestDestination !== true &&
+        server.syncEnabled &&
+        (this.enable4kMovie && server.is4k) === is4k
     );
 
     for (const server of servers) {
@@ -197,6 +240,46 @@ class RadarrScanner
     return false;
   }
 
+  private async cleanupIndependentOrphanedMovies(
+    server: RadarrSettings,
+    movies: RadarrMovie[]
+  ): Promise<void> {
+    const scannedTmdbIds = new Set(movies.map((movie) => movie.tmdbId));
+    const candidates = await findIndependentDestinationCandidates(
+      server.id,
+      MediaType.MOVIE,
+      [MediaStatus.PROCESSING, MediaStatus.AVAILABLE]
+    );
+
+    for (const destination of candidates) {
+      if (scannedTmdbIds.has(destination.media.tmdbId)) {
+        continue;
+      }
+      try {
+        const exactMovies = await this.radarrApi.getLibraryMoviesByTmdbId(
+          destination.media.tmdbId
+        );
+        if (!Array.isArray(exactMovies)) {
+          continue;
+        }
+        if (
+          exactMovies.some((movie) => movie.tmdbId === destination.media.tmdbId)
+        ) {
+          continue;
+        }
+      } catch (e) {
+        this.log(
+          `Could not confirm movie ${destination.media.tmdbId} against independent Radarr server ${server.name}. Skipping cleanup for it.`,
+          'warn',
+          { errorMessage: e.message }
+        );
+        continue;
+      }
+
+      await markMissingMovieDestination(destination.mediaId, server.id);
+    }
+  }
+
   private async cleanupOrphanedMovies(): Promise<void> {
     const mediaRepository = getRepository(Media);
 
@@ -208,7 +291,7 @@ class RadarrScanner
 
       for (const media of processingMovies) {
         if (!this.scannedTmdbIds.has(media.tmdbId)) {
-          if (await this.existsInAnyServer(media.tmdbId, false)) {
+          if (await this.existsInAnyNativeServer(media.tmdbId, false)) {
             continue;
           }
 
@@ -239,7 +322,7 @@ class RadarrScanner
 
       for (const media of processing4kMovies) {
         if (!this.scanned4kTmdbIds.has(media.tmdbId)) {
-          if (await this.existsInAnyServer(media.tmdbId, true)) {
+          if (await this.existsInAnyNativeServer(media.tmdbId, true)) {
             continue;
           }
 

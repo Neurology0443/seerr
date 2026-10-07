@@ -18,6 +18,7 @@ import { MediaRequest } from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import notificationManager from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
@@ -1568,5 +1569,36 @@ describe('MediaRequestSubscriber request destinations', () => {
     assert.strictEqual(persisted.status, MediaRequestStatus.DECLINED);
     assert.strictEqual(destination.status, MediaStatus.UNKNOWN);
     assert.strictEqual(sendNotificationMock.mock.callCount(), 0);
+  });
+
+  it('does not use native availability notifications for an independent completion', async (t) => {
+    const request = await seedMovieRequest(102);
+    await markApprovedWithoutListeners(request);
+    const notify = t.mock.method(
+      notificationManager,
+      'sendNotification',
+      async () => undefined
+    );
+
+    request.status = MediaRequestStatus.COMPLETED;
+    await getRepository(MediaRequest).save(request);
+
+    assert.strictEqual(notify.mock.callCount(), 0);
+  });
+
+  it('retains the existing native availability notification on completion', async (t) => {
+    configureMixedServers();
+    const request = await seedMovieRequest(101);
+    await markApprovedWithoutListeners(request);
+    const notify = t.mock.method(
+      notificationManager,
+      'sendNotification',
+      async () => undefined
+    );
+
+    request.status = MediaRequestStatus.COMPLETED;
+    await getRepository(MediaRequest).save(request);
+
+    assert.strictEqual(notify.mock.callCount(), 1);
   });
 });

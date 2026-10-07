@@ -1672,7 +1672,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       }
     }
 
-    if (entity.status === MediaRequestStatus.COMPLETED) {
+    if (entity.status === MediaRequestStatus.COMPLETED && !independent) {
       if (entity.media.mediaType === MediaType.MOVIE) {
         await this.notifyAvailableMovie(entity, event);
       }
