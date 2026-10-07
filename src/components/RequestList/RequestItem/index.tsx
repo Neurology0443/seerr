@@ -6,6 +6,7 @@ import ConfirmButton from '@app/components/Common/ConfirmButton';
 import RequestModal from '@app/components/RequestModal';
 import StatusBadge from '@app/components/StatusBadge';
 import useDeepLinks from '@app/hooks/useDeepLinks';
+import { revalidateRequestData } from '@app/hooks/useRequestTargets';
 import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
@@ -335,7 +336,11 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
       await axios.post(`/api/v1/request/${request.id}/${type}`);
       revalidate();
       revalidateList();
-      mutate('/api/v1/request/count');
+      revalidateRequestData({
+        mediaType: request.type,
+        tmdbId: request.media.tmdbId,
+        requestId: request.id,
+      });
     } catch {
       addToast(intl.formatMessage(messages.failedmodify), {
         autoDismiss: true,
@@ -350,7 +355,11 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
     await axios.delete(`/api/v1/request/${request.id}`);
 
     revalidateList();
-    mutate('/api/v1/request/count');
+    revalidateRequestData({
+      mediaType: request.type,
+      tmdbId: request.media.tmdbId,
+      requestId: request.id,
+    });
   };
 
   const deleteMediaFile = async () => {
@@ -379,6 +388,11 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
     try {
       const result = await axios.post(`/api/v1/request/${request.id}/retry`);
       revalidate(result.data);
+      revalidateRequestData({
+        mediaType: request.type,
+        tmdbId: request.media.tmdbId,
+        requestId: request.id,
+      });
     } catch {
       addToast(intl.formatMessage(messages.failedretry), {
         autoDismiss: true,

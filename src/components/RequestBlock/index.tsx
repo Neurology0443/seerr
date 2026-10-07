@@ -4,6 +4,7 @@ import CachedImage from '@app/components/Common/CachedImage';
 import Tooltip from '@app/components/Common/Tooltip';
 import RequestModal from '@app/components/RequestModal';
 import useRequestOverride from '@app/hooks/useRequestOverride';
+import { revalidateRequestData } from '@app/hooks/useRequestTargets';
 import { useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
@@ -22,7 +23,6 @@ import axios from 'axios';
 import Link from 'next/link';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
-import { mutate } from 'swr';
 
 const messages = defineMessages('components.RequestBlock', {
   seasons: '{seasonCount, plural, one {Season} other {Seasons}}',
@@ -59,8 +59,12 @@ const RequestBlock = ({ request, onUpdate }: RequestBlockProps) => {
 
     if (onUpdate) {
       onUpdate();
-      mutate('/api/v1/request/count');
     }
+    revalidateRequestData({
+      mediaType: request.type,
+      tmdbId: request.media.tmdbId,
+      requestId: request.id,
+    });
     setIsUpdating(false);
   };
 
@@ -70,8 +74,12 @@ const RequestBlock = ({ request, onUpdate }: RequestBlockProps) => {
 
     if (onUpdate) {
       onUpdate();
-      mutate('/api/v1/request/count');
     }
+    revalidateRequestData({
+      mediaType: request.type,
+      tmdbId: request.media.tmdbId,
+      requestId: request.id,
+    });
 
     setIsUpdating(false);
   };

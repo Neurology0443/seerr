@@ -1,3 +1,4 @@
+import Alert from '@app/components/Common/Alert';
 import Modal from '@app/components/Common/Modal';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import type { SonarrTestResponse } from '@app/components/Settings/SettingsServices';
@@ -67,6 +68,10 @@ const messages = defineMessages('components.Settings.SonarrModal', {
   loadingTags: 'Loading tags…',
   testFirstTags: 'Test connection to load tags',
   syncEnabled: 'Enable Scan',
+  independentRequestDestination: 'Independent Request Destination',
+  independentRequestDestinationHelp:
+    'Track requests and availability independently for this destination. Scanning is required and will be enabled automatically.',
+  saveError: 'Unable to save the Sonarr server settings.',
   externalUrl: 'External URL',
   enableSearch: 'Enable Automatic Search',
   tagRequests: 'Tag Requests',
@@ -106,6 +111,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
   const { addToast } = useToasts();
   const [isValidated, setIsValidated] = useState(sonarr ? true : false);
   const [isTesting, setIsTesting] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [testResponse, setTestResponse] = useState<SonarrTestResponse>({
     profiles: [],
     rootFolders: [],
@@ -256,15 +262,20 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
           animeTags: sonarr?.animeTags ?? [],
           isDefault: sonarr?.isDefault ?? false,
           is4k: sonarr?.is4k ?? false,
+          independentRequestDestination:
+            sonarr?.independentRequestDestination ?? false,
           enableSeasonFolders: sonarr?.enableSeasonFolders ?? false,
           externalUrl: sonarr?.externalUrl,
-          syncEnabled: sonarr?.syncEnabled ?? false,
+          syncEnabled: sonarr?.independentRequestDestination
+            ? true
+            : (sonarr?.syncEnabled ?? false),
           enableSearch: !sonarr?.preventSearch,
           tagRequests: sonarr?.tagRequests ?? false,
           monitorNewItems: sonarr?.monitorNewItems ?? 'all',
         }}
         validationSchema={SonarrSettingsSchema}
         onSubmit={async (values) => {
+          setSaveError(null);
           try {
             const profileName = testResponse.profiles.find(
               (profile) => profile.id === Number(values.activeProfileId)
@@ -299,10 +310,13 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
               tags: values.tags,
               animeTags: values.animeTags,
               is4k: values.is4k,
+              independentRequestDestination:
+                values.independentRequestDestination,
               isDefault: values.isDefault,
               enableSeasonFolders: values.enableSeasonFolders,
               externalUrl: values.externalUrl,
-              syncEnabled: values.syncEnabled,
+              syncEnabled:
+                values.independentRequestDestination || values.syncEnabled,
               preventSearch: !values.enableSearch,
               tagRequests: values.tagRequests,
               monitorNewItems: values.monitorNewItems,
@@ -317,8 +331,15 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
             }
 
             onSave();
-          } catch {
-            // set error here
+          } catch (error) {
+            const responseMessage = axios.isAxiosError<{
+              message?: string;
+            }>(error)
+              ? error.response?.data?.message
+              : undefined;
+            setSaveError(
+              responseMessage ?? intl.formatMessage(messages.saveError)
+            );
           }
         }}
       >
@@ -383,6 +404,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                     )
               }
             >
+              {saveError && <Alert type="error" title={saveError} />}
               <div className="mb-6">
                 <div className="form-row">
                   <label htmlFor="isDefault" className="checkbox-label">
@@ -405,6 +427,33 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                   </label>
                   <div className="form-input-area">
                     <Field type="checkbox" id="is4k" name="is4k" />
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label
+                    htmlFor="independentRequestDestination"
+                    className="checkbox-label"
+                  >
+                    {intl.formatMessage(messages.independentRequestDestination)}
+                    <span className="label-tip">
+                      {intl.formatMessage(
+                        messages.independentRequestDestinationHelp
+                      )}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      type="checkbox"
+                      id="independentRequestDestination"
+                      name="independentRequestDestination"
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                        const enabled = e.target.checked;
+                        setFieldValue('independentRequestDestination', enabled);
+                        if (enabled) {
+                          setFieldValue('syncEnabled', true);
+                        }
+                      }}
+                    />
                   </div>
                 </div>
                 <div className="form-row">
@@ -1070,6 +1119,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                       type="checkbox"
                       id="syncEnabled"
                       name="syncEnabled"
+                      disabled={values.independentRequestDestination}
                     />
                   </div>
                 </div>

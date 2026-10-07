@@ -1,3 +1,4 @@
+import Alert from '@app/components/Common/Alert';
 import Modal from '@app/components/Common/Modal';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import type { RadarrTestResponse } from '@app/components/Settings/SettingsServices';
@@ -44,6 +45,10 @@ const messages = defineMessages('components.Settings.RadarrModal', {
   apiKey: 'API Key',
   baseUrl: 'URL Base',
   syncEnabled: 'Enable Scan',
+  independentRequestDestination: 'Independent Request Destination',
+  independentRequestDestinationHelp:
+    'Track requests and availability independently for this destination. Scanning is required and will be enabled automatically.',
+  saveError: 'Unable to save the Radarr server settings.',
   externalUrl: 'External URL',
   qualityprofile: 'Quality Profile',
   rootfolder: 'Root Folder',
@@ -97,6 +102,7 @@ const RadarrModal = ({ onClose, radarr, onSave }: RadarrModalProps) => {
   const { addToast } = useToasts();
   const [isValidated, setIsValidated] = useState(radarr ? true : false);
   const [isTesting, setIsTesting] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [testResponse, setTestResponse] = useState<RadarrTestResponse>({
     profiles: [],
     rootFolders: [],
@@ -238,13 +244,18 @@ const RadarrModal = ({ onClose, radarr, onSave }: RadarrModalProps) => {
           tags: radarr?.tags ?? [],
           isDefault: radarr?.isDefault ?? false,
           is4k: radarr?.is4k ?? false,
+          independentRequestDestination:
+            radarr?.independentRequestDestination ?? false,
           externalUrl: radarr?.externalUrl,
-          syncEnabled: radarr?.syncEnabled ?? false,
+          syncEnabled: radarr?.independentRequestDestination
+            ? true
+            : (radarr?.syncEnabled ?? false),
           enableSearch: !radarr?.preventSearch,
           tagRequests: radarr?.tagRequests ?? false,
         }}
         validationSchema={RadarrSettingsSchema}
         onSubmit={async (values) => {
+          setSaveError(null);
           try {
             const profileName = testResponse.profiles.find(
               (profile) => profile.id === Number(values.activeProfileId)
@@ -261,11 +272,14 @@ const RadarrModal = ({ onClose, radarr, onSave }: RadarrModalProps) => {
               activeProfileName: profileName,
               activeDirectory: values.rootFolder,
               is4k: values.is4k,
+              independentRequestDestination:
+                values.independentRequestDestination,
               minimumAvailability: values.minimumAvailability,
               tags: values.tags,
               isDefault: values.isDefault,
               externalUrl: values.externalUrl,
-              syncEnabled: values.syncEnabled,
+              syncEnabled:
+                values.independentRequestDestination || values.syncEnabled,
               preventSearch: !values.enableSearch,
               tagRequests: values.tagRequests,
             };
@@ -279,8 +293,15 @@ const RadarrModal = ({ onClose, radarr, onSave }: RadarrModalProps) => {
             }
 
             onSave();
-          } catch {
-            // set error here
+          } catch (error) {
+            const responseMessage = axios.isAxiosError<{
+              message?: string;
+            }>(error)
+              ? error.response?.data?.message
+              : undefined;
+            setSaveError(
+              responseMessage ?? intl.formatMessage(messages.saveError)
+            );
           }
         }}
       >
@@ -345,6 +366,7 @@ const RadarrModal = ({ onClose, radarr, onSave }: RadarrModalProps) => {
                     )
               }
             >
+              {saveError && <Alert type="error" title={saveError} />}
               <div className="mb-6">
                 <div className="form-row">
                   <label htmlFor="isDefault" className="checkbox-label">
@@ -367,6 +389,33 @@ const RadarrModal = ({ onClose, radarr, onSave }: RadarrModalProps) => {
                   </label>
                   <div className="form-input-area">
                     <Field type="checkbox" id="is4k" name="is4k" />
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label
+                    htmlFor="independentRequestDestination"
+                    className="checkbox-label"
+                  >
+                    {intl.formatMessage(messages.independentRequestDestination)}
+                    <span className="label-tip">
+                      {intl.formatMessage(
+                        messages.independentRequestDestinationHelp
+                      )}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      type="checkbox"
+                      id="independentRequestDestination"
+                      name="independentRequestDestination"
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                        const enabled = e.target.checked;
+                        setFieldValue('independentRequestDestination', enabled);
+                        if (enabled) {
+                          setFieldValue('syncEnabled', true);
+                        }
+                      }}
+                    />
                   </div>
                 </div>
                 <div className="form-row">
@@ -733,6 +782,7 @@ const RadarrModal = ({ onClose, radarr, onSave }: RadarrModalProps) => {
                       type="checkbox"
                       id="syncEnabled"
                       name="syncEnabled"
+                      disabled={values.independentRequestDestination}
                     />
                   </div>
                 </div>

@@ -6,6 +6,7 @@ import Tooltip from '@app/components/Common/Tooltip';
 import RequestModal from '@app/components/RequestModal';
 import StatusBadge from '@app/components/StatusBadge';
 import useDeepLinks from '@app/hooks/useDeepLinks';
+import { revalidateRequestData } from '@app/hooks/useRequestTargets';
 import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
@@ -267,7 +268,11 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
     try {
       await axios.post(`/api/v1/request/${request.id}/${type}`);
       revalidate();
-      mutate('/api/v1/request/count');
+      revalidateRequestData({
+        mediaType: request.type,
+        tmdbId: request.media.tmdbId,
+        requestId: request.id,
+      });
     } catch {
       addToast(intl.formatMessage(messages.failedmodify), {
         autoDismiss: true,
@@ -280,8 +285,11 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
 
   const deleteRequest = async () => {
     await axios.delete(`/api/v1/request/${request.id}`);
-    mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
-    mutate('/api/v1/request/count');
+    revalidateRequestData({
+      mediaType: request.type,
+      tmdbId: request.media.tmdbId,
+      requestId: request.id,
+    });
   };
 
   const retryRequest = async () => {
@@ -292,6 +300,11 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
 
       if (response) {
         revalidate();
+        revalidateRequestData({
+          mediaType: request.type,
+          tmdbId: request.media.tmdbId,
+          requestId: request.id,
+        });
       }
     } catch {
       addToast(intl.formatMessage(messages.failedretry), {

@@ -1,9 +1,17 @@
 import ButtonWithDropdown from '@app/components/Common/ButtonWithDropdown';
 import RequestModal from '@app/components/RequestModal';
+import {
+  revalidateRequestData,
+  useRequestTargets,
+} from '@app/hooks/useRequestTargets';
 import useSettings from '@app/hooks/useSettings';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import {
+  canRequestTargetTier,
+  groupPendingRequests,
+} from '@app/utils/requestTargets';
 import { ArrowDownTrayIcon } from '@heroicons/react/24/outline';
 import {
   CheckIcon,
@@ -35,6 +43,7 @@ const messages = defineMessages('components.RequestButton', {
     'Approve {requestCount, plural, one {4K Request} other {{requestCount} 4K Requests}}',
   decline4krequests:
     'Decline {requestCount, plural, one {4K Request} other {{requestCount} 4K Requests}}',
+  destinationAction: '{action} — {destination}',
 });
 
 interface ButtonOption {
@@ -66,31 +75,34 @@ const RequestButton = ({
   const { user, hasPermission } = useUser();
   const [showRequestModal, setShowRequestModal] = useState(false);
   const [showRequest4kModal, setShowRequest4kModal] = useState(false);
-  const [editRequest, setEditRequest] = useState(false);
+  const [editRequest, setEditRequest] = useState<MediaRequest | undefined>();
+  const { targets } = useRequestTargets(mediaType, tmdbId);
 
-  // All pending requests
-  const activeRequests = media?.requests.filter(
-    (request) => request.status === MediaRequestStatus.PENDING && !request.is4k
+  const pendingRequestGroups = useMemo(
+    () =>
+      groupPendingRequests(
+        (media?.requests ?? []).filter(
+          (request) => request.status === MediaRequestStatus.PENDING
+        ),
+        targets
+      ),
+    [media?.requests, targets]
   );
-  const active4kRequests = media?.requests.filter(
-    (request) => request.status === MediaRequestStatus.PENDING && request.is4k
+  const canSelectDestination = hasPermission(Permission.REQUEST_ADVANCED);
+  const canRequest = canRequestTargetTier(targets, false, canSelectDestination);
+  const canRequest4k = canRequestTargetTier(
+    targets,
+    true,
+    canSelectDestination
   );
-
-  // Current user's pending request, or the first pending request
-  const activeRequest = useMemo(() => {
-    return activeRequests && activeRequests.length > 0
-      ? (activeRequests.find(
-          (request) => request.requestedBy.id === user?.id
-        ) ?? activeRequests[0])
-      : undefined;
-  }, [activeRequests, user]);
-  const active4kRequest = useMemo(() => {
-    return active4kRequests && active4kRequests.length > 0
-      ? (active4kRequests.find(
-          (request) => request.requestedBy.id === user?.id
-        ) ?? active4kRequests[0])
-      : undefined;
-  }, [active4kRequests, user]);
+  const hasNativeRequestMoreTarget = (tier4k: boolean) =>
+    targets?.some(
+      (target) =>
+        target.is4k === tier4k &&
+        !target.isIndependent &&
+        target.requestable &&
+        (canSelectDestination || target.isDefault)
+    ) === true;
 
   const modifyRequest = async (
     request: MediaRequest,
@@ -100,7 +112,11 @@ const RequestButton = ({
 
     if (response) {
       onUpdate();
-      mutate('/api/v1/request/count');
+      revalidateRequestData({
+        mediaType,
+        tmdbId,
+        requestId: request.id,
+      });
     }
   };
 
@@ -119,159 +135,100 @@ const RequestButton = ({
     );
 
     onUpdate();
-    mutate('/api/v1/request/count');
+    requests.forEach((request) => mutate(`/api/v1/request/${request.id}`));
+    revalidateRequestData({ mediaType, tmdbId });
   };
 
   const buttons: ButtonOption[] = [];
+  const withDestination = (action: string, destination?: string) =>
+    destination
+      ? intl.formatMessage(messages.destinationAction, {
+          action,
+          destination,
+        })
+      : action;
 
-  // If there are pending requests, show request management options first
-  if (activeRequest || active4kRequest) {
+  pendingRequestGroups.forEach((group) => {
+    const representative =
+      group.requests.find((request) => request.requestedBy.id === user?.id) ??
+      group.requests[0];
+    const tierSuffix = group.is4k ? '4k' : 'standard';
+    const viewText = intl.formatMessage(
+      group.is4k ? messages.viewrequest4k : messages.viewrequest
+    );
+
     if (
-      activeRequest &&
-      (activeRequest.requestedBy.id === user?.id ||
-        (activeRequests?.length === 1 &&
-          hasPermission(Permission.MANAGE_REQUESTS)))
+      representative.requestedBy.id === user?.id ||
+      (group.requests.length === 1 && hasPermission(Permission.MANAGE_REQUESTS))
     ) {
       buttons.push({
-        id: 'active-request',
-        text: intl.formatMessage(messages.viewrequest),
+        id: `active-${tierSuffix}-${group.key}-${representative.id}`,
+        text: withDestination(viewText, group.destinationName),
         action: () => {
-          setEditRequest(true);
-          setShowRequestModal(true);
+          setEditRequest(representative);
+          if (group.is4k) {
+            setShowRequest4kModal(true);
+          } else {
+            setShowRequestModal(true);
+          }
         },
         svg: <InformationCircleIcon />,
       });
     }
 
-    if (
-      activeRequest &&
-      hasPermission(Permission.MANAGE_REQUESTS) &&
-      mediaType === 'movie'
-    ) {
+    if (!hasPermission(Permission.MANAGE_REQUESTS)) {
+      return;
+    }
+
+    if (mediaType === 'movie') {
+      const approveText = intl.formatMessage(
+        group.is4k ? messages.approverequest4k : messages.approverequest
+      );
+      const declineText = intl.formatMessage(
+        group.is4k ? messages.declinerequest4k : messages.declinerequest
+      );
       buttons.push(
         {
-          id: 'approve-request',
-          text: intl.formatMessage(messages.approverequest),
-          action: () => {
-            modifyRequest(activeRequest, 'approve');
-          },
+          id: `approve-${tierSuffix}-${group.key}-${representative.id}`,
+          text: withDestination(approveText, group.destinationName),
+          action: () => modifyRequest(representative, 'approve'),
           svg: <CheckIcon />,
         },
         {
-          id: 'decline-request',
-          text: intl.formatMessage(messages.declinerequest),
-          action: () => {
-            modifyRequest(activeRequest, 'decline');
-          },
+          id: `decline-${tierSuffix}-${group.key}-${representative.id}`,
+          text: withDestination(declineText, group.destinationName),
+          action: () => modifyRequest(representative, 'decline'),
           svg: <XMarkIcon />,
         }
       );
-    } else if (
-      activeRequests &&
-      activeRequests.length > 0 &&
-      hasPermission(Permission.MANAGE_REQUESTS) &&
-      mediaType === 'tv'
-    ) {
+    } else {
+      const approveText = intl.formatMessage(
+        group.is4k ? messages.approve4krequests : messages.approverequests,
+        { requestCount: group.requests.length }
+      );
+      const declineText = intl.formatMessage(
+        group.is4k ? messages.decline4krequests : messages.declinerequests,
+        { requestCount: group.requests.length }
+      );
       buttons.push(
         {
-          id: 'approve-request-batch',
-          text: intl.formatMessage(messages.approverequests, {
-            requestCount: activeRequests.length,
-          }),
-          action: () => {
-            modifyRequests(activeRequests, 'approve');
-          },
+          id: `approve-${tierSuffix}-batch-${group.key}`,
+          text: withDestination(approveText, group.destinationName),
+          action: () => modifyRequests(group.requests, 'approve'),
           svg: <CheckIcon />,
         },
         {
-          id: 'decline-request-batch',
-          text: intl.formatMessage(messages.declinerequests, {
-            requestCount: activeRequests.length,
-          }),
-          action: () => {
-            modifyRequests(activeRequests, 'decline');
-          },
+          id: `decline-${tierSuffix}-batch-${group.key}`,
+          text: withDestination(declineText, group.destinationName),
+          action: () => modifyRequests(group.requests, 'decline'),
           svg: <XMarkIcon />,
         }
       );
     }
+  });
 
-    if (
-      active4kRequest &&
-      (active4kRequest.requestedBy.id === user?.id ||
-        (active4kRequests?.length === 1 &&
-          hasPermission(Permission.MANAGE_REQUESTS)))
-    ) {
-      buttons.push({
-        id: 'active-4k-request',
-        text: intl.formatMessage(messages.viewrequest4k),
-        action: () => {
-          setEditRequest(true);
-          setShowRequest4kModal(true);
-        },
-        svg: <InformationCircleIcon />,
-      });
-    }
-
-    if (
-      active4kRequest &&
-      hasPermission(Permission.MANAGE_REQUESTS) &&
-      mediaType === 'movie'
-    ) {
-      buttons.push(
-        {
-          id: 'approve-4k-request',
-          text: intl.formatMessage(messages.approverequest4k),
-          action: () => {
-            modifyRequest(active4kRequest, 'approve');
-          },
-          svg: <CheckIcon />,
-        },
-        {
-          id: 'decline-4k-request',
-          text: intl.formatMessage(messages.declinerequest4k),
-          action: () => {
-            modifyRequest(active4kRequest, 'decline');
-          },
-          svg: <XMarkIcon />,
-        }
-      );
-    } else if (
-      active4kRequests &&
-      active4kRequests.length > 0 &&
-      hasPermission(Permission.MANAGE_REQUESTS) &&
-      mediaType === 'tv'
-    ) {
-      buttons.push(
-        {
-          id: 'approve-4k-request-batch',
-          text: intl.formatMessage(messages.approve4krequests, {
-            requestCount: active4kRequests.length,
-          }),
-          action: () => {
-            modifyRequests(active4kRequests, 'approve');
-          },
-          svg: <CheckIcon />,
-        },
-        {
-          id: 'decline-4k-request-batch',
-          text: intl.formatMessage(messages.decline4krequests, {
-            requestCount: active4kRequests.length,
-          }),
-          action: () => {
-            modifyRequests(active4kRequests, 'decline');
-          },
-          svg: <XMarkIcon />,
-        }
-      );
-    }
-  }
-
-  // Standard request button
   if (
-    (!media ||
-      media.status === MediaStatus.UNKNOWN ||
-      (media.status === MediaStatus.DELETED && !activeRequest)) &&
+    canRequest &&
     hasPermission(
       [
         Permission.REQUEST,
@@ -282,41 +239,31 @@ const RequestButton = ({
       { type: 'or' }
     )
   ) {
+    // Native status only preserves the legacy TV label; eligibility above is
+    // exclusively determined by request-targets.
+    const isRequestMore =
+      mediaType === 'tv' &&
+      !!media &&
+      !isShowComplete &&
+      media.status !== MediaStatus.UNKNOWN &&
+      media.status !== MediaStatus.DELETED &&
+      media.status !== MediaStatus.BLOCKLISTED &&
+      hasNativeRequestMoreTarget(false);
     buttons.push({
-      id: 'request',
-      text: intl.formatMessage(globalMessages.request),
+      id: isRequestMore ? 'request-more' : 'request',
+      text: intl.formatMessage(
+        isRequestMore ? messages.requestmore : globalMessages.request
+      ),
       action: () => {
-        setEditRequest(false);
-        setShowRequestModal(true);
-      },
-      svg: <ArrowDownTrayIcon />,
-    });
-  } else if (
-    mediaType === 'tv' &&
-    (!activeRequest || activeRequest.requestedBy.id !== user?.id) &&
-    hasPermission([Permission.REQUEST, Permission.REQUEST_TV], {
-      type: 'or',
-    }) &&
-    media &&
-    media.status !== MediaStatus.BLOCKLISTED &&
-    !isShowComplete
-  ) {
-    buttons.push({
-      id: 'request-more',
-      text: intl.formatMessage(messages.requestmore),
-      action: () => {
-        setEditRequest(false);
+        setEditRequest(undefined);
         setShowRequestModal(true);
       },
       svg: <ArrowDownTrayIcon />,
     });
   }
 
-  // 4K request button
   if (
-    (!media ||
-      media.status4k === MediaStatus.UNKNOWN ||
-      (media.status4k === MediaStatus.DELETED && !active4kRequest)) &&
+    canRequest4k &&
     hasPermission(
       [
         Permission.REQUEST_4K,
@@ -329,31 +276,23 @@ const RequestButton = ({
     ((settings.currentSettings.movie4kEnabled && mediaType === 'movie') ||
       (settings.currentSettings.series4kEnabled && mediaType === 'tv'))
   ) {
+    // Native status only preserves the legacy TV label; eligibility above is
+    // exclusively determined by request-targets.
+    const isRequestMore =
+      mediaType === 'tv' &&
+      !!media &&
+      !is4kShowComplete &&
+      media.status4k !== MediaStatus.UNKNOWN &&
+      media.status4k !== MediaStatus.DELETED &&
+      media.status4k !== MediaStatus.BLOCKLISTED &&
+      hasNativeRequestMoreTarget(true);
     buttons.push({
-      id: 'request4k',
-      text: intl.formatMessage(globalMessages.request4k),
+      id: isRequestMore ? 'request-more-4k' : 'request4k',
+      text: intl.formatMessage(
+        isRequestMore ? messages.requestmore4k : globalMessages.request4k
+      ),
       action: () => {
-        setEditRequest(false);
-        setShowRequest4kModal(true);
-      },
-      svg: <ArrowDownTrayIcon />,
-    });
-  } else if (
-    mediaType === 'tv' &&
-    (!active4kRequest || active4kRequest.requestedBy.id !== user?.id) &&
-    hasPermission([Permission.REQUEST_4K, Permission.REQUEST_4K_TV], {
-      type: 'or',
-    }) &&
-    media &&
-    media.status4k !== MediaStatus.BLOCKLISTED &&
-    !is4kShowComplete &&
-    settings.currentSettings.series4kEnabled
-  ) {
-    buttons.push({
-      id: 'request-more-4k',
-      text: intl.formatMessage(messages.requestmore4k),
-      action: () => {
-        setEditRequest(false);
+        setEditRequest(undefined);
         setShowRequest4kModal(true);
       },
       svg: <ArrowDownTrayIcon />,
@@ -372,7 +311,7 @@ const RequestButton = ({
         tmdbId={tmdbId}
         show={showRequestModal}
         type={mediaType}
-        editRequest={editRequest ? activeRequest : undefined}
+        editRequest={!editRequest?.is4k ? editRequest : undefined}
         onComplete={() => {
           onUpdate();
           setShowRequestModal(false);
@@ -383,7 +322,7 @@ const RequestButton = ({
         tmdbId={tmdbId}
         show={showRequest4kModal}
         type={mediaType}
-        editRequest={editRequest ? active4kRequest : undefined}
+        editRequest={editRequest?.is4k ? editRequest : undefined}
         is4k
         onComplete={() => {
           onUpdate();

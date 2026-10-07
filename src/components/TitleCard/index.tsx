@@ -90,8 +90,10 @@ const TitleCard = ({
     setCurrentStatus(status);
   }, [status]);
 
-  const requestComplete = useCallback((newStatus: MediaStatus) => {
-    setCurrentStatus(newStatus);
+  const requestComplete = useCallback((newStatus?: MediaStatus) => {
+    if (newStatus !== undefined) {
+      setCurrentStatus(newStatus);
+    }
     setShowRequestModal(false);
   }, []);
 
