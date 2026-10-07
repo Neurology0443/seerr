@@ -12,6 +12,7 @@ import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import {
   completeRequestsForDestination,
+  declineRequestsForDestination,
   rollupDestinationTvStatus,
   transitionDestinationSeasonStatus,
 } from '@server/lib/destinationAvailability';
@@ -111,6 +112,12 @@ describe('destination availability', () => {
         { seasonNumber: 1, status: MediaStatus.UNKNOWN },
       ]),
       MediaStatus.UNKNOWN
+    );
+    assert.strictEqual(
+      rollupDestinationTvStatus(MediaStatus.PROCESSING, [
+        { seasonNumber: 1, status: MediaStatus.PENDING },
+      ]),
+      MediaStatus.PENDING
     );
   });
 
@@ -222,6 +229,194 @@ describe('destination availability', () => {
         })
       ).status,
       MediaRequestStatus.APPROVED
+    );
+  });
+
+  for (const terminalStatus of [
+    MediaRequestStatus.FAILED,
+    MediaRequestStatus.DECLINED,
+    MediaRequestStatus.COMPLETED,
+  ]) {
+    it(`does not overwrite ${terminalStatus} when movie completion loses after candidate selection`, async (t) => {
+      const media = await getRepository(Media).save(
+        new Media({ tmdbId: 110 + terminalStatus, mediaType: MediaType.MOVIE })
+      );
+      await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 13,
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+      const candidate = await createRequest({ media, serverId: 13 });
+      const requestRepository = getRepository(MediaRequest) as unknown as {
+        find: (options: unknown) => Promise<MediaRequest[]>;
+      };
+      const originalFind = requestRepository.find.bind(requestRepository);
+      t.mock.method(requestRepository, 'find', async (options: unknown) => {
+        const requests = await originalFind(options);
+        await setRequestStatusWithoutListeners(candidate, terminalStatus);
+        return requests;
+      });
+
+      await completeRequestsForDestination(media.id, 13);
+
+      assert.strictEqual(
+        (
+          await getRepository(MediaRequest).findOneByOrFail({
+            id: candidate.id,
+          })
+        ).status,
+        terminalStatus
+      );
+    });
+  }
+
+  it('does not decline or mutate children when orphan decline loses after candidate selection', async (t) => {
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 220,
+        tvdbId: 320,
+        mediaType: MediaType.TV,
+      })
+    );
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 22,
+        status: MediaStatus.PROCESSING,
+      })
+    );
+    const candidate = await createRequest({
+      media,
+      serverId: 22,
+      seasons: [1],
+    });
+    const requestRepository = getRepository(MediaRequest) as unknown as {
+      find: (options: unknown) => Promise<MediaRequest[]>;
+    };
+    const originalFind = requestRepository.find.bind(requestRepository);
+    t.mock.method(requestRepository, 'find', async (options: unknown) => {
+      const requests = await originalFind(options);
+      await setRequestStatusWithoutListeners(
+        candidate,
+        MediaRequestStatus.FAILED
+      );
+      return requests;
+    });
+
+    await declineRequestsForDestination(media.id, 22);
+
+    const updated = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: candidate.id },
+      relations: { seasons: true },
+    });
+    assert.strictEqual(updated.status, MediaRequestStatus.FAILED);
+    assert.strictEqual(updated.seasons[0].status, MediaRequestStatus.APPROVED);
+  });
+
+  it('stops TV child completion when the parent becomes ineligible after candidate selection', async (t) => {
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 221,
+        tvdbId: 321,
+        mediaType: MediaType.TV,
+      })
+    );
+    const destination = await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 23,
+        status: MediaStatus.AVAILABLE,
+      })
+    );
+    await getRepository(MediaDestinationSeasonStatus).save(
+      new MediaDestinationSeasonStatus({
+        destinationStatusId: destination.id,
+        seasonNumber: 1,
+        status: MediaStatus.AVAILABLE,
+      })
+    );
+    const candidate = await createRequest({
+      media,
+      serverId: 23,
+      seasons: [1],
+    });
+    const requestRepository = getRepository(MediaRequest) as unknown as {
+      find: (options: unknown) => Promise<MediaRequest[]>;
+    };
+    const originalFind = requestRepository.find.bind(requestRepository);
+    t.mock.method(requestRepository, 'find', async (options: unknown) => {
+      const requests = await originalFind(options);
+      await setRequestStatusWithoutListeners(
+        candidate,
+        MediaRequestStatus.DECLINED
+      );
+      return requests;
+    });
+
+    await completeRequestsForDestination(media.id, 23);
+
+    const updated = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: candidate.id },
+      relations: { seasons: true },
+    });
+    assert.strictEqual(updated.status, MediaRequestStatus.DECLINED);
+    assert.strictEqual(updated.seasons[0].status, MediaRequestStatus.APPROVED);
+  });
+
+  it('preserves completed TV seasons while declining active siblings', async () => {
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 222,
+        tvdbId: 322,
+        mediaType: MediaType.TV,
+      })
+    );
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 24,
+        status: MediaStatus.PROCESSING,
+      })
+    );
+    const request = await createRequest({
+      media,
+      serverId: 24,
+      seasons: [1, 2, 3],
+    });
+    const savedRequest = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: request.id },
+      relations: { seasons: true },
+    });
+    const completedSeason = savedRequest.seasons.find(
+      (season) => season.seasonNumber === 1
+    )!;
+    const pendingSeason = savedRequest.seasons.find(
+      (season) => season.seasonNumber === 3
+    )!;
+    completedSeason.status = MediaRequestStatus.COMPLETED;
+    pendingSeason.status = MediaRequestStatus.PENDING;
+    await getRepository(SeasonRequest).save([completedSeason, pendingSeason]);
+
+    await declineRequestsForDestination(media.id, 24);
+
+    const updated = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: request.id },
+      relations: { seasons: true },
+    });
+    assert.strictEqual(updated.status, MediaRequestStatus.DECLINED);
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 1)?.status,
+      MediaRequestStatus.COMPLETED
+    );
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 2)?.status,
+      MediaRequestStatus.DECLINED
+    );
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 3)?.status,
+      MediaRequestStatus.DECLINED
     );
   });
 

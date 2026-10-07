@@ -7,6 +7,7 @@ import {
   isDvrServerHistoricallyUsed,
 } from '@server/lib/settings/dvrId';
 import {
+  conflictsWithIndependentDvrEndpoint,
   hasIndependentRequestDestination,
   hasValidIndependentRequestDestination,
 } from '@server/lib/settings/dvrValidation';
@@ -45,6 +46,14 @@ radarrRoutes.post('/', async (req, res, next) => {
     return next({
       status: 400,
       message: 'Independent request destinations require sync to be enabled.',
+    });
+  }
+
+  if (conflictsWithIndependentDvrEndpoint(newRadarr, settings.radarr)) {
+    return next({
+      status: 409,
+      message:
+        'This Radarr instance is already configured and cannot also be an independent destination.',
     });
   }
 
@@ -146,6 +155,20 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
           status: 400,
           message:
             'Independent request destinations require sync to be enabled.',
+        });
+      }
+
+      if (
+        conflictsWithIndependentDvrEndpoint(
+          updatedRadarr,
+          settings.radarr,
+          currentRadarr.id
+        )
+      ) {
+        return next({
+          status: 409,
+          message:
+            'This Radarr instance is already configured and cannot also be an independent destination.',
         });
       }
 

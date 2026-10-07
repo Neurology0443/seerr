@@ -965,6 +965,104 @@ describe('Sonarr Scanner', () => {
       assert.strictEqual(destination.status, MediaStatus.AVAILABLE);
     });
 
+    it('backfills a missing TVDB identity and later uses it for exact orphan cleanup', async () => {
+      const media = await getRepository(Media).save(
+        new Media({ tmdbId: 3650, mediaType: MediaType.TV })
+      );
+      const destination = await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 30,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      configureSonarr([
+        {
+          id: 30,
+          hostname: 'sonarr-en',
+          independentRequestDestination: true,
+        },
+      ]);
+      getSeriesImpl = async () => [fakeSonarrSeries({ tvdbId: 4650 })];
+      getShowByTvdbIdImpl = async () => fakeTmdbShow(3650);
+
+      await runWithMockTimers(() => sonarrScanner.run());
+
+      assert.strictEqual(
+        (await getRepository(Media).findOneByOrFail({ id: media.id })).tvdbId,
+        4650
+      );
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.AVAILABLE
+      );
+
+      getSeriesImpl = async () => [fakeSonarrSeries({ tvdbId: 9999 })];
+      getLibrarySeriesByTvdbIdImpl = async () => [];
+      await runWithMockTimers(() => sonarrScanner.run());
+
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.DELETED
+      );
+    });
+
+    it('does not overwrite or merge a conflicting TVDB identity', async () => {
+      const media = await getRepository(Media).save(
+        new Media({ tmdbId: 3660, mediaType: MediaType.TV })
+      );
+      const owner = await getRepository(Media).save(
+        new Media({
+          tmdbId: 3661,
+          tvdbId: 4660,
+          mediaType: MediaType.TV,
+        })
+      );
+      const destination = await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 30,
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+      configureSonarr([
+        {
+          id: 30,
+          hostname: 'sonarr-en',
+          independentRequestDestination: true,
+        },
+      ]);
+      getSeriesImpl = async () => [fakeSonarrSeries({ tvdbId: 4660 })];
+      getTvShowImpl = async () => fakeTmdbShow(3660);
+
+      await runWithMockTimers(() => sonarrScanner.run());
+
+      assert.strictEqual(
+        (await getRepository(Media).findOneByOrFail({ id: media.id })).tvdbId,
+        null
+      );
+      assert.strictEqual(
+        (await getRepository(Media).findOneByOrFail({ id: owner.id })).tvdbId,
+        4660
+      );
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.AVAILABLE
+      );
+    });
+
     it('writes exact season states and linkage without changing native seasons or another destination', async () => {
       const mediaRepository = getRepository(Media);
       const destinationRepository = getRepository(MediaDestinationStatus);
@@ -1379,6 +1477,77 @@ describe('Sonarr Scanner', () => {
       );
     });
 
+    it('does not destructively transition provider-only synthetic seasons', async () => {
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 3160,
+          tvdbId: 4160,
+          mediaType: MediaType.TV,
+        })
+      );
+      const destination = await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 30,
+          status: MediaStatus.PARTIALLY_AVAILABLE,
+        })
+      );
+      const persistedSeasons = await getRepository(
+        MediaDestinationSeasonStatus
+      ).save([
+        new MediaDestinationSeasonStatus({
+          destinationStatusId: destination.id,
+          seasonNumber: 1,
+          status: MediaStatus.AVAILABLE,
+        }),
+        new MediaDestinationSeasonStatus({
+          destinationStatusId: destination.id,
+          seasonNumber: 2,
+          status: MediaStatus.PARTIALLY_AVAILABLE,
+        }),
+        new MediaDestinationSeasonStatus({
+          destinationStatusId: destination.id,
+          seasonNumber: 3,
+          status: MediaStatus.PROCESSING,
+        }),
+      ]);
+      configureSonarr([
+        {
+          id: 30,
+          hostname: 'sonarr-en',
+          independentRequestDestination: true,
+        },
+      ]);
+      getSeriesImpl = async () => [
+        fakeSonarrSeries({ tvdbId: 4160, seasons: [] }),
+      ];
+      getTvShowImpl = async () =>
+        fakeTmdbShow(
+          3160,
+          [1, 2, 3].map((seasonNumber) => ({
+            id: seasonNumber,
+            air_date: '2024-01-01',
+            episode_count: 10,
+            name: `Season ${seasonNumber}`,
+            overview: '',
+            season_number: seasonNumber,
+          }))
+        );
+
+      await runWithMockTimers(() => sonarrScanner.run());
+
+      const updatedSeasons = await getRepository(
+        MediaDestinationSeasonStatus
+      ).find({
+        where: { destinationStatusId: destination.id },
+        order: { seasonNumber: 'ASC' },
+      });
+      assert.deepStrictEqual(
+        updatedSeasons.map((season) => season.status),
+        persistedSeasons.map((season) => season.status)
+      );
+    });
+
     it('preserves unresolved request-driven PENDING state when an exact scan has no positive evidence', async () => {
       configureSonarr([
         {
@@ -1509,6 +1678,104 @@ describe('Sonarr Scanner', () => {
           })
         ).status,
         MediaStatus.UNKNOWN
+      );
+    });
+
+    it('reconciles a stale PROCESSING parent to PENDING when another exact pending request remains', async () => {
+      configureSonarr([
+        {
+          id: 30,
+          hostname: 'sonarr-en',
+          independentRequestDestination: true,
+        },
+      ]);
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 3250,
+          tvdbId: 4250,
+          mediaType: MediaType.TV,
+        })
+      );
+      const requestRepository = getRepository(MediaRequest);
+      const requestedBy = await getRepository(User).findOneByOrFail({ id: 1 });
+      const approvedRequest = await requestRepository.save(
+        new MediaRequest({
+          type: MediaType.TV,
+          status: MediaRequestStatus.PENDING,
+          media,
+          requestedBy,
+          is4k: false,
+          serverId: 30,
+          seasons: [new SeasonRequest({ seasonNumber: 1 })],
+        })
+      );
+      const pendingRequest = await requestRepository.save(
+        new MediaRequest({
+          type: MediaType.TV,
+          status: MediaRequestStatus.PENDING,
+          media,
+          requestedBy,
+          is4k: false,
+          serverId: 30,
+          seasons: [new SeasonRequest({ seasonNumber: 2 })],
+        })
+      );
+      await requestRepository
+        .createQueryBuilder()
+        .update(MediaRequest)
+        .set({ status: MediaRequestStatus.APPROVED })
+        .where('id = :id', { id: approvedRequest.id })
+        .callListeners(false)
+        .execute();
+      await getRepository(SeasonRequest)
+        .createQueryBuilder()
+        .update(SeasonRequest)
+        .set({ status: MediaRequestStatus.APPROVED })
+        .where('requestId = :requestId', { requestId: approvedRequest.id })
+        .callListeners(false)
+        .execute();
+      const destination = await getRepository(
+        MediaDestinationStatus
+      ).findOneOrFail({
+        where: { mediaId: media.id, serverId: 30 },
+      });
+      destination.status = MediaStatus.PROCESSING;
+      await getRepository(MediaDestinationStatus).save(destination);
+      const seasonStatuses = await getRepository(
+        MediaDestinationSeasonStatus
+      ).find({ where: { destinationStatusId: destination.id } });
+      seasonStatuses.find((season) => season.seasonNumber === 1)!.status =
+        MediaStatus.PROCESSING;
+      await getRepository(MediaDestinationSeasonStatus).save(seasonStatuses);
+      getSeriesImpl = async () => [fakeSonarrSeries({ tvdbId: 9999 })];
+      getLibrarySeriesByTvdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => sonarrScanner.run());
+
+      assert.strictEqual(
+        (await requestRepository.findOneByOrFail({ id: approvedRequest.id }))
+          .status,
+        MediaRequestStatus.DECLINED
+      );
+      assert.strictEqual(
+        (await requestRepository.findOneByOrFail({ id: pendingRequest.id }))
+          .status,
+        MediaRequestStatus.PENDING
+      );
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.PENDING
+      );
+      assert.ok(
+        (
+          await getRepository(MediaDestinationSeasonStatus).find({
+            where: { destinationStatusId: destination.id },
+          })
+        ).every((season) => season.status !== MediaStatus.PROCESSING)
       );
     });
 
@@ -1712,6 +1979,50 @@ describe('Sonarr Scanner', () => {
           })
         ).status,
         MediaStatus.AVAILABLE
+      );
+    });
+
+    it('skips a legacy ambiguous native and independent physical instance', async () => {
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 3600,
+          tvdbId: 4600,
+          mediaType: MediaType.TV,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      const destination = await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 30,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      configureSonarr([
+        { id: 29, hostname: 'ambiguous-sonarr', baseUrl: '/sonarr' },
+        {
+          id: 30,
+          hostname: 'ambiguous-sonarr',
+          baseUrl: '/sonarr',
+          independentRequestDestination: true,
+        },
+      ]);
+      getSeriesImpl = async () => [fakeSonarrSeries({ tvdbId: 9999 })];
+      getLibrarySeriesByTvdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => sonarrScanner.run());
+
+      assert.strictEqual(
+        (await getRepository(Media).findOneByOrFail({ id: media.id })).status,
+        MediaStatus.PROCESSING
+      );
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.PROCESSING
       );
     });
   });

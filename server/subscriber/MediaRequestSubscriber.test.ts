@@ -884,6 +884,60 @@ describe('MediaRequestSubscriber request destinations', () => {
     assert.strictEqual(frenchSeason.status, MediaStatus.PROCESSING);
   });
 
+  it('preserves completed TV season history when an independent parent is declined', async () => {
+    const media = await getRepository(Media).save(
+      new Media({
+        mediaType: MediaType.TV,
+        tmdbId: 93002,
+        tvdbId: 94002,
+      })
+    );
+    const requestRepository = getRepository(MediaRequest);
+    const request = await requestRepository.save(
+      new MediaRequest({
+        type: MediaType.TV,
+        status: MediaRequestStatus.PENDING,
+        media,
+        requestedBy: await requester(),
+        is4k: false,
+        serverId: 202,
+        seasons: [1, 2, 3].map(
+          (seasonNumber) => new SeasonRequest({ seasonNumber })
+        ),
+      })
+    );
+    await markApprovedWithoutListeners(request);
+    const persisted = await requestRepository.findOneOrFail({
+      where: { id: request.id },
+      relations: { seasons: true },
+    });
+    persisted.seasons.find((season) => season.seasonNumber === 1)!.status =
+      MediaRequestStatus.COMPLETED;
+    persisted.seasons.find((season) => season.seasonNumber === 2)!.status =
+      MediaRequestStatus.APPROVED;
+    await getRepository(SeasonRequest).save(persisted.seasons);
+
+    persisted.status = MediaRequestStatus.DECLINED;
+    await requestRepository.save(persisted);
+
+    const updated = await requestRepository.findOneOrFail({
+      where: { id: request.id },
+      relations: { seasons: true },
+    });
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 1)?.status,
+      MediaRequestStatus.COMPLETED
+    );
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 2)?.status,
+      MediaRequestStatus.DECLINED
+    );
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 3)?.status,
+      MediaRequestStatus.DECLINED
+    );
+  });
+
   it('ignores an independent movie request when declining the native request', async () => {
     configureMixedServers();
     const requestRepository = getRepository(MediaRequest);

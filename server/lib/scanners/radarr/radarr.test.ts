@@ -1110,5 +1110,48 @@ describe('Radarr Scanner', () => {
         MediaStatus.AVAILABLE
       );
     });
+
+    it('skips a legacy ambiguous native and independent physical instance', async () => {
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 810,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      const destination = await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 10,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      configureRadarr([
+        { id: 9, hostname: 'ambiguous-radarr', baseUrl: '/radarr' },
+        {
+          id: 10,
+          hostname: 'ambiguous-radarr',
+          baseUrl: '/radarr',
+          independentRequestDestination: true,
+        },
+      ]);
+      getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 999 })];
+      getLibraryMoviesByTmdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      assert.strictEqual(
+        (await getRepository(Media).findOneByOrFail({ id: media.id })).status,
+        MediaStatus.PROCESSING
+      );
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.PROCESSING
+      );
+    });
   });
 });

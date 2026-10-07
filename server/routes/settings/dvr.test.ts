@@ -291,7 +291,11 @@ for (const kind of ['radarr', 'sonarr'] as const) {
         );
       const native = await request(app)
         .post(`/${kind}`)
-        .send(serverPayload(serverFixture(kind, 999)));
+        .send(
+          serverPayload(
+            serverFixture(kind, 999, { hostname: 'native-instance' })
+          )
+        );
 
       assert.strictEqual(independent.status, 201);
       assert.strictEqual(native.status, 201);
@@ -307,6 +311,98 @@ for (const kind of ['radarr', 'sonarr'] as const) {
         await getRepository(MediaDestinationSeasonStatus).count(),
         0
       );
+    });
+
+    it('rejects an independent POST sharing a native physical endpoint', async (t) => {
+      const save = mockSettingsSave(t);
+      const native = serverFixture(kind, 1);
+      setServers(kind, [native]);
+
+      const response = await request(app)
+        .post(`/${kind}`)
+        .send(
+          serverPayload(serverFixture(kind, 999), {
+            independentRequestDestination: true,
+            syncEnabled: true,
+          })
+        );
+
+      assert.strictEqual(response.status, 409);
+      assert.deepStrictEqual(getServers(kind), [native]);
+      assert.strictEqual(save.mock.callCount(), 0);
+    });
+
+    it('rejects a second independent POST sharing a physical endpoint', async (t) => {
+      const save = mockSettingsSave(t);
+      const independent = serverFixture(kind, 1, {
+        independentRequestDestination: true,
+        syncEnabled: true,
+      });
+      setServers(kind, [independent]);
+
+      const response = await request(app)
+        .post(`/${kind}`)
+        .send(
+          serverPayload(serverFixture(kind, 999), {
+            independentRequestDestination: true,
+            syncEnabled: true,
+          })
+        );
+
+      assert.strictEqual(response.status, 409);
+      assert.deepStrictEqual(getServers(kind), [independent]);
+      assert.strictEqual(save.mock.callCount(), 0);
+    });
+
+    it('rejects a native PUT that collides with an independent endpoint', async (t) => {
+      const save = mockSettingsSave(t);
+      const independent = serverFixture(kind, 1, {
+        hostname: 'independent-host',
+        independentRequestDestination: true,
+        syncEnabled: true,
+      });
+      const native = serverFixture(kind, 2, { hostname: 'native-host' });
+      setServers(kind, [independent, native]);
+
+      const response = await request(app)
+        .put(`/${kind}/${native.id}`)
+        .send(serverPayload(native, { hostname: independent.hostname }));
+
+      assert.strictEqual(response.status, 409);
+      assert.deepStrictEqual(getServers(kind), [independent, native]);
+      assert.strictEqual(save.mock.callCount(), 0);
+    });
+
+    it('rejects an independent PUT that collides with another endpoint', async (t) => {
+      const save = mockSettingsSave(t);
+      const native = serverFixture(kind, 1, { hostname: 'native-host' });
+      const independent = serverFixture(kind, 2, {
+        hostname: 'independent-host',
+        independentRequestDestination: true,
+        syncEnabled: true,
+      });
+      setServers(kind, [native, independent]);
+
+      const response = await request(app)
+        .put(`/${kind}/${independent.id}`)
+        .send(serverPayload(independent, { hostname: native.hostname }));
+
+      assert.strictEqual(response.status, 409);
+      assert.deepStrictEqual(getServers(kind), [native, independent]);
+      assert.strictEqual(save.mock.callCount(), 0);
+    });
+
+    it('allows native duplicate physical endpoints as before', async (t) => {
+      mockSettingsSave(t);
+      const native = serverFixture(kind, 1);
+      setServers(kind, [native]);
+
+      const response = await request(app)
+        .post(`/${kind}`)
+        .send(serverPayload(serverFixture(kind, 999)));
+
+      assert.strictEqual(response.status, 201);
+      assert.strictEqual(getServers(kind).length, 2);
     });
 
     it('preserves the independent flag and ID when PUT omits it', async (t) => {
@@ -677,6 +773,7 @@ describe('request creation identity locking', () => {
       independentRequestDestination: true,
     });
     const nextDefault = serverFixture('radarr', 51, {
+      hostname: 'next-default',
       syncEnabled: true,
       independentRequestDestination: true,
     });

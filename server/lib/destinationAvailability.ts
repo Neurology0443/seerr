@@ -9,7 +9,7 @@ import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSea
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import SeasonRequest from '@server/entity/SeasonRequest';
-import { In, type EntityManager } from 'typeorm';
+import { In, Not, type EntityManager } from 'typeorm';
 
 export type DestinationSeasonState = {
   seasonNumber: number;
@@ -21,7 +21,10 @@ type DestinationSeasonObservation = {
   totalEpisodes: number;
   availableEpisodes: number;
   monitored: boolean;
+  observedInService?: boolean;
 };
+
+export class MediaIdentityConflictError extends Error {}
 
 const managerOrDefault = (manager?: EntityManager): EntityManager =>
   manager ?? getRepository(Media).manager;
@@ -105,9 +108,7 @@ export const rollupDestinationTvStatus = (
     return MediaStatus.PROCESSING;
   }
   if (relevantStates.some((season) => season.status === MediaStatus.PENDING)) {
-    return currentStatus === MediaStatus.PROCESSING
-      ? MediaStatus.PROCESSING
-      : MediaStatus.PENDING;
+    return MediaStatus.PENDING;
   }
   if (
     relevantStates.some((season) => season.status === MediaStatus.DELETED) &&
@@ -138,14 +139,33 @@ const ensureMediaIdentity = async (
 ): Promise<Media> => {
   const mediaRepository = manager.getRepository(Media);
   let media = await mediaRepository.findOne({
-    where:
-      mediaType === MediaType.TV && tvdbId
-        ? [
-            { tmdbId, mediaType },
-            { tvdbId, mediaType },
-          ]
-        : { tmdbId, mediaType },
+    where: { tmdbId, mediaType },
   });
+
+  if (mediaType === MediaType.TV && media) {
+    if (media.tvdbId && tvdbId && media.tvdbId !== tvdbId) {
+      throw new MediaIdentityConflictError(
+        `TV media ${media.id} already uses TVDB ID ${media.tvdbId}; refusing incoming TVDB ID ${tvdbId}.`
+      );
+    }
+    if (!media.tvdbId && tvdbId) {
+      const conflictingMedia = await mediaRepository.findOne({
+        where: { tvdbId },
+      });
+      if (conflictingMedia && conflictingMedia.id !== media.id) {
+        throw new MediaIdentityConflictError(
+          `TVDB ID ${tvdbId} is already owned by media ${conflictingMedia.id}; refusing to merge it with media ${media.id}.`
+        );
+      }
+      media.tvdbId = tvdbId;
+      media = await mediaRepository.save(media);
+    }
+    return media;
+  }
+
+  if (!media && mediaType === MediaType.TV && tvdbId) {
+    media = await mediaRepository.findOne({ where: { tvdbId } });
+  }
 
   if (!media) {
     media = await mediaRepository.save(
@@ -160,6 +180,25 @@ const ensureMediaIdentity = async (
   }
 
   return media;
+};
+
+const transitionApprovedRequest = async (
+  requestId: number,
+  status: MediaRequestStatus.COMPLETED | MediaRequestStatus.DECLINED,
+  manager: EntityManager
+): Promise<boolean> => {
+  const result = await manager
+    .createQueryBuilder()
+    .update(MediaRequest)
+    .set({ status })
+    .where('id = :requestId', { requestId })
+    .andWhere('status = :approved', {
+      approved: MediaRequestStatus.APPROVED,
+    })
+    .callListeners(false)
+    .execute();
+
+  return result.affected === 1;
 };
 
 export const completeRequestsForDestination = async (
@@ -188,17 +227,6 @@ export const completeRequestsForDestination = async (
     return;
   }
 
-  if (requests[0].type === MediaType.MOVIE) {
-    if (destination.status !== MediaStatus.AVAILABLE) {
-      return;
-    }
-    for (const request of requests) {
-      request.status = MediaRequestStatus.COMPLETED;
-      await requestRepository.save(request);
-    }
-    return;
-  }
-
   const destinationSeasons = await entityManager.find(
     MediaDestinationSeasonStatus,
     { where: { destinationStatusId: destination.id } }
@@ -206,26 +234,59 @@ export const completeRequestsForDestination = async (
   const statusBySeason = new Map(
     destinationSeasons.map((season) => [season.seasonNumber, season.status])
   );
-  const seasonRequestRepository = entityManager.getRepository(SeasonRequest);
 
   for (const request of requests) {
+    if (request.type === MediaType.MOVIE) {
+      if (destination.status === MediaStatus.AVAILABLE) {
+        await transitionApprovedRequest(
+          request.id,
+          MediaRequestStatus.COMPLETED,
+          entityManager
+        );
+      }
+      continue;
+    }
+
     for (const season of request.seasons) {
-      if (
-        season.status !== MediaRequestStatus.COMPLETED &&
-        statusBySeason.get(season.seasonNumber) === MediaStatus.AVAILABLE
-      ) {
-        season.status = MediaRequestStatus.COMPLETED;
-        await seasonRequestRepository.save(season);
+      if (statusBySeason.get(season.seasonNumber) === MediaStatus.AVAILABLE) {
+        await entityManager
+          .createQueryBuilder()
+          .update(SeasonRequest)
+          .set({ status: MediaRequestStatus.COMPLETED })
+          .where('id = :seasonRequestId', { seasonRequestId: season.id })
+          .andWhere('status IN (:...eligibleSeasonStatuses)', {
+            eligibleSeasonStatuses: [
+              MediaRequestStatus.PENDING,
+              MediaRequestStatus.APPROVED,
+            ],
+          })
+          .andWhere(
+            `EXISTS (SELECT 1 FROM "media_request" "parentRequest" WHERE "parentRequest"."id" = :parentRequestId AND "parentRequest"."status" = :approved)`
+          )
+          .setParameters({
+            parentRequestId: request.id,
+            approved: MediaRequestStatus.APPROVED,
+          })
+          .callListeners(false)
+          .execute();
       }
     }
-    if (
-      request.seasons.length > 0 &&
-      request.seasons.every(
-        (season) => season.status === MediaRequestStatus.COMPLETED
-      )
-    ) {
-      request.status = MediaRequestStatus.COMPLETED;
-      await requestRepository.save(request);
+
+    const requestedSeasonCount = await entityManager.count(SeasonRequest, {
+      where: { request: { id: request.id } },
+    });
+    const incompleteSeasonCount = await entityManager.count(SeasonRequest, {
+      where: {
+        request: { id: request.id },
+        status: Not(MediaRequestStatus.COMPLETED),
+      },
+    });
+    if (requestedSeasonCount > 0 && incompleteSeasonCount === 0) {
+      await transitionApprovedRequest(
+        request.id,
+        MediaRequestStatus.COMPLETED,
+        entityManager
+      );
     }
   }
 };
@@ -247,8 +308,20 @@ export const declineRequestsForDestination = async (
   });
 
   for (const request of requests) {
-    request.status = MediaRequestStatus.DECLINED;
-    await requestRepository.save(request);
+    if (
+      !(await transitionApprovedRequest(
+        request.id,
+        MediaRequestStatus.DECLINED,
+        entityManager
+      ))
+    ) {
+      continue;
+    }
+    const declinedRequest = await requestRepository.findOneOrFail({
+      where: { id: request.id },
+      relations: { media: true, seasons: true },
+    });
+    await reconcileIndependentRequestDecline(declinedRequest, entityManager);
   }
 };
 
@@ -355,7 +428,10 @@ export const updateIndependentTvDestination = async (
   );
 
   for (const observation of seasons) {
-    if (observation.totalEpisodes <= 0) {
+    if (
+      observation.totalEpisodes <= 0 ||
+      observation.observedInService === false
+    ) {
       continue;
     }
     const existing = bySeason.get(observation.seasonNumber);
@@ -398,6 +474,215 @@ export const updateIndependentTvDestination = async (
   destination = await destinationRepository.save(destination);
   await completeRequestsForDestination(media.id, serverId, entityManager);
   return destination;
+};
+
+const releaseRequestDrivenDestinationSeasons = async (
+  {
+    mediaId,
+    serverId,
+    destinationStatusId,
+    seasonNumbers,
+    excludeRequestId,
+  }: {
+    mediaId: number;
+    serverId: number;
+    destinationStatusId: number;
+    seasonNumbers?: number[];
+    excludeRequestId?: number;
+  },
+  manager: EntityManager
+): Promise<void> => {
+  const seasonRepository = manager.getRepository(MediaDestinationSeasonStatus);
+  const uniqueSeasonNumbers = seasonNumbers
+    ? [...new Set(seasonNumbers)]
+    : undefined;
+  if (uniqueSeasonNumbers?.length === 0) {
+    return;
+  }
+  const seasonStatuses = await seasonRepository.find({
+    where: {
+      destinationStatusId,
+      ...(uniqueSeasonNumbers
+        ? { seasonNumber: In(uniqueSeasonNumbers) }
+        : undefined),
+    },
+  });
+
+  for (const seasonStatus of seasonStatuses) {
+    if (
+      seasonStatus.status !== MediaStatus.PENDING &&
+      seasonStatus.status !== MediaStatus.PROCESSING
+    ) {
+      continue;
+    }
+    const activeQuery = manager
+      .getRepository(MediaRequest)
+      .createQueryBuilder('request')
+      .innerJoin('request.seasons', 'seasonRequest')
+      .where('request.mediaId = :mediaId', { mediaId })
+      .andWhere('request.serverId = :serverId', { serverId })
+      .andWhere('request.status IN (:...statuses)', {
+        statuses: [MediaRequestStatus.PENDING, MediaRequestStatus.APPROVED],
+      })
+      .andWhere('seasonRequest.seasonNumber = :seasonNumber', {
+        seasonNumber: seasonStatus.seasonNumber,
+      });
+    if (excludeRequestId !== undefined) {
+      activeQuery.andWhere('request.id != :excludeRequestId', {
+        excludeRequestId,
+      });
+    }
+    if ((await activeQuery.getCount()) === 0) {
+      seasonStatus.status = MediaStatus.UNKNOWN;
+      await seasonRepository.save(seasonStatus);
+    }
+  }
+};
+
+export const reconcileIndependentTvDestination = async (
+  mediaId: number,
+  serverId: number,
+  manager?: EntityManager,
+  excludeRequestId?: number
+): Promise<void> => {
+  const entityManager = managerOrDefault(manager);
+  const destinationRepository = entityManager.getRepository(
+    MediaDestinationStatus
+  );
+  const destination = await destinationRepository.findOne({
+    where: { mediaId, serverId },
+  });
+  if (!destination) {
+    return;
+  }
+  const seasons = await entityManager.find(MediaDestinationSeasonStatus, {
+    where: { destinationStatusId: destination.id },
+  });
+  const relevantSeasons = seasons.filter((season) => season.seasonNumber !== 0);
+
+  if (relevantSeasons.length === 0) {
+    const activeRequests = await entityManager.find(MediaRequest, {
+      where: {
+        media: { id: mediaId },
+        serverId,
+        ...(excludeRequestId !== undefined
+          ? { id: Not(excludeRequestId) }
+          : undefined),
+        status: In([MediaRequestStatus.PENDING, MediaRequestStatus.APPROVED]),
+      },
+      select: { id: true, status: true },
+    });
+    if (
+      destination.status === MediaStatus.PENDING ||
+      destination.status === MediaStatus.PROCESSING
+    ) {
+      destination.status = activeRequests.some(
+        (request) => request.status === MediaRequestStatus.APPROVED
+      )
+        ? MediaStatus.PROCESSING
+        : activeRequests.length > 0
+          ? MediaStatus.PENDING
+          : MediaStatus.UNKNOWN;
+      await destinationRepository.save(destination);
+    }
+    return;
+  }
+
+  let nextStatus = rollupDestinationTvStatus(
+    destination.status,
+    relevantSeasons.map((season) => ({
+      seasonNumber: season.seasonNumber,
+      status: season.status,
+    }))
+  );
+  if (
+    nextStatus === MediaStatus.PENDING ||
+    nextStatus === MediaStatus.PROCESSING
+  ) {
+    const activeRequests = await entityManager.count(MediaRequest, {
+      where: {
+        media: { id: mediaId },
+        serverId,
+        ...(excludeRequestId !== undefined
+          ? { id: Not(excludeRequestId) }
+          : undefined),
+        status: In([MediaRequestStatus.PENDING, MediaRequestStatus.APPROVED]),
+      },
+    });
+    if (activeRequests === 0) {
+      nextStatus = MediaStatus.UNKNOWN;
+    }
+  }
+  if (nextStatus !== destination.status) {
+    destination.status = nextStatus;
+    await destinationRepository.save(destination);
+  }
+};
+
+export const reconcileIndependentRequestDecline = async (
+  request: MediaRequest,
+  manager?: EntityManager
+): Promise<void> => {
+  const entityManager = managerOrDefault(manager);
+  const destinationRepository = entityManager.getRepository(
+    MediaDestinationStatus
+  );
+  const destination = await destinationRepository.findOne({
+    where: { mediaId: request.media.id, serverId: request.serverId },
+  });
+  if (!destination) {
+    return;
+  }
+
+  if (request.type === MediaType.TV) {
+    await entityManager
+      .createQueryBuilder()
+      .update(SeasonRequest)
+      .set({ status: MediaRequestStatus.DECLINED })
+      .where('requestId = :requestId', { requestId: request.id })
+      .andWhere('status IN (:...activeStatuses)', {
+        activeStatuses: [
+          MediaRequestStatus.PENDING,
+          MediaRequestStatus.APPROVED,
+        ],
+      })
+      .callListeners(false)
+      .execute();
+    await releaseRequestDrivenDestinationSeasons(
+      {
+        mediaId: request.media.id,
+        serverId: request.serverId,
+        destinationStatusId: destination.id,
+        seasonNumbers: request.seasons.map((season) => season.seasonNumber),
+        excludeRequestId: request.id,
+      },
+      entityManager
+    );
+    await reconcileIndependentTvDestination(
+      request.media.id,
+      request.serverId,
+      entityManager,
+      request.id
+    );
+    return;
+  }
+
+  const otherActive = await entityManager.count(MediaRequest, {
+    where: {
+      media: { id: request.media.id },
+      serverId: request.serverId,
+      id: Not(request.id),
+      status: In([MediaRequestStatus.PENDING, MediaRequestStatus.APPROVED]),
+    },
+  });
+  if (
+    otherActive === 0 &&
+    (destination.status === MediaStatus.PENDING ||
+      destination.status === MediaStatus.PROCESSING)
+  ) {
+    destination.status = MediaStatus.UNKNOWN;
+    await destinationRepository.save(destination);
+  }
 };
 
 export const markMissingMovieDestination = async (
@@ -474,6 +759,14 @@ export const markMissingTvDestination = async (
 
   await declineRequestsForDestination(mediaId, serverId, entityManager);
 
+  const refreshedDestination = await destinationRepository.findOneOrFail({
+    where: { id: destination.id },
+  });
+  if (hadScannerAvailability) {
+    refreshedDestination.status = MediaStatus.DELETED;
+    await destinationRepository.save(refreshedDestination);
+  }
+
   const refreshedSeasons = await seasonRepository.find({
     where: { destinationStatusId: destination.id },
   });
@@ -489,52 +782,11 @@ export const markMissingTvDestination = async (
     await seasonRepository.save(changedSeasons);
   }
 
-  for (const season of refreshedSeasons) {
-    if (
-      season.status !== MediaStatus.PENDING &&
-      season.status !== MediaStatus.PROCESSING
-    ) {
-      continue;
-    }
-    const activeForSeason = await entityManager
-      .getRepository(MediaRequest)
-      .createQueryBuilder('request')
-      .innerJoin('request.seasons', 'seasonRequest')
-      .where('request.mediaId = :mediaId', { mediaId })
-      .andWhere('request.serverId = :serverId', { serverId })
-      .andWhere('request.status IN (:...statuses)', {
-        statuses: [MediaRequestStatus.PENDING, MediaRequestStatus.APPROVED],
-      })
-      .andWhere('seasonRequest.seasonNumber = :seasonNumber', {
-        seasonNumber: season.seasonNumber,
-      })
-      .getCount();
-    if (activeForSeason === 0) {
-      season.status = MediaStatus.UNKNOWN;
-      await seasonRepository.save(season);
-    }
-  }
-
-  const refreshedDestination = await destinationRepository.findOneOrFail({
-    where: { id: destination.id },
-  });
-  if (hadScannerAvailability) {
-    refreshedDestination.status = MediaStatus.DELETED;
-    await destinationRepository.save(refreshedDestination);
-    return;
-  }
-
-  const activeRequests = await entityManager.count(MediaRequest, {
-    where: {
-      media: { id: mediaId },
-      serverId,
-      status: In([MediaRequestStatus.PENDING, MediaRequestStatus.APPROVED]),
-    },
-  });
-  if (activeRequests === 0) {
-    refreshedDestination.status = MediaStatus.UNKNOWN;
-    await destinationRepository.save(refreshedDestination);
-  }
+  await releaseRequestDrivenDestinationSeasons(
+    { mediaId, serverId, destinationStatusId: destination.id },
+    entityManager
+  );
+  await reconcileIndependentTvDestination(mediaId, serverId, entityManager);
 };
 
 export const findIndependentDestinationCandidates = async (

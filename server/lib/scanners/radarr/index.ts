@@ -15,6 +15,10 @@ import type {
 import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import {
+  findAmbiguousIndependentDvrServerIds,
+  isSameDvrEndpoint,
+} from '@server/lib/settings/dvrValidation';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -61,13 +65,24 @@ class RadarrScanner
     this.server4kReturnedEmpty = false;
 
     try {
-      this.servers = uniqWith(settings.radarr, (radarrA, radarrB) => {
-        return (
-          radarrA.hostname === radarrB.hostname &&
-          radarrA.port === radarrB.port &&
-          radarrA.baseUrl === radarrB.baseUrl
+      const ambiguousServerIds = findAmbiguousIndependentDvrServerIds(
+        settings.radarr
+      );
+      const ambiguousServers = settings.radarr.filter((server) =>
+        ambiguousServerIds.has(server.id)
+      );
+      if (ambiguousServers.length > 0) {
+        this.log(
+          `Skipping ambiguous Radarr configuration sharing a physical instance: ${ambiguousServers
+            .map((server) => `${server.name} (${server.id})`)
+            .join(', ')}`,
+          'error'
         );
-      });
+      }
+      this.servers = uniqWith(
+        settings.radarr.filter((server) => !ambiguousServerIds.has(server.id)),
+        isSameDvrEndpoint
+      );
 
       for (const server of this.servers) {
         this.currentServer = server;
@@ -144,6 +159,26 @@ class RadarrScanner
         this.didScanStandard = false;
       }
       if (!all4kScanned) {
+        this.didScan4k = false;
+      }
+
+      if (
+        ambiguousServers.some(
+          (server) =>
+            server.independentRequestDestination !== true &&
+            (!this.enable4kMovie || !server.is4k)
+        )
+      ) {
+        this.didScanStandard = false;
+      }
+      if (
+        ambiguousServers.some(
+          (server) =>
+            server.independentRequestDestination !== true &&
+            this.enable4kMovie &&
+            server.is4k
+        )
+      ) {
         this.didScan4k = false;
       }
 

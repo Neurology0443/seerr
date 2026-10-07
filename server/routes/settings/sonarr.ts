@@ -7,6 +7,7 @@ import {
   isDvrServerHistoricallyUsed,
 } from '@server/lib/settings/dvrId';
 import {
+  conflictsWithIndependentDvrEndpoint,
   hasIndependentRequestDestination,
   hasValidIndependentRequestDestination,
 } from '@server/lib/settings/dvrValidation';
@@ -45,6 +46,14 @@ sonarrRoutes.post('/', async (req, res, next) => {
     return next({
       status: 400,
       message: 'Independent request destinations require sync to be enabled.',
+    });
+  }
+
+  if (conflictsWithIndependentDvrEndpoint(newSonarr, settings.sonarr)) {
+    return next({
+      status: 409,
+      message:
+        'This Sonarr instance is already configured and cannot also be an independent destination.',
     });
   }
 
@@ -140,6 +149,20 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
       return next({
         status: 400,
         message: 'Independent request destinations require sync to be enabled.',
+      });
+    }
+
+    if (
+      conflictsWithIndependentDvrEndpoint(
+        updatedSonarr,
+        settings.sonarr,
+        currentSonarr.id
+      )
+    ) {
+      return next({
+        status: 409,
+        message:
+          'This Sonarr instance is already configured and cannot also be an independent destination.',
       });
     }
 

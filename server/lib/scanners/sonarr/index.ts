@@ -24,6 +24,10 @@ import type {
 import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import {
+  findAmbiguousIndependentDvrServerIds,
+  isSameDvrEndpoint,
+} from '@server/lib/settings/dvrValidation';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -70,13 +74,24 @@ class SonarrScanner
     this.server4kReturnedEmpty = false;
 
     try {
-      this.servers = uniqWith(settings.sonarr, (sonarrA, sonarrB) => {
-        return (
-          sonarrA.hostname === sonarrB.hostname &&
-          sonarrA.port === sonarrB.port &&
-          sonarrA.baseUrl === sonarrB.baseUrl
+      const ambiguousServerIds = findAmbiguousIndependentDvrServerIds(
+        settings.sonarr
+      );
+      const ambiguousServers = settings.sonarr.filter((server) =>
+        ambiguousServerIds.has(server.id)
+      );
+      if (ambiguousServers.length > 0) {
+        this.log(
+          `Skipping ambiguous Sonarr configuration sharing a physical instance: ${ambiguousServers
+            .map((server) => `${server.name} (${server.id})`)
+            .join(', ')}`,
+          'error'
         );
-      });
+      }
+      this.servers = uniqWith(
+        settings.sonarr.filter((server) => !ambiguousServerIds.has(server.id)),
+        isSameDvrEndpoint
+      );
 
       for (const server of this.servers) {
         this.currentServer = server;
@@ -156,6 +171,26 @@ class SonarrScanner
         this.didScan4k = false;
       }
 
+      if (
+        ambiguousServers.some(
+          (server) =>
+            server.independentRequestDestination !== true &&
+            (!this.enable4kShow || !server.is4k)
+        )
+      ) {
+        this.didScanStandard = false;
+      }
+      if (
+        ambiguousServers.some(
+          (server) =>
+            server.independentRequestDestination !== true &&
+            this.enable4kShow &&
+            server.is4k
+        )
+      ) {
+        this.didScan4k = false;
+      }
+
       if (this.serverReturnedEmpty) {
         this.didScanStandard = false;
       }
@@ -211,6 +246,9 @@ class SonarrScanner
       }
 
       const settings = getSettings();
+      const observedSonarrSeasons = new Set(
+        sonarrSeries.seasons.map((season) => season.seasonNumber)
+      );
 
       const filteredSeasons = tvShow.seasons
         .filter(
@@ -261,6 +299,7 @@ class SonarrScanner
               totalEpisodes: season.statistics?.totalEpisodeCount ?? 0,
               availableEpisodes: season.statistics?.episodeFileCount ?? 0,
               monitored: season.monitored,
+              observedInService: observedSonarrSeasons.has(season.seasonNumber),
             })),
           })
         );
