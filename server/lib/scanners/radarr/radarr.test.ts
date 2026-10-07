@@ -7,6 +7,7 @@ import {
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import MediaRequest from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
 import { radarrScanner } from '@server/lib/scanners/radarr';
@@ -720,6 +721,458 @@ describe('Radarr Scanner', () => {
       assert.strictEqual(updatedMedia.status4k, MediaStatus.UNKNOWN);
       assert.strictEqual(updatedStandard.status, MediaRequestStatus.APPROVED);
       assert.strictEqual(updated4k.status, MediaRequestStatus.DECLINED);
+    });
+  });
+
+  describe('independent destination scanning', () => {
+    it('scans canonically equivalent native configurations separately under upstream raw deduplication', async () => {
+      configureRadarr([
+        { id: 8, hostname: 'localhost', port: 7878, baseUrl: '' },
+        { id: 9, hostname: 'localhost', port: 7878, baseUrl: '/' },
+      ]);
+      let inventoryCalls = 0;
+      getMoviesImpl = async () => {
+        inventoryCalls++;
+        return [];
+      };
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      assert.strictEqual(inventoryCalls, 2);
+    });
+
+    it('creates only minimal native identity when an independent movie is first discovered', async () => {
+      configureRadarr([
+        {
+          id: 10,
+          hostname: 'radarr-fr',
+          independentRequestDestination: true,
+        },
+      ]);
+      getMoviesImpl = async () => [
+        fakeRadarrMovie({
+          tmdbId: 549,
+          monitored: false,
+          hasFile: false,
+        }),
+      ];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      const media = await getRepository(Media).findOneOrFail({
+        where: { tmdbId: 549, mediaType: MediaType.MOVIE },
+      });
+      const destination = await getRepository(
+        MediaDestinationStatus
+      ).findOneOrFail({
+        where: { mediaId: media.id, serverId: 10 },
+      });
+      assert.strictEqual(media.status, MediaStatus.UNKNOWN);
+      assert.strictEqual(media.status4k, MediaStatus.UNKNOWN);
+      assert.strictEqual(media.serviceId, null);
+      assert.strictEqual(media.externalServiceId, null);
+      assert.strictEqual(destination.status, MediaStatus.UNKNOWN);
+    });
+
+    it('stores exact availability and linkage without changing native state or another destination', async () => {
+      const mediaRepository = getRepository(Media);
+      const destinationRepository = getRepository(MediaDestinationStatus);
+      const requestRepository = getRepository(MediaRequest);
+      const requestedBy = await getRepository(User).findOneOrFail({
+        where: { id: 1 },
+      });
+      const media = await mediaRepository.save(
+        new Media({
+          tmdbId: 550,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.UNKNOWN,
+          status4k: MediaStatus.UNKNOWN,
+          serviceId: 99,
+          externalServiceId: 999,
+          externalServiceSlug: 'native-link',
+        })
+      );
+      await destinationRepository.save([
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 10,
+          status: MediaStatus.PROCESSING,
+        }),
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 11,
+          status: MediaStatus.PROCESSING,
+        }),
+      ]);
+      const exactRequest = await requestRepository.save(
+        new MediaRequest({
+          type: MediaType.MOVIE,
+          status: MediaRequestStatus.PENDING,
+          media,
+          requestedBy,
+          is4k: false,
+          serverId: 10,
+        })
+      );
+      const otherRequest = await requestRepository.save(
+        new MediaRequest({
+          type: MediaType.MOVIE,
+          status: MediaRequestStatus.PENDING,
+          media,
+          requestedBy,
+          is4k: false,
+          serverId: 11,
+        })
+      );
+      await requestRepository
+        .createQueryBuilder()
+        .update(MediaRequest)
+        .set({ status: MediaRequestStatus.APPROVED })
+        .where('id IN (:...ids)', { ids: [exactRequest.id, otherRequest.id] })
+        .callListeners(false)
+        .execute();
+
+      configureRadarr([
+        {
+          id: 10,
+          hostname: 'radarr-fr',
+          independentRequestDestination: true,
+        },
+      ]);
+      getMoviesImpl = async () => [
+        fakeRadarrMovie({ id: 77, titleSlug: 'exact-link' }),
+      ];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      const updatedMedia = await mediaRepository.findOneOrFail({
+        where: { id: media.id },
+      });
+      const exactDestination = await destinationRepository.findOneOrFail({
+        where: { mediaId: media.id, serverId: 10 },
+      });
+      const otherDestination = await destinationRepository.findOneOrFail({
+        where: { mediaId: media.id, serverId: 11 },
+      });
+      assert.strictEqual(exactDestination.status, MediaStatus.AVAILABLE);
+      assert.strictEqual(exactDestination.externalServiceId, 77);
+      assert.strictEqual(exactDestination.externalServiceSlug, 'exact-link');
+      assert.strictEqual(otherDestination.status, MediaStatus.PROCESSING);
+      assert.strictEqual(updatedMedia.status, MediaStatus.UNKNOWN);
+      assert.strictEqual(updatedMedia.status4k, MediaStatus.UNKNOWN);
+      assert.strictEqual(updatedMedia.serviceId, 99);
+      assert.strictEqual(updatedMedia.externalServiceId, 999);
+      assert.strictEqual(updatedMedia.externalServiceSlug, 'native-link');
+      assert.strictEqual(
+        (
+          await requestRepository.findOneOrFail({
+            where: { id: exactRequest.id },
+          })
+        ).status,
+        MediaRequestStatus.COMPLETED
+      );
+      assert.strictEqual(
+        (
+          await requestRepository.findOneOrFail({
+            where: { id: otherRequest.id },
+          })
+        ).status,
+        MediaRequestStatus.APPROVED
+      );
+    });
+
+    it('declines only an exactly missing PROCESSING movie and ignores the other media type', async () => {
+      const mediaRepository = getRepository(Media);
+      const destinationRepository = getRepository(MediaDestinationStatus);
+      const requestRepository = getRepository(MediaRequest);
+      const requestedBy = await getRepository(User).findOneOrFail({
+        where: { id: 1 },
+      });
+      const movie = await mediaRepository.save(
+        new Media({ tmdbId: 700, mediaType: MediaType.MOVIE })
+      );
+      const show = await mediaRepository.save(
+        new Media({
+          tmdbId: 701,
+          tvdbId: 702,
+          mediaType: MediaType.TV,
+        })
+      );
+      await destinationRepository.save([
+        new MediaDestinationStatus({
+          mediaId: movie.id,
+          serverId: 10,
+          status: MediaStatus.PROCESSING,
+        }),
+        new MediaDestinationStatus({
+          mediaId: show.id,
+          serverId: 10,
+          status: MediaStatus.PROCESSING,
+        }),
+      ]);
+      const request = await requestRepository.save(
+        new MediaRequest({
+          type: MediaType.MOVIE,
+          status: MediaRequestStatus.PENDING,
+          media: movie,
+          requestedBy,
+          is4k: false,
+          serverId: 10,
+        })
+      );
+      await requestRepository
+        .createQueryBuilder()
+        .update(MediaRequest)
+        .set({ status: MediaRequestStatus.APPROVED })
+        .where('id = :id', { id: request.id })
+        .callListeners(false)
+        .execute();
+
+      configureRadarr([
+        {
+          id: 10,
+          hostname: 'radarr-fr',
+          independentRequestDestination: true,
+        },
+      ]);
+      getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 999 })];
+      getLibraryMoviesByTmdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      assert.strictEqual(
+        (await requestRepository.findOneOrFail({ where: { id: request.id } }))
+          .status,
+        MediaRequestStatus.DECLINED
+      );
+      assert.strictEqual(
+        (
+          await destinationRepository.findOneOrFail({
+            where: { mediaId: movie.id, serverId: 10 },
+          })
+        ).status,
+        MediaStatus.UNKNOWN
+      );
+      assert.strictEqual(
+        (
+          await destinationRepository.findOneOrFail({
+            where: { mediaId: show.id, serverId: 10 },
+          })
+        ).status,
+        MediaStatus.PROCESSING
+      );
+    });
+
+    it('marks confirmed missing AVAILABLE media deleted but preserves completed history', async () => {
+      const media = await getRepository(Media).save(
+        new Media({ tmdbId: 710, mediaType: MediaType.MOVIE })
+      );
+      await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 10,
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+      const request = await getRepository(MediaRequest).save(
+        new MediaRequest({
+          type: MediaType.MOVIE,
+          status: MediaRequestStatus.COMPLETED,
+          media,
+          requestedBy: await getRepository(User).findOneOrFail({
+            where: { id: 1 },
+          }),
+          is4k: false,
+          serverId: 10,
+        })
+      );
+      configureRadarr([
+        {
+          id: 10,
+          hostname: 'radarr-fr',
+          independentRequestDestination: true,
+        },
+      ]);
+      getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 999 })];
+      getLibraryMoviesByTmdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneOrFail({
+            where: { mediaId: media.id, serverId: 10 },
+          })
+        ).status,
+        MediaStatus.DELETED
+      );
+      assert.strictEqual(
+        (
+          await getRepository(MediaRequest).findOneOrFail({
+            where: { id: request.id },
+          })
+        ).status,
+        MediaRequestStatus.COMPLETED
+      );
+    });
+
+    it('does not clean up an omitted movie when exact lookup finds it, throws, or inventory is empty', async () => {
+      const media = await getRepository(Media).save(
+        new Media({ tmdbId: 720, mediaType: MediaType.MOVIE })
+      );
+      const destination = await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 10,
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+      configureRadarr([
+        {
+          id: 10,
+          hostname: 'radarr-fr',
+          independentRequestDestination: true,
+        },
+      ]);
+      getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 999 })];
+      getLibraryMoviesByTmdbIdImpl = async (tmdbId) => [
+        fakeRadarrMovie({ tmdbId }),
+      ];
+      await runWithMockTimers(() => radarrScanner.run());
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.AVAILABLE
+      );
+
+      getLibraryMoviesByTmdbIdImpl = async () => {
+        throw new Error('unreachable');
+      };
+      await runWithMockTimers(() => radarrScanner.run());
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.AVAILABLE
+      );
+
+      getMoviesImpl = async () => [];
+      getLibraryMoviesByTmdbIdImpl = async () => [];
+      await runWithMockTimers(() => radarrScanner.run());
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.AVAILABLE
+      );
+    });
+
+    it('keeps native and independent presence bookkeeping isolated in one run', async () => {
+      const nativeOrphan = await getRepository(Media).save(
+        new Media({
+          tmdbId: 800,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      const independentMedia = await getRepository(Media).save(
+        new Media({ tmdbId: 801, mediaType: MediaType.MOVIE })
+      );
+      const independentDestination = await getRepository(
+        MediaDestinationStatus
+      ).save(
+        new MediaDestinationStatus({
+          mediaId: independentMedia.id,
+          serverId: 10,
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+      configureRadarr([
+        { id: 9, hostname: 'radarr-native' },
+        {
+          id: 10,
+          hostname: 'radarr-independent',
+          independentRequestDestination: true,
+        },
+      ]);
+      const inventories = [
+        [fakeRadarrMovie({ tmdbId: 801 })],
+        [fakeRadarrMovie({ tmdbId: 800 })],
+      ];
+      getMoviesImpl = async () => inventories.shift() ?? [];
+      getLibraryMoviesByTmdbIdImpl = async (tmdbId) =>
+        tmdbId === 801 ? [fakeRadarrMovie({ tmdbId })] : [];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      assert.strictEqual(
+        (await getRepository(Media).findOneByOrFail({ id: nativeOrphan.id }))
+          .status,
+        MediaStatus.UNKNOWN
+      );
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: independentDestination.id,
+          })
+        ).status,
+        MediaStatus.AVAILABLE
+      );
+    });
+
+    it('skips a legacy ambiguous native and independent physical instance', async () => {
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 810,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      const destination = await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 10,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      configureRadarr([
+        { id: 9, hostname: ' Ambiguous-Radarr ', baseUrl: '/radarr/' },
+        {
+          id: 10,
+          hostname: 'ambiguous-radarr',
+          baseUrl: 'radarr',
+          independentRequestDestination: true,
+        },
+      ]);
+      let inventoryCalls = 0;
+      getMoviesImpl = async () => {
+        inventoryCalls++;
+        return [fakeRadarrMovie({ tmdbId: 999 })];
+      };
+      getLibraryMoviesByTmdbIdImpl = async () => [];
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      assert.strictEqual(
+        (await getRepository(Media).findOneByOrFail({ id: media.id })).status,
+        MediaStatus.PROCESSING
+      );
+      assert.strictEqual(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destination.id,
+          })
+        ).status,
+        MediaStatus.PROCESSING
+      );
+      assert.strictEqual(inventoryCalls, 0);
     });
   });
 });

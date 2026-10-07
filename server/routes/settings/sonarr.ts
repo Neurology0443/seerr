@@ -7,11 +7,15 @@ import {
   isDvrServerHistoricallyUsed,
 } from '@server/lib/settings/dvrId';
 import {
+  conflictsWithIndependentDvrEndpoint,
   hasIndependentRequestDestination,
   hasValidIndependentRequestDestination,
 } from '@server/lib/settings/dvrValidation';
 import logger from '@server/logger';
-import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
+import {
+  withDvrIdentityLock,
+  withDvrSettingsMutationLock,
+} from '@server/utils/dvrIdentityLock';
 import { Router } from 'express';
 
 const sonarrRoutes = Router();
@@ -30,41 +34,51 @@ sonarrRoutes.post('/', async (req, res, next) => {
     });
   }
 
-  const settings = getSettings();
+  return withDvrSettingsMutationLock('sonarr', async () => {
+    const settings = getSettings();
 
-  const newSonarr = {
-    ...req.body,
-    independentRequestDestination:
-      req.body.independentRequestDestination ?? false,
-  } as SonarrSettings;
+    const newSonarr = {
+      ...req.body,
+      independentRequestDestination:
+        req.body.independentRequestDestination ?? false,
+    } as SonarrSettings;
 
-  if (
-    newSonarr.independentRequestDestination === true &&
-    newSonarr.syncEnabled !== true
-  ) {
-    return next({
-      status: 400,
-      message: 'Independent request destinations require sync to be enabled.',
-    });
-  }
-
-  newSonarr.id = await allocateDvrServerId('sonarr');
-
-  // If we are setting this as the default, clear any previous defaults for the same type first
-  // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
-  // and are the default
-  if (newSonarr.isDefault) {
-    settings.sonarr
-      .filter((sonarrInstance) => sonarrInstance.is4k === newSonarr.is4k)
-      .forEach((sonarrInstance) => {
-        sonarrInstance.isDefault = false;
+    if (
+      newSonarr.independentRequestDestination === true &&
+      newSonarr.syncEnabled !== true
+    ) {
+      return next({
+        status: 400,
+        message: 'Independent request destinations require sync to be enabled.',
       });
-  }
+    }
 
-  settings.sonarr = [...settings.sonarr, newSonarr];
-  await settings.save();
+    if (conflictsWithIndependentDvrEndpoint(newSonarr, settings.sonarr)) {
+      return next({
+        status: 409,
+        message:
+          'This Sonarr instance is already configured and cannot also be an independent destination.',
+      });
+    }
 
-  return res.status(201).json(newSonarr);
+    newSonarr.id = await allocateDvrServerId('sonarr');
+
+    // If we are setting this as the default, clear any previous defaults for the same type first
+    // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
+    // and are the default
+    if (newSonarr.isDefault) {
+      settings.sonarr
+        .filter((sonarrInstance) => sonarrInstance.is4k === newSonarr.is4k)
+        .forEach((sonarrInstance) => {
+          sonarrInstance.isDefault = false;
+        });
+    }
+
+    settings.sonarr = [...settings.sonarr, newSonarr];
+    await settings.save();
+
+    return res.status(201).json(newSonarr);
+  });
 });
 
 sonarrRoutes.post('/test', async (req, res, next) => {
@@ -143,6 +157,20 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
       });
     }
 
+    if (
+      conflictsWithIndependentDvrEndpoint(
+        updatedSonarr,
+        settings.sonarr,
+        currentSonarr.id
+      )
+    ) {
+      return next({
+        status: 409,
+        message:
+          'This Sonarr instance is already configured and cannot also be an independent destination.',
+      });
+    }
+
     const independentRoleChanged =
       updatedSonarr.independentRequestDestination !==
       currentIndependentRequestDestination;
@@ -189,32 +217,34 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
     return res.status(200).json(settings.sonarr[sonarrIndex]);
   };
 
-  return update();
+  return withDvrSettingsMutationLock('sonarr', update);
 });
 
 sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   const serverId = Number(req.params.id);
 
-  return withDvrIdentityLock('sonarr', serverId, async () => {
-    const settings = getSettings();
-    const sonarrIndex = settings.sonarr.findIndex((r) => r.id === serverId);
+  return withDvrSettingsMutationLock('sonarr', () =>
+    withDvrIdentityLock('sonarr', serverId, async () => {
+      const settings = getSettings();
+      const sonarrIndex = settings.sonarr.findIndex((r) => r.id === serverId);
 
-    if (sonarrIndex === -1) {
-      return next({ status: 404, message: 'Settings instance not found' });
-    }
+      if (sonarrIndex === -1) {
+        return next({ status: 404, message: 'Settings instance not found' });
+      }
 
-    if (await hasActiveDvrRequests('sonarr', serverId)) {
-      return next({
-        status: 409,
-        message: 'A server with active requests cannot be deleted.',
-      });
-    }
+      if (await hasActiveDvrRequests('sonarr', serverId)) {
+        return next({
+          status: 409,
+          message: 'A server with active requests cannot be deleted.',
+        });
+      }
 
-    const removed = settings.sonarr.splice(sonarrIndex, 1);
-    await settings.save();
+      const removed = settings.sonarr.splice(sonarrIndex, 1);
+      await settings.save();
 
-    return res.status(200).json(removed[0]);
-  });
+      return res.status(200).json(removed[0]);
+    })
+  );
 });
 
 export default sonarrRoutes;

@@ -19,6 +19,7 @@ import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
+import { reconcileIndependentRequestDecline } from '@server/lib/destinationAvailability';
 import notificationManager, { Notification } from '@server/lib/notifications';
 import {
   ACTIVE_REQUEST_STATUSES,
@@ -1407,25 +1408,19 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       entity.status === MediaRequestStatus.APPROVED
     ) {
       for (const season of entity.seasons) {
-        season.status = MediaRequestStatus.APPROVED;
-        await seasonRequestRepository.save(season);
+        if (season.status === MediaRequestStatus.PENDING) {
+          season.status = MediaRequestStatus.APPROVED;
+          await seasonRequestRepository.save(season);
+        }
       }
     }
 
-    if (
-      entity.type === MediaType.TV &&
-      entity.status === MediaRequestStatus.DECLINED
-    ) {
-      for (const season of entity.seasons) {
-        season.status = MediaRequestStatus.DECLINED;
-        await seasonRequestRepository.save(season);
-      }
+    if (entity.status === MediaRequestStatus.DECLINED) {
+      await reconcileIndependentRequestDecline(entity, manager);
+      return;
     }
 
-    if (
-      entity.status === MediaRequestStatus.DECLINED ||
-      entity.status === MediaRequestStatus.FAILED
-    ) {
+    if (entity.status === MediaRequestStatus.FAILED) {
       await this.releaseIndependentDestination(manager, entity);
     }
   }
@@ -1672,7 +1667,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       }
     }
 
-    if (entity.status === MediaRequestStatus.COMPLETED) {
+    if (entity.status === MediaRequestStatus.COMPLETED && !independent) {
       if (entity.media.mediaType === MediaType.MOVIE) {
         await this.notifyAvailableMovie(entity, event);
       }

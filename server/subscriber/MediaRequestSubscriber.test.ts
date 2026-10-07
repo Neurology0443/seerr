@@ -18,6 +18,7 @@ import { MediaRequest } from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import notificationManager from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
@@ -883,6 +884,60 @@ describe('MediaRequestSubscriber request destinations', () => {
     assert.strictEqual(frenchSeason.status, MediaStatus.PROCESSING);
   });
 
+  it('preserves completed TV season history when an independent parent is declined', async () => {
+    const media = await getRepository(Media).save(
+      new Media({
+        mediaType: MediaType.TV,
+        tmdbId: 93002,
+        tvdbId: 94002,
+      })
+    );
+    const requestRepository = getRepository(MediaRequest);
+    const request = await requestRepository.save(
+      new MediaRequest({
+        type: MediaType.TV,
+        status: MediaRequestStatus.PENDING,
+        media,
+        requestedBy: await requester(),
+        is4k: false,
+        serverId: 202,
+        seasons: [1, 2, 3].map(
+          (seasonNumber) => new SeasonRequest({ seasonNumber })
+        ),
+      })
+    );
+    await markApprovedWithoutListeners(request);
+    const persisted = await requestRepository.findOneOrFail({
+      where: { id: request.id },
+      relations: { seasons: true },
+    });
+    persisted.seasons.find((season) => season.seasonNumber === 1)!.status =
+      MediaRequestStatus.COMPLETED;
+    persisted.seasons.find((season) => season.seasonNumber === 2)!.status =
+      MediaRequestStatus.APPROVED;
+    await getRepository(SeasonRequest).save(persisted.seasons);
+
+    persisted.status = MediaRequestStatus.DECLINED;
+    await requestRepository.save(persisted);
+
+    const updated = await requestRepository.findOneOrFail({
+      where: { id: request.id },
+      relations: { seasons: true },
+    });
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 1)?.status,
+      MediaRequestStatus.COMPLETED
+    );
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 2)?.status,
+      MediaRequestStatus.DECLINED
+    );
+    assert.strictEqual(
+      updated.seasons.find((season) => season.seasonNumber === 3)?.status,
+      MediaRequestStatus.DECLINED
+    );
+  });
+
   it('ignores an independent movie request when declining the native request', async () => {
     configureMixedServers();
     const requestRepository = getRepository(MediaRequest);
@@ -1568,5 +1623,36 @@ describe('MediaRequestSubscriber request destinations', () => {
     assert.strictEqual(persisted.status, MediaRequestStatus.DECLINED);
     assert.strictEqual(destination.status, MediaStatus.UNKNOWN);
     assert.strictEqual(sendNotificationMock.mock.callCount(), 0);
+  });
+
+  it('does not use native availability notifications for an independent completion', async (t) => {
+    const request = await seedMovieRequest(102);
+    await markApprovedWithoutListeners(request);
+    const notify = t.mock.method(
+      notificationManager,
+      'sendNotification',
+      async () => undefined
+    );
+
+    request.status = MediaRequestStatus.COMPLETED;
+    await getRepository(MediaRequest).save(request);
+
+    assert.strictEqual(notify.mock.callCount(), 0);
+  });
+
+  it('retains the existing native availability notification on completion', async (t) => {
+    configureMixedServers();
+    const request = await seedMovieRequest(101);
+    await markApprovedWithoutListeners(request);
+    const notify = t.mock.method(
+      notificationManager,
+      'sendNotification',
+      async () => undefined
+    );
+
+    request.status = MediaRequestStatus.COMPLETED;
+    await getRepository(MediaRequest).save(request);
+
+    assert.strictEqual(notify.mock.callCount(), 1);
   });
 });
