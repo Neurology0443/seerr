@@ -597,6 +597,9 @@ components:
         isDefault:
           type: boolean
           example: false
+        independentRequestDestination:
+          type: boolean
+          example: false
         externalUrl:
           type: string
           example: http://radarr.example.com
@@ -674,6 +677,9 @@ components:
           type: boolean
           example: false
         isDefault:
+          type: boolean
+          example: false
+        independentRequestDestination:
           type: boolean
           example: false
         externalUrl:
@@ -1235,6 +1241,78 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/WatchProviders'
+    MediaRequestTarget:
+      type: object
+      properties:
+        serverId:
+          type: number
+        name:
+          type: string
+        is4k:
+          type: boolean
+        isIndependent:
+          type: boolean
+        deleted:
+          type: boolean
+        status:
+          type: number
+          description: Effective availability status for this request target.
+      required:
+        - serverId
+        - name
+        - is4k
+        - isIndependent
+        - deleted
+        - status
+    MovieRequestTarget:
+      type: object
+      properties:
+        serverId:
+          type: number
+        name:
+          type: string
+        is4k:
+          type: boolean
+        isDefault:
+          type: boolean
+        isIndependent:
+          type: boolean
+        status:
+          type: number
+        requestable:
+          type: boolean
+      required:
+        - serverId
+        - name
+        - is4k
+        - isDefault
+        - isIndependent
+        - status
+        - requestable
+    TvRequestTargetSeason:
+      type: object
+      properties:
+        seasonNumber:
+          type: number
+        status:
+          type: number
+        requestable:
+          type: boolean
+      required:
+        - seasonNumber
+        - status
+        - requestable
+    TvRequestTarget:
+      allOf:
+        - $ref: '#/components/schemas/MovieRequestTarget'
+        - type: object
+          properties:
+            seasons:
+              type: array
+              items:
+                $ref: '#/components/schemas/TvRequestTargetSeason'
+          required:
+            - seasons
     MediaRequest:
       type: object
       properties:
@@ -1277,6 +1355,10 @@ components:
           type: boolean
           example: false
           description: If true, this request will not count against the user's quota. Requires MANAGE_REQUESTS permission.
+        target:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/MediaRequestTarget'
       required:
         - id
         - status
@@ -6834,6 +6916,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MovieDetails'
+  /movie/{movieId}/request-targets:
+    get:
+      summary: Get movie request targets
+      description: Returns effective local state and requestability for each configured Radarr server.
+      tags:
+        - movies
+      parameters:
+        - in: path
+          name: movieId
+          required: true
+          schema:
+            type: number
+      responses:
+        '200':
+          description: Request targets returned
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MovieRequestTarget'
   /movie/{movieId}/recommendations:
     get:
       summary: Get recommended movies
@@ -7048,6 +7151,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TvDetails'
+  /tv/{tvId}/request-targets:
+    get:
+      summary: Get series request targets
+      description: Returns effective local state and per-season requestability for each configured Sonarr server.
+      tags:
+        - tv
+      parameters:
+        - in: path
+          name: tvId
+          required: true
+          schema:
+            type: number
+      responses:
+        '200':
+          description: Request targets returned
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TvRequestTarget'
   /tv/{tvId}/season/{seasonNumber}:
     get:
       summary: Get season details and episode list

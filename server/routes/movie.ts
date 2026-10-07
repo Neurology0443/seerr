@@ -5,13 +5,94 @@ import TheMovieDb from '@server/api/themoviedb';
 import { MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { Watchlist } from '@server/entity/Watchlist';
+import type { MovieRequestTarget } from '@server/interfaces/api/requestInterfaces';
+import {
+  isActiveRequestStatus,
+  isRequestableDestinationStatus,
+} from '@server/lib/requestSlot';
+import { isIndependentRequest } from '@server/lib/requestTarget';
+import { getConfiguredTargetStatus } from '@server/lib/requestTargetState';
+import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { mapMovieDetails } from '@server/models/Movie';
 import { mapMovieResult } from '@server/models/Search';
 import { Router } from 'express';
 
 const movieRoutes = Router();
+
+movieRoutes.get<{ id: string }, MovieRequestTarget[]>(
+  '/:id/request-targets',
+  async (req, res, next) => {
+    try {
+      const mediaRepository = getRepository(Media);
+      const media = await mediaRepository.findOne({
+        where: {
+          tmdbId: Number(req.params.id),
+          mediaType: MediaType.MOVIE,
+        },
+        relations: { requests: true },
+      });
+      const destinations = media
+        ? await getRepository(MediaDestinationStatus).find({
+            where: { mediaId: media.id },
+          })
+        : [];
+      const activeRequests = (media?.requests ?? []).filter((request) =>
+        isActiveRequestStatus(request.status)
+      );
+      const classifiedRequests = await Promise.all(
+        activeRequests.map(async (request) => ({
+          request,
+          independent: await isIndependentRequest(
+            request,
+            mediaRepository.manager
+          ),
+        }))
+      );
+
+      const targets = getSettings().radarr.map((server) => {
+        const independent = server.independentRequestDestination === true;
+        const status = getConfiguredTargetStatus({
+          media: media ?? undefined,
+          server,
+          destinationStatus: destinations.find(
+            (destination) => destination.serverId === server.id
+          )?.status,
+        });
+        const occupied = classifiedRequests.some(
+          ({ request, independent: requestIndependent }) =>
+            independent
+              ? requestIndependent && request.serverId === server.id
+              : !requestIndependent && request.is4k === server.is4k
+        );
+
+        return {
+          serverId: server.id,
+          name: server.name,
+          is4k: Boolean(server.is4k),
+          isDefault: Boolean(server.isDefault),
+          isIndependent: independent,
+          status,
+          requestable: isRequestableDestinationStatus(status) && !occupied,
+        };
+      });
+
+      return res.status(200).json(targets);
+    } catch (e) {
+      logger.debug('Something went wrong retrieving movie request targets', {
+        label: 'API',
+        errorMessage: e.message,
+        movieId: req.params.id,
+      });
+      return next({
+        status: 500,
+        message: 'Unable to retrieve movie request targets.',
+      });
+    }
+  }
+);
 
 movieRoutes.get('/:id', async (req, res, next) => {
   const tmdb = new TheMovieDb();

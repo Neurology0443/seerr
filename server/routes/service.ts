@@ -20,6 +20,8 @@ serviceRoutes.get('/radarr', async (req, res) => {
       name: radarr.name,
       is4k: radarr.is4k,
       isDefault: radarr.isDefault,
+      independentRequestDestination:
+        radarr.independentRequestDestination === true,
       activeDirectory: radarr.activeDirectory,
       activeProfileId: radarr.activeProfileId,
       activeTags: radarr.tags ?? [],
@@ -60,6 +62,8 @@ serviceRoutes.get<{ radarrId: string }>(
         name: radarrSettings.name,
         is4k: radarrSettings.is4k,
         isDefault: radarrSettings.isDefault,
+        independentRequestDestination:
+          radarrSettings.independentRequestDestination === true,
         activeDirectory: radarrSettings.activeDirectory,
         activeProfileId: radarrSettings.activeProfileId,
         activeTags: radarrSettings.tags,
@@ -88,6 +92,8 @@ serviceRoutes.get('/sonarr', async (req, res) => {
       name: sonarr.name,
       is4k: sonarr.is4k,
       isDefault: sonarr.isDefault,
+      independentRequestDestination:
+        sonarr.independentRequestDestination === true,
       activeDirectory: sonarr.activeDirectory,
       activeProfileId: sonarr.activeProfileId,
       activeAnimeProfileId: sonarr.activeAnimeProfileId,
@@ -138,6 +144,8 @@ serviceRoutes.get<{ sonarrId: string }>(
           name: sonarrSettings.name,
           is4k: sonarrSettings.is4k,
           isDefault: sonarrSettings.isDefault,
+          independentRequestDestination:
+            sonarrSettings.independentRequestDestination === true,
           activeDirectory: sonarrSettings.activeDirectory,
           activeProfileId: sonarrSettings.activeProfileId,
           activeAnimeProfileId: sonarrSettings.activeAnimeProfileId,
