@@ -354,10 +354,53 @@ for (const kind of ['radarr', 'sonarr'] as const) {
       assert.strictEqual(save.mock.callCount(), 0);
     });
 
+    for (const endpointCase of [
+      {
+        name: 'missing and empty base URLs',
+        configured: { baseUrl: undefined },
+        candidate: { baseUrl: '' },
+      },
+      {
+        name: 'empty and root-only base URLs',
+        configured: { baseUrl: '' },
+        candidate: { baseUrl: '/' },
+      },
+      {
+        name: 'base URL slash variations',
+        configured: { baseUrl: '/arr' },
+        candidate: { baseUrl: 'arr/' },
+      },
+      {
+        name: 'hostname case and whitespace variations',
+        configured: { hostname: ' Example.Host ' },
+        candidate: { hostname: 'example.host' },
+      },
+    ]) {
+      it(`rejects independent collisions across ${endpointCase.name}`, async (t) => {
+        const save = mockSettingsSave(t);
+        const native = serverFixture(kind, 1, endpointCase.configured);
+        setServers(kind, [native]);
+
+        const response = await request(app)
+          .post(`/${kind}`)
+          .send(
+            serverPayload(serverFixture(kind, 999, endpointCase.candidate), {
+              independentRequestDestination: true,
+              syncEnabled: true,
+            })
+          );
+
+        assert.strictEqual(response.status, 409);
+        assert.deepStrictEqual(getServers(kind), [native]);
+        assert.strictEqual(save.mock.callCount(), 0);
+      });
+    }
+
     it('rejects a native PUT that collides with an independent endpoint', async (t) => {
       const save = mockSettingsSave(t);
       const independent = serverFixture(kind, 1, {
-        hostname: 'independent-host',
+        hostname: ' Independent-Host ',
+        baseUrl: '/arr/',
         independentRequestDestination: true,
         syncEnabled: true,
       });
@@ -366,7 +409,12 @@ for (const kind of ['radarr', 'sonarr'] as const) {
 
       const response = await request(app)
         .put(`/${kind}/${native.id}`)
-        .send(serverPayload(native, { hostname: independent.hostname }));
+        .send(
+          serverPayload(native, {
+            hostname: 'independent-host',
+            baseUrl: 'arr',
+          })
+        );
 
       assert.strictEqual(response.status, 409);
       assert.deepStrictEqual(getServers(kind), [independent, native]);
@@ -375,7 +423,10 @@ for (const kind of ['radarr', 'sonarr'] as const) {
 
     it('rejects an independent PUT that collides with another endpoint', async (t) => {
       const save = mockSettingsSave(t);
-      const native = serverFixture(kind, 1, { hostname: 'native-host' });
+      const native = serverFixture(kind, 1, {
+        hostname: ' Native-Host ',
+        baseUrl: '/arr/',
+      });
       const independent = serverFixture(kind, 2, {
         hostname: 'independent-host',
         independentRequestDestination: true,
@@ -385,24 +436,82 @@ for (const kind of ['radarr', 'sonarr'] as const) {
 
       const response = await request(app)
         .put(`/${kind}/${independent.id}`)
-        .send(serverPayload(independent, { hostname: native.hostname }));
+        .send(
+          serverPayload(independent, {
+            hostname: 'native-host',
+            baseUrl: 'arr',
+          })
+        );
 
       assert.strictEqual(response.status, 409);
       assert.deepStrictEqual(getServers(kind), [native, independent]);
       assert.strictEqual(save.mock.callCount(), 0);
     });
 
-    it('allows native duplicate physical endpoints as before', async (t) => {
+    it('allows canonically equivalent native endpoints as before', async (t) => {
       mockSettingsSave(t);
-      const native = serverFixture(kind, 1);
+      const native = serverFixture(kind, 1, {
+        hostname: ' Native.Host ',
+        baseUrl: '/arr/',
+      });
       setServers(kind, [native]);
 
       const response = await request(app)
         .post(`/${kind}`)
-        .send(serverPayload(serverFixture(kind, 999)));
+        .send(
+          serverPayload(
+            serverFixture(kind, 999, {
+              hostname: 'native.host',
+              baseUrl: 'arr',
+            })
+          )
+        );
 
       assert.strictEqual(response.status, 201);
       assert.strictEqual(getServers(kind).length, 2);
+    });
+
+    it('serializes conflicting concurrent independent creates', async (t) => {
+      const settings = getSettings();
+      let signalFirstSave!: () => void;
+      const firstSaveReached = new Promise<void>((resolve) => {
+        signalFirstSave = resolve;
+      });
+      let releaseFirstSave!: () => void;
+      const firstSaveReleased = new Promise<void>((resolve) => {
+        releaseFirstSave = resolve;
+      });
+      let saveCalls = 0;
+      t.mock.method(settings, 'save', async () => {
+        saveCalls++;
+        if (saveCalls === 1) {
+          signalFirstSave();
+          await firstSaveReleased;
+        }
+      });
+      const payload = serverPayload(serverFixture(kind, 999), {
+        independentRequestDestination: true,
+        syncEnabled: true,
+      });
+
+      const responses = Promise.all([
+        request(app).post(`/${kind}`).send(payload),
+        request(app).post(`/${kind}`).send(payload),
+      ]);
+      await firstSaveReached;
+      await nextTurn();
+      await nextTurn();
+      releaseFirstSave();
+
+      const statuses = (await responses)
+        .map((response) => response.status)
+        .sort((first, second) => first - second);
+      assert.deepStrictEqual(statuses, [201, 409]);
+      assert.strictEqual(getServers(kind).length, 1);
+      assert.strictEqual(
+        getServers(kind)[0].independentRequestDestination,
+        true
+      );
     });
 
     it('preserves the independent flag and ID when PUT omits it', async (t) => {

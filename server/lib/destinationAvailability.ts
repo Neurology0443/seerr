@@ -9,6 +9,8 @@ import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSea
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import SeasonRequest from '@server/entity/SeasonRequest';
+import { Notification } from '@server/lib/notifications';
+import logger from '@server/logger';
 import { In, Not, type EntityManager } from 'typeorm';
 
 export type DestinationSeasonState = {
@@ -295,9 +297,10 @@ export const declineRequestsForDestination = async (
   mediaId: number,
   serverId: number,
   manager?: EntityManager
-): Promise<void> => {
+): Promise<MediaRequest[]> => {
   const entityManager = managerOrDefault(manager);
   const requestRepository = entityManager.getRepository(MediaRequest);
+  const declinedRequests: MediaRequest[] = [];
   const requests = await requestRepository.find({
     where: {
       media: { id: mediaId },
@@ -322,7 +325,10 @@ export const declineRequestsForDestination = async (
       relations: { media: true, seasons: true },
     });
     await reconcileIndependentRequestDecline(declinedRequest, entityManager);
+    declinedRequests.push(declinedRequest);
   }
+
+  return declinedRequests;
 };
 
 export const updateIndependentMovieDestination = async (
@@ -456,21 +462,34 @@ export const updateIndependentTvDestination = async (
   const observationsBySeason = new Map(
     seasons.map((season) => [season.seasonNumber, season])
   );
-  const rollupSeasons = [...bySeason.values()]
-    .filter((season) => {
-      const observation = observationsBySeason.get(season.seasonNumber);
-      return observation
-        ? observation.totalEpisodes > 0
-        : season.status !== MediaStatus.UNKNOWN;
-    })
-    .map((season) => ({
-      seasonNumber: season.seasonNumber,
-      status: season.status,
-    }));
-  destination.status = rollupDestinationTvStatus(
-    destination.status,
-    rollupSeasons
+  const rollupSeasonsByNumber = new Map(
+    [...bySeason.values()]
+      .filter((season) => {
+        const observation = observationsBySeason.get(season.seasonNumber);
+        return observation
+          ? observation.totalEpisodes > 0
+          : season.status !== MediaStatus.UNKNOWN;
+      })
+      .map((season) => ({
+        seasonNumber: season.seasonNumber,
+        status: season.status,
+      }))
+      .map((season) => [season.seasonNumber, season] as const)
   );
+  for (const observation of seasons) {
+    if (
+      observation.totalEpisodes > 0 &&
+      !rollupSeasonsByNumber.has(observation.seasonNumber)
+    ) {
+      rollupSeasonsByNumber.set(observation.seasonNumber, {
+        seasonNumber: observation.seasonNumber,
+        status: MediaStatus.UNKNOWN,
+      });
+    }
+  }
+  destination.status = rollupDestinationTvStatus(destination.status, [
+    ...rollupSeasonsByNumber.values(),
+  ]);
   destination = await destinationRepository.save(destination);
   await completeRequestsForDestination(media.id, serverId, entityManager);
   return destination;
@@ -700,8 +719,13 @@ export const markMissingMovieDestination = async (
   if (!destination) {
     return;
   }
+  let declinedRequests: MediaRequest[] = [];
   if (destination.status === MediaStatus.PROCESSING) {
-    await declineRequestsForDestination(mediaId, serverId, entityManager);
+    declinedRequests = await declineRequestsForDestination(
+      mediaId,
+      serverId,
+      entityManager
+    );
     const activeRequests = await entityManager.count(MediaRequest, {
       where: {
         media: { id: mediaId },
@@ -725,7 +749,37 @@ export const markMissingMovieDestination = async (
     destination.status = MediaStatus.DELETED;
     await destinationRepository.save(destination);
   }
+  await notifyDeclinedRequests(declinedRequests);
 };
+
+const notifyDeclinedRequests = async (
+  requests: MediaRequest[]
+): Promise<void> => {
+  for (const request of requests) {
+    try {
+      await MediaRequest.sendNotification(
+        request,
+        request.media,
+        Notification.MEDIA_DECLINED
+      );
+    } catch (e) {
+      logger.error('Something went wrong sending media notification(s)', {
+        label: 'Notifications',
+        errorMessage: e instanceof Error ? e.message : String(e),
+        requestId: request.id,
+        mediaId: request.media.id,
+      });
+    }
+  }
+};
+
+const runInTransaction = <T>(
+  manager: EntityManager,
+  run: (transactionManager: EntityManager) => Promise<T>
+): Promise<T> =>
+  manager.queryRunner?.isTransactionActive
+    ? run(manager)
+    : manager.transaction(run);
 
 export const markMissingTvDestination = async (
   mediaId: number,
@@ -733,60 +787,76 @@ export const markMissingTvDestination = async (
   manager?: EntityManager
 ): Promise<void> => {
   const entityManager = managerOrDefault(manager);
-  const destinationRepository = entityManager.getRepository(
-    MediaDestinationStatus
-  );
-  const seasonRepository = entityManager.getRepository(
-    MediaDestinationSeasonStatus
-  );
-  const destination = await destinationRepository.findOne({
-    where: { mediaId, serverId },
-  });
-  if (!destination) {
-    return;
-  }
-  const existingSeasons = await seasonRepository.find({
-    where: { destinationStatusId: destination.id },
-  });
-  const hadScannerAvailability =
-    destination.status === MediaStatus.AVAILABLE ||
-    destination.status === MediaStatus.PARTIALLY_AVAILABLE ||
-    existingSeasons.some((season) =>
-      [MediaStatus.AVAILABLE, MediaStatus.PARTIALLY_AVAILABLE].includes(
-        season.status
-      )
-    );
+  const declinedRequests = await runInTransaction(
+    entityManager,
+    async (transactionManager) => {
+      const destinationRepository = transactionManager.getRepository(
+        MediaDestinationStatus
+      );
+      const seasonRepository = transactionManager.getRepository(
+        MediaDestinationSeasonStatus
+      );
+      const destination = await destinationRepository.findOne({
+        where: { mediaId, serverId },
+      });
+      if (!destination) {
+        return [];
+      }
+      const existingSeasons = await seasonRepository.find({
+        where: { destinationStatusId: destination.id },
+      });
+      const hadScannerAvailability =
+        destination.status === MediaStatus.AVAILABLE ||
+        destination.status === MediaStatus.PARTIALLY_AVAILABLE ||
+        existingSeasons.some((season) =>
+          [MediaStatus.AVAILABLE, MediaStatus.PARTIALLY_AVAILABLE].includes(
+            season.status
+          )
+        );
 
-  await declineRequestsForDestination(mediaId, serverId, entityManager);
+      const transactionDeclines = await declineRequestsForDestination(
+        mediaId,
+        serverId,
+        transactionManager
+      );
 
-  const refreshedDestination = await destinationRepository.findOneOrFail({
-    where: { id: destination.id },
-  });
-  if (hadScannerAvailability) {
-    refreshedDestination.status = MediaStatus.DELETED;
-    await destinationRepository.save(refreshedDestination);
-  }
+      const refreshedDestination = await destinationRepository.findOneOrFail({
+        where: { id: destination.id },
+      });
+      if (hadScannerAvailability) {
+        refreshedDestination.status = MediaStatus.DELETED;
+        await destinationRepository.save(refreshedDestination);
+      }
 
-  const refreshedSeasons = await seasonRepository.find({
-    where: { destinationStatusId: destination.id },
-  });
-  const changedSeasons = refreshedSeasons.filter((season) =>
-    [MediaStatus.AVAILABLE, MediaStatus.PARTIALLY_AVAILABLE].includes(
-      season.status
-    )
+      const refreshedSeasons = await seasonRepository.find({
+        where: { destinationStatusId: destination.id },
+      });
+      const changedSeasons = refreshedSeasons.filter((season) =>
+        [MediaStatus.AVAILABLE, MediaStatus.PARTIALLY_AVAILABLE].includes(
+          season.status
+        )
+      );
+      for (const season of changedSeasons) {
+        season.status = MediaStatus.DELETED;
+      }
+      if (changedSeasons.length > 0) {
+        await seasonRepository.save(changedSeasons);
+      }
+
+      await releaseRequestDrivenDestinationSeasons(
+        { mediaId, serverId, destinationStatusId: destination.id },
+        transactionManager
+      );
+      await reconcileIndependentTvDestination(
+        mediaId,
+        serverId,
+        transactionManager
+      );
+      return transactionDeclines;
+    }
   );
-  for (const season of changedSeasons) {
-    season.status = MediaStatus.DELETED;
-  }
-  if (changedSeasons.length > 0) {
-    await seasonRepository.save(changedSeasons);
-  }
 
-  await releaseRequestDrivenDestinationSeasons(
-    { mediaId, serverId, destinationStatusId: destination.id },
-    entityManager
-  );
-  await reconcileIndependentTvDestination(mediaId, serverId, entityManager);
+  await notifyDeclinedRequests(declinedRequests);
 };
 
 export const findIndependentDestinationCandidates = async (

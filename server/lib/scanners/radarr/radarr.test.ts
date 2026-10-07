@@ -1127,11 +1127,11 @@ describe('Radarr Scanner', () => {
         })
       );
       configureRadarr([
-        { id: 9, hostname: 'ambiguous-radarr', baseUrl: '/radarr' },
+        { id: 9, hostname: ' Ambiguous-Radarr ', baseUrl: '/radarr/' },
         {
           id: 10,
           hostname: 'ambiguous-radarr',
-          baseUrl: '/radarr',
+          baseUrl: 'radarr',
           independentRequestDestination: true,
         },
       ]);

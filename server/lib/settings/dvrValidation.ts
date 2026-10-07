@@ -19,13 +19,26 @@ export const hasValidIndependentRequestDestination = (body: {
   !hasIndependentRequestDestination(body) ||
   typeof body.independentRequestDestination === 'boolean';
 
+const canonicalBaseUrl = (baseUrl?: string): string => {
+  const pathSegments = (baseUrl ?? '')
+    .trim()
+    .split('/')
+    .filter((segment) => segment.length > 0);
+
+  return pathSegments.length > 0 ? `/${pathSegments.join('/')}` : '';
+};
+
+export const dvrEndpointKey = (endpoint: DvrEndpoint): string =>
+  JSON.stringify([
+    endpoint.hostname.trim().toLowerCase(),
+    endpoint.port,
+    canonicalBaseUrl(endpoint.baseUrl),
+  ]);
+
 export const isSameDvrEndpoint = (
   first: DvrEndpoint,
   second: DvrEndpoint
-): boolean =>
-  first.hostname === second.hostname &&
-  first.port === second.port &&
-  first.baseUrl === second.baseUrl;
+): boolean => dvrEndpointKey(first) === dvrEndpointKey(second);
 
 export const conflictsWithIndependentDvrEndpoint = (
   candidate: DvrEndpoint,
