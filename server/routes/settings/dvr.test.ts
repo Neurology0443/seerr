@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
-import { before, beforeEach, describe, it } from 'node:test';
+import { before, beforeEach, describe, it, mock } from 'node:test';
 
+import ExternalAPI from '@server/api/externalapi';
 import { MediaRequestStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
@@ -9,9 +10,16 @@ import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSea
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
+import { Permission } from '@server/lib/permissions';
+import { RequestTargetError } from '@server/lib/requestTarget';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
+import {
+  dvrIdentityKey,
+  withDvrIdentityLock,
+} from '@server/utils/dvrIdentityLock';
 import type { Express } from 'express';
 import express from 'express';
 import request from 'supertest';
@@ -23,6 +31,29 @@ type DvrSettings = RadarrSettings | SonarrSettings;
 
 let app: Express;
 let nextTmdbId = 70000;
+
+const externalApiGetMock = mock.method(
+  ExternalAPI.prototype as unknown as {
+    get: (endpoint: string) => Promise<unknown>;
+  },
+  'get',
+  async (endpoint: string) => {
+    const tmdbId = Number(endpoint.replace(/^\/(movie|tv)\//, ''));
+
+    if (!tmdbId) {
+      throw new Error(`Unstubbed external endpoint: ${endpoint}`);
+    }
+
+    return {
+      id: tmdbId,
+      external_ids: {},
+      seasons: [],
+      videos: { results: [{ type: 'Trailer', key: 'trailer' }] },
+    };
+  }
+).mock;
+
+mock.method(MediaRequest, 'sendNotification', async () => undefined);
 
 setupTestDb();
 
@@ -46,6 +77,7 @@ before(() => {
 });
 
 beforeEach(() => {
+  externalApiGetMock.resetCalls();
   const settings = getSettings();
   settings.radarr = [];
   settings.sonarr = [];
@@ -117,6 +149,42 @@ const withoutIndependentFlag = (payload: Record<string, unknown>) => {
 const mockSettingsSave = (t: TestContext) =>
   t.mock.method(getSettings(), 'save', async () => undefined);
 
+const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+const pauseRequestBeforeInsert = (t: TestContext) => {
+  const originalBeforeInsert = MediaRequestSubscriber.prototype.beforeInsert;
+  let signalReached!: () => void;
+  const reached = new Promise<void>((resolve) => {
+    signalReached = resolve;
+  });
+  let resume!: () => void;
+  const resumed = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+
+  t.mock.method(
+    MediaRequestSubscriber.prototype,
+    'beforeInsert',
+    async function (
+      this: MediaRequestSubscriber,
+      ...args: Parameters<typeof originalBeforeInsert>
+    ) {
+      signalReached();
+      await resumed;
+      return originalBeforeInsert.apply(this, args);
+    }
+  );
+
+  return { reached, resume };
+};
+
+async function getPendingRequester(): Promise<User> {
+  const requester = await getRepository(User).findOneByOrFail({ id: 1 });
+  requester.permissions = Permission.REQUEST;
+  requester.movieQuotaLimit = 10;
+  return getRepository(User).save(requester);
+}
+
 const mediaTypeForKind = (kind: DvrKind) =>
   kind === 'radarr' ? MediaType.MOVIE : MediaType.TV;
 
@@ -157,6 +225,13 @@ async function seedRequest(
     .callListeners(false)
     .execute();
 }
+
+it('uses separate identity-lock namespaces for Radarr and Sonarr IDs', () => {
+  assert.notStrictEqual(
+    dvrIdentityKey('radarr', 5),
+    dvrIdentityKey('sonarr', 5)
+  );
+});
 
 for (const kind of ['radarr', 'sonarr'] as const) {
   describe(`${kind} destination settings`, () => {
@@ -350,6 +425,83 @@ for (const kind of ['radarr', 'sonarr'] as const) {
       );
     });
 
+    it('uses the server identity lock for role changes', async (t) => {
+      mockSettingsSave(t);
+      const currentServer = serverFixture(kind, 14);
+      setServers(kind, [currentServer]);
+      let signalHeld!: () => void;
+      const held = new Promise<void>((resolve) => {
+        signalHeld = resolve;
+      });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const lock = withDvrIdentityLock(kind, 14, async () => {
+        signalHeld();
+        await released;
+      });
+      await held;
+
+      let settled = false;
+      const update = request(app)
+        .put(`/${kind}/14`)
+        .send(
+          serverPayload(currentServer, {
+            independentRequestDestination: true,
+            syncEnabled: true,
+          })
+        )
+        .then((response) => {
+          settled = true;
+          return response;
+        });
+      await nextTurn();
+      await nextTurn();
+      assert.strictEqual(settled, false);
+
+      release();
+      await lock;
+      const response = await update;
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(response.body.independentRequestDestination, true);
+    });
+
+    it('uses the server identity lock for deletion', async (t) => {
+      mockSettingsSave(t);
+      setServers(kind, [serverFixture(kind, 15)]);
+      let signalHeld!: () => void;
+      const held = new Promise<void>((resolve) => {
+        signalHeld = resolve;
+      });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const lock = withDvrIdentityLock(kind, 15, async () => {
+        signalHeld();
+        await released;
+      });
+      await held;
+
+      let settled = false;
+      const deletion = request(app)
+        .delete(`/${kind}/15`)
+        .then((response) => {
+          settled = true;
+          return response;
+        });
+      await nextTurn();
+      await nextTurn();
+      assert.strictEqual(settled, false);
+
+      release();
+      await lock;
+      const response = await deletion;
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(getServers(kind).length, 0);
+    });
+
     for (const status of [
       MediaRequestStatus.PENDING,
       MediaRequestStatus.APPROVED,
@@ -385,3 +537,179 @@ for (const kind of ['radarr', 'sonarr'] as const) {
     }
   });
 }
+
+describe('request creation identity locking', () => {
+  for (const scenario of [
+    {
+      name: 'deletion',
+      mutate: (server: DvrSettings) =>
+        request(app).delete(`/radarr/${server.id}`),
+    },
+    {
+      name: 'independent role change',
+      mutate: (server: DvrSettings) =>
+        request(app)
+          .put(`/radarr/${server.id}`)
+          .send(
+            serverPayload(server, {
+              independentRequestDestination: false,
+            })
+          ),
+    },
+    {
+      name: '4K tier change',
+      mutate: (server: DvrSettings) =>
+        request(app)
+          .put(`/radarr/${server.id}`)
+          .send(serverPayload(server, { is4k: true })),
+    },
+  ]) {
+    it(`holds the independent target stable against ${scenario.name}`, async (t) => {
+      mockSettingsSave(t);
+      const target = serverFixture('radarr', 30, {
+        isDefault: true,
+        syncEnabled: true,
+        independentRequestDestination: true,
+      });
+      setServers('radarr', [target]);
+      const requester = await getPendingRequester();
+      const pause = pauseRequestBeforeInsert(t);
+
+      const creation = MediaRequest.request(
+        {
+          mediaId: nextTmdbId++,
+          mediaType: MediaType.MOVIE,
+          serverId: target.id,
+        },
+        requester
+      );
+      await pause.reached;
+
+      let mutationSettled = false;
+      const mutation = scenario.mutate(target).then((response) => {
+        mutationSettled = true;
+        return response;
+      });
+      await nextTurn();
+      await nextTurn();
+      assert.strictEqual(mutationSettled, false);
+
+      pause.resume();
+      const created = await creation;
+      const response = await mutation;
+
+      assert.strictEqual(created.serverId, target.id);
+      assert.strictEqual(response.status, 409);
+      assert.strictEqual(
+        await getRepository(MediaDestinationStatus).count({
+          where: { mediaId: created.media.id, serverId: target.id },
+        }),
+        1
+      );
+      assert.strictEqual(getServers('radarr')[0].id, target.id);
+      assert.strictEqual(
+        getServers('radarr')[0].independentRequestDestination,
+        true
+      );
+      assert.strictEqual(getServers('radarr')[0].is4k, false);
+    });
+  }
+
+  it('rejects native creation when deletion wins before lock acquisition', async (t) => {
+    mockSettingsSave(t);
+    const target = serverFixture('radarr', 40, { isDefault: true });
+    const fallback = serverFixture('radarr', 41, { isDefault: false });
+    setServers('radarr', [target, fallback]);
+    const requester = await getPendingRequester();
+    let signalValidation!: () => void;
+    const validationReached = new Promise<void>((resolve) => {
+      signalValidation = resolve;
+    });
+    let resumeValidation!: () => void;
+    const validationResumed = new Promise<void>((resolve) => {
+      resumeValidation = resolve;
+    });
+    t.mock.method(getRepository(MediaRequest), 'existsBy', async () => {
+      signalValidation();
+      await validationResumed;
+      return false;
+    });
+
+    const deletion = request(app).delete(`/radarr/${target.id}`);
+    const deletionPromise = deletion.then((response) => response);
+    await validationReached;
+    const sendToRadarr = t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+    const mediaId = nextTmdbId++;
+    const creation = MediaRequest.request(
+      {
+        mediaId,
+        mediaType: MediaType.MOVIE,
+        serverId: target.id,
+      },
+      requester
+    );
+    const rejection = assert.rejects(creation, RequestTargetError);
+
+    resumeValidation();
+    const deletionResponse = await deletionPromise;
+    assert.strictEqual(deletionResponse.status, 200);
+    await rejection;
+    assert.strictEqual(await getRepository(MediaRequest).count(), 0);
+    assert.strictEqual(
+      await getRepository(Media).count({
+        where: { tmdbId: mediaId, mediaType: MediaType.MOVIE },
+      }),
+      0
+    );
+    assert.strictEqual(sendToRadarr.mock.callCount(), 0);
+    assert.strictEqual(getServers('radarr')[0].id, fallback.id);
+  });
+
+  it('allows a default change without retargeting the locked creation', async (t) => {
+    mockSettingsSave(t);
+    const target = serverFixture('radarr', 50, {
+      isDefault: true,
+      syncEnabled: true,
+      independentRequestDestination: true,
+    });
+    const nextDefault = serverFixture('radarr', 51, {
+      syncEnabled: true,
+      independentRequestDestination: true,
+    });
+    setServers('radarr', [target, nextDefault]);
+    const requester = await getPendingRequester();
+    const pause = pauseRequestBeforeInsert(t);
+
+    const creation = MediaRequest.request(
+      { mediaId: nextTmdbId++, mediaType: MediaType.MOVIE },
+      requester
+    );
+    await pause.reached;
+
+    const defaultChange = await request(app)
+      .put(`/radarr/${nextDefault.id}`)
+      .send(serverPayload(nextDefault, { isDefault: true }));
+    assert.strictEqual(defaultChange.status, 200);
+    assert.strictEqual(getServers('radarr')[1].isDefault, true);
+
+    pause.resume();
+    const created = await creation;
+    assert.strictEqual(created.serverId, target.id);
+    assert.strictEqual(
+      await getRepository(MediaDestinationStatus).count({
+        where: { mediaId: created.media.id, serverId: target.id },
+      }),
+      1
+    );
+    assert.strictEqual(
+      await getRepository(MediaDestinationStatus).count({
+        where: { mediaId: created.media.id, serverId: nextDefault.id },
+      }),
+      0
+    );
+  });
+});

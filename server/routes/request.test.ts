@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import type { TestContext } from 'node:test';
 import { before, beforeEach, describe, it, mock } from 'node:test';
 
 import TheMovieDb from '@server/api/themoviedb';
@@ -13,6 +14,8 @@ import {
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import OverrideRule from '@server/entity/OverrideRule';
 import Season from '@server/entity/Season';
@@ -32,8 +35,10 @@ import type { Express } from 'express';
 import express from 'express';
 import session from 'express-session';
 import request from 'supertest';
+import { In } from 'typeorm';
 import authRoutes from './auth';
 import requestRoutes from './request';
+import radarrRoutes from './settings/radarr';
 
 const sendNotificationMock = mock.method(
   MediaRequest,
@@ -106,7 +111,9 @@ function configureRadarr(overrides: Partial<RadarrSettings>[]): void {
     tags: [],
     isDefault: i === 0,
     syncEnabled: true,
+    independentRequestDestination: false,
     preventSearch: false,
+    tagRequests: false,
     externalUrl: '',
     ...o,
   })) as RadarrSettings[];
@@ -131,7 +138,12 @@ function configureSonarr(overrides: Partial<SonarrSettings>[]): void {
     tags: [],
     isDefault: i === 0,
     syncEnabled: true,
+    independentRequestDestination: false,
     preventSearch: false,
+    tagRequests: false,
+    seriesType: 'standard',
+    animeSeriesType: 'anime',
+    monitorNewItems: 'all',
     externalUrl: '',
     ...o,
   })) as SonarrSettings[];
@@ -152,6 +164,7 @@ function createApp() {
   app.use(checkUser);
   app.use('/auth', authRoutes);
   app.use('/request', requestRoutes);
+  app.use('/settings/radarr', radarrRoutes);
   app.use(
     (
       err: { status?: number; message?: string },
@@ -174,6 +187,8 @@ before(async () => {
 
 beforeEach(() => {
   sendNotificationMock.resetCalls();
+  getSettings().radarr = [];
+  getSettings().sonarr = [];
 });
 
 setupTestDb();
@@ -227,6 +242,35 @@ async function seedRequest(status = MediaRequestStatus.PENDING) {
     relations: { requestedBy: true, modifiedBy: true },
   });
 }
+
+const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+const pauseRequestBeforeUpdate = (t: TestContext) => {
+  const originalBeforeUpdate = MediaRequestSubscriber.prototype.beforeUpdate;
+  let signalReached!: () => void;
+  const reached = new Promise<void>((resolve) => {
+    signalReached = resolve;
+  });
+  let resume!: () => void;
+  const resumed = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+
+  t.mock.method(
+    MediaRequestSubscriber.prototype,
+    'beforeUpdate',
+    async function (
+      this: MediaRequestSubscriber,
+      ...args: Parameters<typeof originalBeforeUpdate>
+    ) {
+      signalReached();
+      await resumed;
+      return originalBeforeUpdate.apply(this, args);
+    }
+  );
+
+  return { reached, resume };
+};
 
 describe('DELETE /request/:requestId', () => {
   it('allows the owner to delete their own pending request', async () => {
@@ -315,6 +359,9 @@ describe('DELETE /request/:requestId', () => {
 
 describe('PUT /request/:requestId (movie)', () => {
   it('persists server and root folder changes to the database', async () => {
+    configureRadarr([
+      { id: 3, isDefault: true, independentRequestDestination: false },
+    ]);
     const requestRepo = getRepository(MediaRequest);
     const mediaRequest = await seedRequest();
 
@@ -355,6 +402,157 @@ describe('PUT /request/:requestId (movie)', () => {
       where: { id: mediaRequest.id },
     });
     assert.strictEqual(saved.serverId, null);
+    assert.strictEqual(saved.rootFolder, null);
+  });
+
+  it('keeps an independent destination when serverId is omitted', async () => {
+    configureRadarr([
+      { id: 31, independentRequestDestination: true, isDefault: true },
+    ]);
+    const requestRepo = getRepository(MediaRequest);
+    const mediaRequest = await seedRequest();
+    mediaRequest.serverId = 31;
+    await requestRepo.save(mediaRequest);
+
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.MOVIE,
+      rootFolder: '/updated/movies',
+    });
+
+    assert.strictEqual(res.status, 200);
+    const saved = await requestRepo.findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 31);
+  });
+
+  it('keeps a resolved native destination when serverId is omitted', async () => {
+    configureRadarr([{ id: 33, independentRequestDestination: false }]);
+    const requestRepo = getRepository(MediaRequest);
+    const mediaRequest = await seedRequest();
+    mediaRequest.serverId = 33;
+    await requestRepo.save(mediaRequest);
+
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.MOVIE,
+      rootFolder: '/updated/native-movies',
+    });
+
+    assert.strictEqual(res.status, 200);
+    const saved = await requestRepo.findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 33);
+    assert.strictEqual(saved.rootFolder, '/updated/native-movies');
+  });
+
+  it('allows a native movie request to move to another native server', async () => {
+    configureRadarr([
+      { id: 34, isDefault: true, independentRequestDestination: false },
+      { id: 35, isDefault: false, independentRequestDestination: false },
+    ]);
+    const requestRepo = getRepository(MediaRequest);
+    const mediaRequest = await seedRequest();
+    mediaRequest.serverId = 34;
+    await requestRepo.save(mediaRequest);
+
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.MOVIE,
+      serverId: 35,
+      rootFolder: '/other-native',
+    });
+
+    assert.strictEqual(res.status, 200);
+    const saved = await requestRepo.findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 35);
+    assert.strictEqual(saved.rootFolder, '/other-native');
+  });
+
+  it('rejects converting a native movie request to an independent destination', async () => {
+    configureRadarr([
+      { id: 36, isDefault: true, independentRequestDestination: false },
+      { id: 37, isDefault: false, independentRequestDestination: true },
+    ]);
+    const requestRepo = getRepository(MediaRequest);
+    const mediaRequest = await seedRequest();
+    mediaRequest.serverId = 36;
+    await requestRepo.save(mediaRequest);
+
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.MOVIE,
+      serverId: 37,
+      rootFolder: '/must-not-change',
+    });
+
+    assert.strictEqual(res.status, 409);
+    const saved = await requestRepo.findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 36);
+    assert.strictEqual(saved.is4k, false);
+    assert.strictEqual(saved.rootFolder, null);
+    assert.strictEqual(
+      await getRepository(MediaDestinationStatus).count({
+        where: { mediaId: mediaRequest.media.id, serverId: 37 },
+      }),
+      0
+    );
+  });
+
+  it('rejects null and unknown native movie targets without partial edits', async () => {
+    configureRadarr([
+      { id: 38, isDefault: true, independentRequestDestination: false },
+    ]);
+    const requestRepo = getRepository(MediaRequest);
+    const mediaRequest = await seedRequest();
+    mediaRequest.serverId = 38;
+    await requestRepo.save(mediaRequest);
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+
+    for (const serverId of [null, 99999]) {
+      const res = await agent.put(`/request/${mediaRequest.id}`).send({
+        mediaType: MediaType.MOVIE,
+        serverId,
+        rootFolder: '/must-not-change',
+      });
+      assert.strictEqual(res.status, 409);
+    }
+
+    const saved = await requestRepo.findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 38);
+    assert.strictEqual(saved.rootFolder, null);
+  });
+
+  it('rejects retargeting an independent request', async () => {
+    configureRadarr([
+      { id: 31, independentRequestDestination: true, isDefault: true },
+      { id: 32, independentRequestDestination: true, isDefault: false },
+    ]);
+    const requestRepo = getRepository(MediaRequest);
+    const mediaRequest = await seedRequest();
+    mediaRequest.serverId = 31;
+    await requestRepo.save(mediaRequest);
+
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.MOVIE,
+      serverId: 32,
+      rootFolder: '/changed',
+    });
+
+    assert.strictEqual(res.status, 409);
+    const saved = await requestRepo.findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 31);
     assert.strictEqual(saved.rootFolder, null);
   });
 });
@@ -508,6 +706,438 @@ describe('PUT /request/:requestId (tv)', () => {
       [1, 2, 3]
     );
   });
+
+  it('edits independent TV seasons without reading or changing another destination', async () => {
+    configureSonarr([
+      { id: 201, isDefault: true, independentRequestDestination: true },
+      { id: 202, isDefault: false, independentRequestDestination: true },
+    ]);
+    const user = await seedUser('demo@seerr.dev');
+    const french = await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67901,
+        serverId: 201,
+        seasons: [2],
+      },
+      user
+    );
+    const english = await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67901,
+        serverId: 202,
+        seasons: [1],
+      },
+      user
+    );
+    const englishDestination = await getRepository(
+      MediaDestinationStatus
+    ).findOneOrFail({
+      where: { mediaId: english.media.id, serverId: 202 },
+    });
+    const englishSeasonOne = await getRepository(
+      MediaDestinationSeasonStatus
+    ).findOneOrFail({
+      where: {
+        destinationStatusId: englishDestination.id,
+        seasonNumber: 1,
+      },
+    });
+    englishSeasonOne.status = MediaStatus.PROCESSING;
+    await getRepository(MediaDestinationSeasonStatus).save(englishSeasonOne);
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${english.id}`).send({
+      mediaType: MediaType.TV,
+      seasons: [2],
+    });
+
+    assert.strictEqual(res.status, 200);
+    const savedEnglish = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: english.id },
+    });
+    assert.deepStrictEqual(
+      savedEnglish.seasons.map((season) => season.seasonNumber),
+      [2]
+    );
+    const destinations = await getRepository(MediaDestinationStatus).find({
+      where: { mediaId: english.media.id },
+    });
+    const byServerId = new Map(
+      destinations.map((destination) => [destination.serverId, destination])
+    );
+    const statuses = await getRepository(MediaDestinationSeasonStatus).find({
+      where: {
+        destinationStatusId: In([
+          byServerId.get(201)?.id ?? 0,
+          byServerId.get(202)?.id ?? 0,
+        ]),
+      },
+    });
+    const statusBySlot = new Map(
+      statuses.map((status) => [
+        `${status.destinationStatusId}:${status.seasonNumber}`,
+        status.status,
+      ])
+    );
+    assert.strictEqual(
+      statusBySlot.get(`${byServerId.get(201)?.id}:2`),
+      MediaStatus.PENDING
+    );
+    assert.strictEqual(
+      statusBySlot.get(`${byServerId.get(202)?.id}:1`),
+      MediaStatus.UNKNOWN
+    );
+    assert.strictEqual(
+      statusBySlot.get(`${byServerId.get(202)?.id}:2`),
+      MediaStatus.PENDING
+    );
+    assert.deepStrictEqual(
+      french.seasons.map((season) => season.seasonNumber),
+      [2]
+    );
+  });
+
+  it('rolls back an independent TV edit when removed-season cleanup fails', async (t) => {
+    configureSonarr([
+      { id: 211, isDefault: true, independentRequestDestination: true },
+    ]);
+    const user = await seedUser('demo@seerr.dev');
+    const mediaRequest = await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67911,
+        serverId: 211,
+        seasons: [1, 2],
+      },
+      user
+    );
+    const destination = await getRepository(
+      MediaDestinationStatus
+    ).findOneOrFail({
+      where: { mediaId: mediaRequest.media.id, serverId: 211 },
+    });
+    const subscriberInternals = MediaRequestSubscriber.prototype as unknown as {
+      releaseIndependentDestinationSeasons: () => Promise<void>;
+    };
+    t.mock.method(
+      subscriberInternals,
+      'releaseIndependentDestinationSeasons',
+      async () => {
+        throw new Error('Destination season cleanup failed');
+      }
+    );
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.TV,
+      seasons: [2],
+    });
+
+    assert.strictEqual(res.status, 500);
+    const persisted = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.deepStrictEqual(
+      persisted.seasons.map((season) => season.seasonNumber),
+      [1, 2]
+    );
+    const seasonStatuses = await getRepository(
+      MediaDestinationSeasonStatus
+    ).find({
+      where: { destinationStatusId: destination.id },
+    });
+    assert.deepStrictEqual(
+      seasonStatuses
+        .map((season) => [season.seasonNumber, season.status])
+        .sort(([left], [right]) => left - right),
+      [
+        [1, MediaStatus.PENDING],
+        [2, MediaStatus.PENDING],
+      ]
+    );
+  });
+
+  it('does not clear removed independent TV state held by another active exact-slot request', async () => {
+    configureSonarr([
+      { id: 212, isDefault: true, independentRequestDestination: true },
+    ]);
+    const user = await seedUser('demo@seerr.dev');
+    const mediaRequest = await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67912,
+        serverId: 212,
+        seasons: [1, 2],
+      },
+      user
+    );
+    await getRepository(MediaRequest).save(
+      new MediaRequest({
+        type: MediaType.TV,
+        status: MediaRequestStatus.PENDING,
+        media: mediaRequest.media,
+        requestedBy: user,
+        is4k: false,
+        serverId: 212,
+        seasons: [
+          new SeasonRequest({
+            seasonNumber: 1,
+            status: MediaRequestStatus.PENDING,
+          }),
+        ],
+      })
+    );
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.TV,
+      seasons: [2],
+    });
+
+    assert.strictEqual(res.status, 200);
+    const destination = await getRepository(
+      MediaDestinationStatus
+    ).findOneOrFail({
+      where: { mediaId: mediaRequest.media.id, serverId: 212 },
+    });
+    const season = await getRepository(
+      MediaDestinationSeasonStatus
+    ).findOneOrFail({
+      where: { destinationStatusId: destination.id, seasonNumber: 1 },
+    });
+    assert.strictEqual(season.status, MediaStatus.PENDING);
+  });
+
+  it('does not degrade scanner-derived state when an independent TV season is removed', async () => {
+    configureSonarr([
+      { id: 213, isDefault: true, independentRequestDestination: true },
+    ]);
+    const user = await seedUser('demo@seerr.dev');
+    const mediaRequest = await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67913,
+        serverId: 213,
+        seasons: [1, 2],
+      },
+      user
+    );
+    const destination = await getRepository(
+      MediaDestinationStatus
+    ).findOneOrFail({
+      where: { mediaId: mediaRequest.media.id, serverId: 213 },
+    });
+    const seasonRepository = getRepository(MediaDestinationSeasonStatus);
+    const scannerDerived = await seasonRepository.findOneOrFail({
+      where: { destinationStatusId: destination.id, seasonNumber: 1 },
+    });
+    scannerDerived.status = MediaStatus.AVAILABLE;
+    await seasonRepository.save(scannerDerived);
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.TV,
+      seasons: [2],
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(
+      (
+        await seasonRepository.findOneOrFail({
+          where: { id: scannerDerived.id },
+        })
+      ).status,
+      MediaStatus.AVAILABLE
+    );
+  });
+
+  it('keeps a resolved native TV destination when serverId is omitted', async () => {
+    configureSonarr([{ id: 203, independentRequestDestination: false }]);
+    const owner = await seedUser('demo@seerr.dev');
+    const mediaRequest = await seedTvRequest(owner, [1]);
+    mediaRequest.serverId = 203;
+    await getRepository(MediaRequest).save(mediaRequest);
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.TV,
+      seasons: [1],
+      rootFolder: '/updated/native-tv',
+    });
+
+    assert.strictEqual(res.status, 200);
+    const saved = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 203);
+    assert.strictEqual(saved.rootFolder, '/updated/native-tv');
+  });
+
+  it('rejects converting a native TV request to an independent destination', async () => {
+    configureSonarr([
+      { id: 208, isDefault: true, independentRequestDestination: false },
+      { id: 209, isDefault: false, independentRequestDestination: true },
+    ]);
+    const owner = await seedUser('demo@seerr.dev');
+    const mediaRequest = await seedTvRequest(owner, [1]);
+    mediaRequest.serverId = 208;
+    await getRepository(MediaRequest).save(mediaRequest);
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.TV,
+      serverId: 209,
+      seasons: [1, 2],
+      rootFolder: '/must-not-change',
+    });
+
+    assert.strictEqual(res.status, 409);
+    const saved = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 208);
+    assert.strictEqual(saved.rootFolder, null);
+    assert.deepStrictEqual(
+      saved.seasons.map((season) => season.seasonNumber),
+      [1]
+    );
+    assert.strictEqual(
+      await getRepository(MediaDestinationStatus).count({
+        where: { mediaId: mediaRequest.media.id, serverId: 209 },
+      }),
+      0
+    );
+    assert.strictEqual(
+      await getRepository(MediaDestinationSeasonStatus).count(),
+      0
+    );
+  });
+
+  it('rejects a deleted native TV target even when an old destination row exists', async () => {
+    configureSonarr([
+      { id: 210, isDefault: true, independentRequestDestination: false },
+    ]);
+    const owner = await seedUser('demo@seerr.dev');
+    const mediaRequest = await seedTvRequest(owner, [1]);
+    mediaRequest.serverId = 210;
+    await getRepository(MediaRequest).save(mediaRequest);
+    const staleDestination = await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: mediaRequest.media.id,
+        serverId: 211,
+        status: MediaStatus.UNKNOWN,
+      })
+    );
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${mediaRequest.id}`).send({
+      mediaType: MediaType.TV,
+      serverId: 211,
+      seasons: [1, 2],
+      rootFolder: '/must-not-change',
+    });
+
+    assert.strictEqual(res.status, 409);
+    const saved = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: mediaRequest.id },
+    });
+    assert.strictEqual(saved.serverId, 210);
+    assert.strictEqual(saved.rootFolder, null);
+    assert.deepStrictEqual(
+      saved.seasons.map((season) => season.seasonNumber),
+      [1]
+    );
+    assert.strictEqual(
+      await getRepository(MediaDestinationSeasonStatus).count({
+        where: { destinationStatusId: staleDestination.id },
+      }),
+      0
+    );
+  });
+
+  it('does not filter a native TV edit because an independent request holds the season', async () => {
+    configureSonarr([
+      { id: 204, isDefault: true, independentRequestDestination: false },
+      { id: 205, isDefault: false, independentRequestDestination: true },
+    ]);
+    const user = await seedUser('demo@seerr.dev');
+    await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67902,
+        serverId: 205,
+        seasons: [2],
+      },
+      user
+    );
+    const native = await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67902,
+        serverId: 204,
+        seasons: [1],
+      },
+      user
+    );
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${native.id}`).send({
+      mediaType: MediaType.TV,
+      seasons: [1, 2],
+    });
+
+    assert.strictEqual(res.status, 200);
+    const saved = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: native.id },
+    });
+    assert.deepStrictEqual(
+      saved.seasons.map((season) => season.seasonNumber).sort((a, b) => a - b),
+      [1, 2]
+    );
+  });
+
+  it('does not filter an independent TV edit because a native request holds the season', async () => {
+    configureSonarr([
+      { id: 206, isDefault: true, independentRequestDestination: false },
+      { id: 207, isDefault: false, independentRequestDestination: true },
+    ]);
+    const user = await seedUser('demo@seerr.dev');
+    await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67903,
+        serverId: 206,
+        seasons: [2],
+      },
+      user
+    );
+    const independent = await MediaRequest.request(
+      {
+        mediaType: MediaType.TV,
+        mediaId: 67903,
+        serverId: 207,
+        seasons: [1],
+      },
+      user
+    );
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.put(`/request/${independent.id}`).send({
+      mediaType: MediaType.TV,
+      seasons: [1, 2],
+    });
+
+    assert.strictEqual(res.status, 200);
+    const saved = await getRepository(MediaRequest).findOneOrFail({
+      where: { id: independent.id },
+    });
+    assert.deepStrictEqual(
+      saved.seasons.map((season) => season.seasonNumber).sort((a, b) => a - b),
+      [1, 2]
+    );
+  });
 });
 
 describe('PUT /request/:requestId (season availability)', () => {
@@ -553,6 +1183,9 @@ describe('PUT /request/:requestId (season availability)', () => {
   });
 
   it('keeps the seasons it already holds once they are available', async () => {
+    configureSonarr([
+      { id: 3, isDefault: true, independentRequestDestination: false },
+    ]);
     const requestRepo = getRepository(MediaRequest);
     const owner = await seedUser('demo@seerr.dev');
     const mediaRequest = await seedTvRequest(owner, [1, 2]);
@@ -930,7 +1563,7 @@ describe('POST /request/:requestId/:status', () => {
 });
 
 describe('POST /request/:requestId/retry', () => {
-  it('re-approves a failed request and records the acting user', async () => {
+  it('preserves default fallback for a legacy request without serverId', async () => {
     const repo = getRepository(MediaRequest);
     const failed = await seedRequest(MediaRequestStatus.FAILED);
     const admin = await loginAs('admin@seerr.dev', 'test1234');
@@ -947,6 +1580,7 @@ describe('POST /request/:requestId/retry', () => {
     });
 
     assert.strictEqual(persisted.status, MediaRequestStatus.APPROVED);
+    assert.strictEqual(persisted.serverId, null);
     assert.strictEqual(persisted.modifiedBy?.email, 'admin@seerr.dev');
     assert.ok(persisted.updatedAt > failed.updatedAt);
   });
@@ -986,6 +1620,403 @@ describe('POST /request/:requestId/retry', () => {
 
     const persisted = await repo.findOneOrFail({ where: { id: failed.id } });
     assert.strictEqual(persisted.status, MediaRequestStatus.APPROVED);
+  });
+
+  it('retries an independent request on its stored server after the default changes', async (t) => {
+    configureRadarr([
+      { id: 41, independentRequestDestination: true, isDefault: false },
+      { id: 42, independentRequestDestination: true, isDefault: true },
+    ]);
+    const repo = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 41;
+    await repo.save(failed);
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: failed.media.id,
+        serverId: 41,
+        status: MediaStatus.UNKNOWN,
+      })
+    );
+    t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.serverId, 41);
+  });
+
+  it('retries a native request on its stored server after the default changes', async (t) => {
+    configureRadarr([
+      { id: 43, independentRequestDestination: false, isDefault: false },
+      { id: 44, independentRequestDestination: false, isDefault: true },
+    ]);
+    const repo = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 43;
+    await repo.save(failed);
+    const dispatchedTargets: (number | null)[] = [];
+    t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async (request: MediaRequest) => {
+        dispatchedTargets.push(request.serverId);
+      }
+    );
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.serverId, 43);
+    assert.deepStrictEqual(dispatchedTargets, [43]);
+  });
+
+  for (const scenario of [
+    { name: 'independent', independent: true, serverId: 71 },
+    { name: 'native', independent: false, serverId: 72 },
+  ]) {
+    it(`${scenario.name} retry wins against concurrent server deletion`, async (t) => {
+      configureRadarr([
+        {
+          id: scenario.serverId,
+          independentRequestDestination: scenario.independent,
+          isDefault: true,
+        },
+      ]);
+      t.mock.method(getSettings(), 'save', async () => undefined);
+      const repo = getRepository(MediaRequest);
+      const failed = await seedRequest(MediaRequestStatus.FAILED);
+      failed.serverId = scenario.serverId;
+      await repo.save(failed);
+      if (scenario.independent) {
+        await getRepository(MediaDestinationStatus).save(
+          new MediaDestinationStatus({
+            mediaId: failed.media.id,
+            serverId: scenario.serverId,
+            status: MediaStatus.UNKNOWN,
+          })
+        );
+      }
+      const pause = pauseRequestBeforeUpdate(t);
+      const sendToRadarr = t.mock.method(
+        MediaRequestSubscriber.prototype,
+        'sendToRadarr',
+        async () => undefined
+      );
+      const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+      const retry = admin.post(`/request/${failed.id}/retry`);
+      const retryPromise = retry.then((response) => response);
+      await pause.reached;
+
+      let deletionSettled = false;
+      const deletion = request(app)
+        .delete(`/settings/radarr/${scenario.serverId}`)
+        .then((response) => {
+          deletionSettled = true;
+          return response;
+        });
+      await nextTurn();
+      await nextTurn();
+      assert.strictEqual(deletionSettled, false);
+
+      pause.resume();
+      const retryResponse = await retryPromise;
+      const deletionResponse = await deletion;
+
+      assert.strictEqual(retryResponse.status, 200);
+      assert.strictEqual(retryResponse.body.serverId, scenario.serverId);
+      assert.strictEqual(deletionResponse.status, 409);
+      const persisted = await repo.findOneOrFail({
+        where: { id: failed.id },
+      });
+      assert.strictEqual(persisted.status, MediaRequestStatus.APPROVED);
+      assert.strictEqual(persisted.serverId, scenario.serverId);
+      assert.strictEqual(sendToRadarr.mock.callCount(), 1);
+      assert.ok(
+        getSettings().radarr.some((server) => server.id === scenario.serverId)
+      );
+    });
+
+    it(`${scenario.name} server deletion wins against concurrent retry`, async (t) => {
+      configureRadarr([
+        {
+          id: scenario.serverId,
+          independentRequestDestination: scenario.independent,
+          isDefault: true,
+        },
+      ]);
+      t.mock.method(getSettings(), 'save', async () => undefined);
+      const repo = getRepository(MediaRequest);
+      const failed = await seedRequest(MediaRequestStatus.FAILED);
+      failed.serverId = scenario.serverId;
+      await repo.save(failed);
+      if (scenario.independent) {
+        await getRepository(MediaDestinationStatus).save(
+          new MediaDestinationStatus({
+            mediaId: failed.media.id,
+            serverId: scenario.serverId,
+            status: MediaStatus.UNKNOWN,
+          })
+        );
+      }
+      const sendToRadarr = t.mock.method(
+        MediaRequestSubscriber.prototype,
+        'sendToRadarr',
+        async () => undefined
+      );
+      const admin = await loginAs('admin@seerr.dev', 'test1234');
+      let signalDeleteValidation!: () => void;
+      const deleteValidationReached = new Promise<void>((resolve) => {
+        signalDeleteValidation = resolve;
+      });
+      let resumeDeleteValidation!: () => void;
+      const deleteValidationResumed = new Promise<void>((resolve) => {
+        resumeDeleteValidation = resolve;
+      });
+      t.mock.method(repo, 'existsBy', async () => {
+        signalDeleteValidation();
+        await deleteValidationResumed;
+        return false;
+      });
+
+      const deletion = request(app).delete(
+        `/settings/radarr/${scenario.serverId}`
+      );
+      const deletionPromise = deletion.then((response) => response);
+      await deleteValidationReached;
+      const retry = admin.post(`/request/${failed.id}/retry`);
+      const retryPromise = retry.then((response) => response);
+
+      resumeDeleteValidation();
+      const deletionResponse = await deletionPromise;
+      const retryResponse = await retryPromise;
+
+      assert.strictEqual(deletionResponse.status, 200);
+      assert.strictEqual(retryResponse.status, 409);
+      const persisted = await repo.findOneOrFail({
+        where: { id: failed.id },
+      });
+      assert.strictEqual(persisted.status, MediaRequestStatus.FAILED);
+      assert.strictEqual(persisted.serverId, scenario.serverId);
+      assert.strictEqual(sendToRadarr.mock.callCount(), 0);
+      assert.ok(
+        !getSettings().radarr.some((server) => server.id === scenario.serverId)
+      );
+
+      if (scenario.independent) {
+        const destination = await getRepository(
+          MediaDestinationStatus
+        ).findOneOrFail({
+          where: {
+            mediaId: failed.media.id,
+            serverId: scenario.serverId,
+          },
+        });
+        assert.strictEqual(destination.status, MediaStatus.UNKNOWN);
+      } else {
+        const media = await getRepository(Media).findOneOrFail({
+          where: { id: failed.media.id },
+        });
+        assert.strictEqual(media.status, MediaStatus.UNKNOWN);
+        assert.strictEqual(media.status4k, MediaStatus.UNKNOWN);
+      }
+    });
+  }
+
+  it('rejects native movie retry when another native request occupies the slot', async (t) => {
+    configureRadarr([
+      { id: 45, independentRequestDestination: false, isDefault: true },
+    ]);
+    const repo = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 45;
+    await repo.save(failed);
+    const active = await repo.save(
+      new MediaRequest({
+        type: MediaType.MOVIE,
+        status: MediaRequestStatus.PENDING,
+        media: failed.media,
+        requestedBy: failed.requestedBy,
+        is4k: false,
+        serverId: 45,
+      })
+    );
+    const sendToRadarr = t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 409);
+    assert.strictEqual(
+      (await repo.findOneOrFail({ where: { id: failed.id } })).status,
+      MediaRequestStatus.FAILED
+    );
+    assert.strictEqual(
+      (await repo.findOneOrFail({ where: { id: active.id } })).status,
+      MediaRequestStatus.PENDING
+    );
+    assert.strictEqual(sendToRadarr.mock.callCount(), 0);
+  });
+
+  it('rejects native TV retry when another native request overlaps a season', async () => {
+    configureSonarr([
+      { id: 46, independentRequestDestination: false, isDefault: true },
+    ]);
+    const owner = await seedUser('demo@seerr.dev');
+    const repo = getRepository(MediaRequest);
+    const failed = await seedTvRequest(owner, [1, 2], { tmdbId: 67904 });
+    failed.status = MediaRequestStatus.FAILED;
+    failed.serverId = 46;
+    await repo.save(failed);
+    const active = await repo.save(
+      new MediaRequest({
+        type: MediaType.TV,
+        status: MediaRequestStatus.PENDING,
+        media: failed.media,
+        requestedBy: owner,
+        is4k: false,
+        serverId: 46,
+        seasons: [
+          new SeasonRequest({
+            seasonNumber: 2,
+            status: MediaRequestStatus.PENDING,
+          }),
+        ],
+      })
+    );
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 409);
+    assert.strictEqual(
+      (await repo.findOneOrFail({ where: { id: failed.id } })).status,
+      MediaRequestStatus.FAILED
+    );
+    assert.strictEqual(
+      (await repo.findOneOrFail({ where: { id: active.id } })).status,
+      MediaRequestStatus.PENDING
+    );
+  });
+
+  it('allows native retry when only an independent request is active', async (t) => {
+    configureRadarr([
+      { id: 47, independentRequestDestination: false, isDefault: true },
+      { id: 48, independentRequestDestination: true, isDefault: false },
+    ]);
+    const repo = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 47;
+    await repo.save(failed);
+    await repo.save(
+      new MediaRequest({
+        type: MediaType.MOVIE,
+        status: MediaRequestStatus.PENDING,
+        media: failed.media,
+        requestedBy: failed.requestedBy,
+        is4k: false,
+        serverId: 48,
+      })
+    );
+    const sendToRadarr = t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.status, MediaRequestStatus.APPROVED);
+    assert.strictEqual(sendToRadarr.mock.callCount(), 1);
+  });
+
+  it('rejects retry when a persisted native server was deleted', async (t) => {
+    configureRadarr([
+      { id: 54, independentRequestDestination: false, isDefault: true },
+    ]);
+    const repo = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 53;
+    await repo.save(failed);
+    const sendToRadarr = t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 409);
+    const persisted = await repo.findOneOrFail({ where: { id: failed.id } });
+    assert.strictEqual(persisted.status, MediaRequestStatus.FAILED);
+    assert.strictEqual(persisted.serverId, 53);
+    assert.strictEqual(sendToRadarr.mock.callCount(), 0);
+  });
+
+  it('rejects retry when the independent server was deleted', async () => {
+    getSettings().radarr = [];
+    const repo = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 51;
+    await repo.save(failed);
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: failed.media.id,
+        serverId: 51,
+        status: MediaStatus.UNKNOWN,
+      })
+    );
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 409);
+  });
+
+  it('rejects retry when another request occupies the independent slot', async () => {
+    configureRadarr([
+      { id: 61, independentRequestDestination: true, isDefault: true },
+    ]);
+    const repo = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 61;
+    await repo.save(failed);
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: failed.media.id,
+        serverId: 61,
+        status: MediaStatus.UNKNOWN,
+      })
+    );
+    await repo.save(
+      new MediaRequest({
+        type: MediaType.MOVIE,
+        status: MediaRequestStatus.PENDING,
+        media: failed.media,
+        requestedBy: failed.requestedBy,
+        is4k: false,
+        serverId: 61,
+      })
+    );
+
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin.post(`/request/${failed.id}/retry`);
+
+    assert.strictEqual(res.status, 409);
   });
 });
 
@@ -1260,6 +2291,62 @@ describe('DELETE /request/:requestId, deleted media status restoration', () => {
 });
 
 describe('POST /request (movie), override rules', () => {
+  it('uses the explicit independent server for override rules instead of the default', async () => {
+    configureRadarr([
+      { id: 71, isDefault: true, independentRequestDestination: true },
+      { id: 72, isDefault: false, independentRequestDestination: true },
+    ]);
+    getSettings().sonarr = [];
+    await getRepository(OverrideRule).save([
+      new OverrideRule({
+        radarrServiceId: 71,
+        rootFolder: '/default',
+      }),
+      new OverrideRule({
+        radarrServiceId: 72,
+        rootFolder: '/explicit',
+      }),
+    ]);
+
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    const res = await agent.post('/request').send({
+      mediaType: MediaType.MOVIE,
+      mediaId: 87999,
+      serverId: 72,
+    });
+
+    assert.strictEqual(res.status, 201);
+    assert.strictEqual(res.body.serverId, 72);
+    assert.strictEqual(res.body.rootFolder, '/explicit');
+  });
+
+  it('rejects an unknown explicit server and a desynchronized independent server', async () => {
+    configureRadarr([
+      {
+        id: 73,
+        isDefault: true,
+        independentRequestDestination: true,
+        syncEnabled: false,
+      },
+    ]);
+    getSettings().sonarr = [];
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+
+    const unknown = await agent.post('/request').send({
+      mediaType: MediaType.MOVIE,
+      mediaId: 87997,
+      serverId: 999,
+    });
+    const incoherent = await agent.post('/request').send({
+      mediaType: MediaType.MOVIE,
+      mediaId: 87998,
+      serverId: 73,
+    });
+
+    assert.strictEqual(unknown.status, 400);
+    assert.strictEqual(incoherent.status, 400);
+  });
+
   it('applies an override rule when the default Radarr server id differs from its array index', async () => {
     configureRadarr([{ id: 5, isDefault: true, is4k: false }]);
     getSettings().sonarr = [];
@@ -1316,7 +2403,7 @@ describe('POST /request (movie), override rules', () => {
     assert.strictEqual(res.body.rootFolder, '/overridden/movies');
   });
 
-  it('does not apply an unrelated override rule when there is no default Radarr server configured', async () => {
+  it('rejects a movie request when there is no resolvable Radarr target', async () => {
     getSettings().radarr = [];
     getSettings().sonarr = [];
 
@@ -1340,8 +2427,7 @@ describe('POST /request (movie), override rules', () => {
       mediaId: 88005,
     });
 
-    assert.strictEqual(res.status, 201);
-    assert.strictEqual(res.body.rootFolder, null);
+    assert.strictEqual(res.status, 400);
   });
 });
 
@@ -1404,7 +2490,7 @@ describe('POST /request (tv), override rules', () => {
     assert.strictEqual(res.body.rootFolder, '/overridden/tv');
   });
 
-  it('does not apply an unrelated override rule when there is no default Sonarr server configured', async () => {
+  it('rejects a TV request when there is no resolvable Sonarr target', async () => {
     getSettings().radarr = [];
     getSettings().sonarr = [];
 
@@ -1429,8 +2515,7 @@ describe('POST /request (tv), override rules', () => {
       seasons: [1],
     });
 
-    assert.strictEqual(res.status, 201);
-    assert.strictEqual(res.body.rootFolder, null);
+    assert.strictEqual(res.status, 400);
   });
 });
 
@@ -1564,6 +2649,7 @@ describe('DELETE /request/:requestId, orphaned season status reset', () => {
     });
     assert.strictEqual(updated.seasons[0].status, MediaStatus.UNKNOWN);
 
+    configureSonarr([{ id: 0, isDefault: true }]);
     const friend = await loginAs('demo@seerr.dev', 'test1234');
     const reRequest = await friend.post('/request').send({
       mediaType: MediaType.TV,

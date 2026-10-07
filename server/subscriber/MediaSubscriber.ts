@@ -7,6 +7,7 @@ import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
+import { isIndependentRequest } from '@server/lib/requestTarget';
 import logger from '@server/logger';
 import { withNestedTransaction } from '@server/utils/nestedTransaction';
 import type {
@@ -32,7 +33,8 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
     for (const request of requests) {
       if (
         request.is4k === is4k &&
-        request.status === MediaRequestStatus.PENDING
+        request.status === MediaRequestStatus.PENDING &&
+        !(await isIndependentRequest(request, manager))
       ) {
         request.status = MediaRequestStatus.APPROVED;
         await requestRepository.save(request);
@@ -66,6 +68,10 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
       const completedRequests: MediaRequest[] = [];
 
       for (const request of relatedRequests) {
+        if (await isIndependentRequest(request, manager)) {
+          continue;
+        }
+
         let shouldComplete = false;
 
         if (
