@@ -1805,6 +1805,80 @@ describe('POST /request/:requestId/:status', () => {
     });
   }
 
+  it('returns freshly persisted native target state after approval', async (t) => {
+    configureRadarr([
+      { id: 341, isDefault: true, independentRequestDestination: false },
+    ]);
+    const requestRepository = getRepository(MediaRequest);
+    const pending = await seedRequest();
+    pending.serverId = 341;
+    pending.media.status = MediaStatus.PENDING;
+    await getRepository(Media).save(pending.media);
+    await requestRepository.save(pending);
+    t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).post(`/request/${pending.id}/approve`);
+    const persistedMedia = await getRepository(Media).findOneByOrFail({
+      id: pending.media.id,
+    });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(persistedMedia.status, MediaStatus.PROCESSING);
+    assert.strictEqual(response.body.target.status, persistedMedia.status);
+    assert.strictEqual(response.body.target.serverId, 341);
+    assert.strictEqual(response.body.target.isIndependent, false);
+  });
+
+  it('keeps independent approval state isolated from contradictory native state', async (t) => {
+    configureRadarr([
+      { id: 342, isDefault: true, independentRequestDestination: true },
+    ]);
+    const pending = await seedRequest();
+    pending.media.status = MediaStatus.AVAILABLE;
+    await getRepository(Media).save(pending.media);
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ serverId: 342 })
+      .where('id = :id', { id: pending.id })
+      .callListeners(false)
+      .execute();
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: pending.media.id,
+        serverId: 342,
+        status: MediaStatus.UNKNOWN,
+      })
+    );
+    t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).post(`/request/${pending.id}/approve`);
+    const destination = await getRepository(
+      MediaDestinationStatus
+    ).findOneByOrFail({
+      mediaId: pending.media.id,
+      serverId: 342,
+    });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.body.target.status, destination.status);
+    assert.notStrictEqual(response.body.target.status, MediaStatus.AVAILABLE);
+    assert.strictEqual(response.body.target.serverId, 342);
+    assert.strictEqual(response.body.target.isIndependent, true);
+  });
+
   it('rejects a status the route does not define', async () => {
     const repo = getRepository(MediaRequest);
     const pending = await seedRequest();
@@ -1874,6 +1948,36 @@ describe('POST /request/:requestId/:status', () => {
 });
 
 describe('POST /request/:requestId/retry', () => {
+  it('returns freshly persisted native target state after retry', async (t) => {
+    configureRadarr([
+      { id: 343, isDefault: true, independentRequestDestination: false },
+    ]);
+    const requestRepository = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 343;
+    failed.media.status = MediaStatus.PENDING;
+    await getRepository(Media).save(failed.media);
+    await requestRepository.save(failed);
+    t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).post(`/request/${failed.id}/retry`);
+    const persistedMedia = await getRepository(Media).findOneByOrFail({
+      id: failed.media.id,
+    });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(persistedMedia.status, MediaStatus.PROCESSING);
+    assert.strictEqual(response.body.target.status, persistedMedia.status);
+    assert.strictEqual(response.body.target.serverId, 343);
+    assert.strictEqual(response.body.target.isIndependent, false);
+  });
+
   it('preserves default fallback for a legacy request without serverId', async () => {
     const repo = getRepository(MediaRequest);
     const failed = await seedRequest(MediaRequestStatus.FAILED);

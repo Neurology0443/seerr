@@ -9,11 +9,9 @@ import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { Watchlist } from '@server/entity/Watchlist';
 import type { MovieRequestTarget } from '@server/interfaces/api/requestInterfaces';
 import {
-  isActiveRequestStatus,
-  isRequestableDestinationStatus,
-} from '@server/lib/requestSlot';
-import { isIndependentRequest } from '@server/lib/requestTarget';
-import { getConfiguredTargetStatus } from '@server/lib/requestTargetState';
+  classifyActiveRequestTargets,
+  getConfiguredRequestTargetState,
+} from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { mapMovieDetails } from '@server/models/Movie';
@@ -39,43 +37,29 @@ movieRoutes.get<{ id: string }, MovieRequestTarget[]>(
             where: { mediaId: media.id },
           })
         : [];
-      const activeRequests = (media?.requests ?? []).filter((request) =>
-        isActiveRequestStatus(request.status)
-      );
-      const classifiedRequests = await Promise.all(
-        activeRequests.map(async (request) => ({
-          request,
-          independent: await isIndependentRequest(
-            request,
-            mediaRepository.manager
-          ),
-        }))
+      const activeRequests = await classifyActiveRequestTargets(
+        media?.requests ?? [],
+        mediaRepository.manager
       );
 
       const targets = getSettings().radarr.map((server) => {
-        const independent = server.independentRequestDestination === true;
-        const status = getConfiguredTargetStatus({
+        const state = getConfiguredRequestTargetState({
           media: media ?? undefined,
           server,
           destinationStatus: destinations.find(
             (destination) => destination.serverId === server.id
           )?.status,
+          activeRequests,
         });
-        const occupied = classifiedRequests.some(
-          ({ request, independent: requestIndependent }) =>
-            independent
-              ? requestIndependent && request.serverId === server.id
-              : !requestIndependent && request.is4k === server.is4k
-        );
 
         return {
           serverId: server.id,
           name: server.name,
           is4k: Boolean(server.is4k),
           isDefault: Boolean(server.isDefault),
-          isIndependent: independent,
-          status,
-          requestable: isRequestableDestinationStatus(status) && !occupied,
+          isIndependent: state.isIndependent,
+          status: state.status,
+          requestable: state.requestable,
         };
       });
 

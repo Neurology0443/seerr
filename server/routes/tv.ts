@@ -3,7 +3,7 @@ import RottenTomatoes from '@server/api/rating/rottentomatoes';
 import TheMovieDb from '@server/api/themoviedb';
 import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import type { TmdbKeyword } from '@server/api/themoviedb/interfaces';
-import { MediaStatus, MediaType } from '@server/constants/media';
+import { MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
@@ -11,11 +11,9 @@ import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { Watchlist } from '@server/entity/Watchlist';
 import type { TvRequestTarget } from '@server/interfaces/api/requestInterfaces';
 import {
-  isActiveRequestStatus,
-  isRequestableDestinationStatus,
-} from '@server/lib/requestSlot';
-import { isIndependentRequest } from '@server/lib/requestTarget';
-import { getConfiguredTargetStatus } from '@server/lib/requestTargetState';
+  classifyActiveRequestTargets,
+  getConfiguredRequestTargetState,
+} from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { mapTvResult } from '@server/models/Search';
@@ -59,49 +57,41 @@ tvRoutes.get<{ id: string }, TvRequestTarget[]>(
               },
             })
           : [];
-      const activeRequests = (media?.requests ?? []).filter((request) =>
-        isActiveRequestStatus(request.status)
-      );
-      const classifiedRequests = await Promise.all(
-        activeRequests.map(async (request) => ({
-          request,
-          independent: await isIndependentRequest(
-            request,
-            mediaRepository.manager
-          ),
-        }))
+      const activeRequests = await classifyActiveRequestTargets(
+        media?.requests ?? [],
+        mediaRepository.manager
       );
 
       const targets = settings.sonarr.map((server) => {
-        const independent = server.independentRequestDestination === true;
         const destination = destinations.find(
           (candidate) => candidate.serverId === server.id
         );
         const seasons = seasonNumbers.map((seasonNumber) => {
-          const status = independent
-            ? (destinationSeasons.find(
-                (season) =>
-                  season.destinationStatusId === destination?.id &&
-                  season.seasonNumber === seasonNumber
-              )?.status ?? MediaStatus.UNKNOWN)
-            : (media?.seasons?.find(
-                (season) => season.seasonNumber === seasonNumber
-              )?.[server.is4k ? 'status4k' : 'status'] ?? MediaStatus.UNKNOWN);
-          const occupied = classifiedRequests.some(
-            ({ request, independent: requestIndependent }) =>
-              (independent
-                ? requestIndependent && request.serverId === server.id
-                : !requestIndependent && request.is4k === server.is4k) &&
-              request.seasons.some(
-                (season) => season.seasonNumber === seasonNumber
-              )
-          );
+          const state = getConfiguredRequestTargetState({
+            server,
+            destinationStatus: destinationSeasons.find(
+              (season) =>
+                season.destinationStatusId === destination?.id &&
+                season.seasonNumber === seasonNumber
+            )?.status,
+            nativeStatus: media?.seasons?.find(
+              (season) => season.seasonNumber === seasonNumber
+            )?.[server.is4k ? 'status4k' : 'status'],
+            activeRequests,
+            seasonNumber,
+          });
 
           return {
             seasonNumber,
-            status,
-            requestable: isRequestableDestinationStatus(status) && !occupied,
+            status: state.status,
+            requestable: state.requestable,
           };
+        });
+        const parentState = getConfiguredRequestTargetState({
+          media: media ?? undefined,
+          server,
+          destinationStatus: destination?.status,
+          activeRequests,
         });
 
         return {
@@ -109,12 +99,8 @@ tvRoutes.get<{ id: string }, TvRequestTarget[]>(
           name: server.name,
           is4k: Boolean(server.is4k),
           isDefault: Boolean(server.isDefault),
-          isIndependent: independent,
-          status: getConfiguredTargetStatus({
-            media: media ?? undefined,
-            server,
-            destinationStatus: destination?.status,
-          }),
+          isIndependent: parentState.isIndependent,
+          status: parentState.status,
           requestable: seasons.some((season) => season.requestable),
           seasons,
         };

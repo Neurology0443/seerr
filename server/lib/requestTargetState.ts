@@ -1,8 +1,12 @@
 import { MediaStatus, MediaType } from '@server/constants/media';
-import type Media from '@server/entity/Media';
+import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { MediaRequestTarget } from '@server/interfaces/api/requestInterfaces';
+import {
+  isActiveRequestStatus,
+  isRequestableDestinationStatus,
+} from '@server/lib/requestSlot';
 import {
   getConfiguredRequestServer,
   isIndependentRequest,
@@ -15,31 +19,93 @@ export const getEffectiveTargetStatus = ({
   is4k,
   isIndependent,
   destinationStatus,
+  nativeStatus,
 }: {
   media?: Media;
   is4k: boolean;
   isIndependent: boolean;
   destinationStatus?: MediaStatus;
+  nativeStatus?: MediaStatus;
 }): MediaStatus =>
   isIndependent
     ? (destinationStatus ?? MediaStatus.UNKNOWN)
-    : (media?.[is4k ? 'status4k' : 'status'] ?? MediaStatus.UNKNOWN);
+    : (nativeStatus ??
+      media?.[is4k ? 'status4k' : 'status'] ??
+      MediaStatus.UNKNOWN);
 
-export const getConfiguredTargetStatus = ({
+export type ClassifiedRequestTarget = {
+  request: Pick<
+    MediaRequest,
+    'type' | 'serverId' | 'is4k' | 'media' | 'seasons'
+  >;
+  isIndependent: boolean;
+};
+
+export const classifyActiveRequestTargets = async (
+  requests: Pick<
+    MediaRequest,
+    'type' | 'serverId' | 'is4k' | 'media' | 'seasons' | 'status'
+  >[],
+  manager: EntityManager
+): Promise<ClassifiedRequestTarget[]> =>
+  Promise.all(
+    requests
+      .filter((request) => isActiveRequestStatus(request.status))
+      .map(async (request) => ({
+        request,
+        isIndependent: await isIndependentRequest(request, manager),
+      }))
+  );
+
+export const getConfiguredRequestTargetState = ({
   media,
   server,
   destinationStatus,
+  nativeStatus,
+  activeRequests = [],
+  seasonNumber,
 }: {
   media?: Media;
   server: DVRSettings;
   destinationStatus?: MediaStatus;
-}): MediaStatus =>
-  getEffectiveTargetStatus({
+  nativeStatus?: MediaStatus;
+  activeRequests?: ClassifiedRequestTarget[];
+  seasonNumber?: number;
+}): {
+  isIndependent: boolean;
+  status: MediaStatus;
+  requestable: boolean;
+} => {
+  const isIndependent = server.independentRequestDestination === true;
+  const status = getEffectiveTargetStatus({
     media,
     is4k: Boolean(server.is4k),
-    isIndependent: server.independentRequestDestination === true,
+    isIndependent,
     destinationStatus,
+    nativeStatus,
   });
+  const occupied = activeRequests.some(
+    ({ request, isIndependent: requestIndependent }) => {
+      const sameSlot = isIndependent
+        ? requestIndependent && request.serverId === server.id
+        : !requestIndependent && request.is4k === Boolean(server.is4k);
+
+      return (
+        sameSlot &&
+        (seasonNumber === undefined ||
+          request.seasons.some(
+            (season) => season.seasonNumber === seasonNumber
+          ))
+      );
+    }
+  );
+
+  return {
+    isIndependent,
+    status,
+    requestable: isRequestableDestinationStatus(status) && !occupied,
+  };
+};
 
 export const getRequestTargetState = async (
   request: Pick<MediaRequest, 'type' | 'serverId' | 'is4k' | 'media'>,
@@ -59,6 +125,11 @@ export const getRequestTargetState = async (
         },
       })
     : null;
+  const media = independent
+    ? request.media
+    : await manager.getRepository(Media).findOneOrFail({
+        where: { id: request.media.id },
+      });
 
   return {
     serverId: request.serverId,
@@ -69,7 +140,7 @@ export const getRequestTargetState = async (
     isIndependent: independent,
     deleted: !server,
     status: getEffectiveTargetStatus({
-      media: request.media,
+      media,
       is4k: request.is4k,
       isIndependent: independent,
       destinationStatus: destination?.status,

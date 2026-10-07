@@ -10,8 +10,13 @@ import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
-import { getRequestTargetState } from '@server/lib/requestTargetState';
+import {
+  classifyActiveRequestTargets,
+  getConfiguredRequestTargetState,
+  getRequestTargetState,
+} from '@server/lib/requestTargetState';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
@@ -112,6 +117,29 @@ async function seedRequest({
 }
 
 describe('getRequestTargetState', () => {
+  it('refreshes persisted native status instead of using the request snapshot', async () => {
+    getSettings().radarr = [radarr(1)];
+    const seeded = await seedRequest({
+      serverId: 1,
+      status: MediaStatus.PENDING,
+    });
+    await getRepository(Media).update(
+      { id: seeded.media.id },
+      { status: MediaStatus.PROCESSING }
+    );
+
+    assert.strictEqual(seeded.request.media.status, MediaStatus.PENDING);
+    assert.strictEqual(
+      (
+        await getRequestTargetState(
+          seeded.request,
+          getRepository(MediaRequest).manager
+        )
+      )?.status,
+      MediaStatus.PROCESSING
+    );
+  });
+
   it('reads native Standard and 4K status from their native fields', async () => {
     getSettings().radarr = [radarr(1), radarr(2, { is4k: true })];
     const standard = await seedRequest({ serverId: 1 });
@@ -245,5 +273,104 @@ describe('getRequestTargetState', () => {
 
     assert.strictEqual(target?.serverId, 51);
     assert.strictEqual(target?.name, 'Renamed');
+  });
+});
+
+describe('configured request target state', () => {
+  const media = new Media({
+    id: 9001,
+    mediaType: MediaType.TV,
+    status: MediaStatus.UNKNOWN,
+    status4k: MediaStatus.UNKNOWN,
+  });
+  const request = ({
+    serverId,
+    is4k = false,
+    status = MediaRequestStatus.PENDING,
+    seasons = [],
+  }: {
+    serverId: number;
+    is4k?: boolean;
+    status?: MediaRequestStatus;
+    seasons?: number[];
+  }) =>
+    new MediaRequest({
+      type: MediaType.TV,
+      serverId,
+      is4k,
+      status,
+      media,
+      seasons: seasons.map(
+        (seasonNumber) => new SeasonRequest({ seasonNumber })
+      ),
+    });
+
+  it('classifies only active requests as slot owners', async () => {
+    getSettings().sonarr = [
+      sonarr(61),
+      sonarr(62, { independentRequestDestination: true }),
+    ];
+    const classified = await classifyActiveRequestTargets(
+      [
+        request({ serverId: 61, status: MediaRequestStatus.PENDING }),
+        request({ serverId: 62, status: MediaRequestStatus.APPROVED }),
+        request({ serverId: 61, status: MediaRequestStatus.COMPLETED }),
+        request({ serverId: 61, status: MediaRequestStatus.DECLINED }),
+        request({ serverId: 62, status: MediaRequestStatus.FAILED }),
+      ],
+      getRepository(MediaRequest).manager
+    );
+
+    assert.strictEqual(classified.length, 2);
+    assert.deepStrictEqual(
+      classified.map(({ isIndependent }) => isIndependent),
+      [false, true]
+    );
+  });
+
+  it('isolates independent and native slots and includes the TV season', async () => {
+    const native = sonarr(71);
+    const nativePeer = sonarr(72);
+    const french = sonarr(73, { independentRequestDestination: true });
+    const english = sonarr(74, { independentRequestDestination: true });
+    getSettings().sonarr = [native, nativePeer, french, english];
+    const activeRequests = await classifyActiveRequestTargets(
+      [
+        request({ serverId: 71, seasons: [1] }),
+        request({ serverId: 73, seasons: [2] }),
+      ],
+      getRepository(MediaRequest).manager
+    );
+    const state = (server: SonarrSettings, seasonNumber: number) =>
+      getConfiguredRequestTargetState({
+        server,
+        nativeStatus: MediaStatus.UNKNOWN,
+        destinationStatus: MediaStatus.UNKNOWN,
+        activeRequests,
+        seasonNumber,
+      });
+
+    assert.strictEqual(state(native, 1).requestable, false);
+    assert.strictEqual(state(nativePeer, 1).requestable, false);
+    assert.strictEqual(state(native, 2).requestable, true);
+    assert.strictEqual(state(french, 2).requestable, false);
+    assert.strictEqual(state(french, 1).requestable, true);
+    assert.strictEqual(state(english, 2).requestable, true);
+  });
+
+  it('combines persisted status requestability with slot occupation', () => {
+    const server = radarr(81, { independentRequestDestination: true });
+    const state = (status: MediaStatus) =>
+      getConfiguredRequestTargetState({
+        server,
+        destinationStatus: status,
+      }).requestable;
+
+    assert.strictEqual(state(MediaStatus.UNKNOWN), true);
+    assert.strictEqual(state(MediaStatus.DELETED), true);
+    assert.strictEqual(state(MediaStatus.PENDING), false);
+    assert.strictEqual(state(MediaStatus.AVAILABLE), false);
+    assert.strictEqual(state(MediaStatus.PROCESSING), false);
+    assert.strictEqual(state(MediaStatus.PARTIALLY_AVAILABLE), false);
   });
 });
