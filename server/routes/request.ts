@@ -7,6 +7,8 @@ import {
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import {
   BlocklistedMediaError,
   DuplicateMediaRequestError,
@@ -22,9 +24,21 @@ import type {
   RequestResultsResponse,
 } from '@server/interfaces/api/requestInterfaces';
 import { Permission } from '@server/lib/permissions';
+import {
+  ACTIVE_REQUEST_STATUSES,
+  isActiveRequestStatus,
+  isRequestableDestinationStatus,
+} from '@server/lib/requestSlot';
+import {
+  RequestTargetError,
+  getConfiguredRequestServer,
+  isIndependentRequest,
+  isNativeRequest,
+} from '@server/lib/requestTarget';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
 import requestLock, {
   mediaKey,
   mediaLock,
@@ -32,6 +46,7 @@ import requestLock, {
   userKey,
 } from '@server/utils/requestLock';
 import { Router } from 'express';
+import { In, Not } from 'typeorm';
 
 const requestRoutes = Router();
 
@@ -334,6 +349,8 @@ requestRoutes.post<never, MediaRequest, MediaRequestBody>(
           return next({ status: 202, message: error.message });
         case BlocklistedMediaError:
           return next({ status: 403, message: error.message });
+        case RequestTargetError:
+          return next({ status: 400, message: error.message });
         default:
           return next({ status: 500, message: error.message });
       }
@@ -501,6 +518,40 @@ requestRoutes.put<{ requestId: string }>(
           });
         }
 
+        const independent = await isIndependentRequest(
+          request,
+          requestRepository.manager
+        );
+        if (
+          independent &&
+          req.body.serverId !== undefined &&
+          req.body.serverId !== request.serverId
+        ) {
+          return next({
+            status: 409,
+            message: 'The destination of an independent request is immutable.',
+          });
+        }
+        if (!independent && req.body.serverId !== undefined) {
+          const serverId = req.body.serverId;
+          const targetServer =
+            typeof serverId === 'number' && Number.isSafeInteger(serverId)
+              ? getConfiguredRequestServer({
+                  type: request.type,
+                  serverId,
+                })
+              : undefined;
+          if (
+            !targetServer ||
+            targetServer.independentRequestDestination === true
+          ) {
+            return next({
+              status: 409,
+              message: 'The requested native destination is not available.',
+            });
+          }
+        }
+
         const previousOwnerId = request.requestedBy.id;
         let requestUser = request.requestedBy;
 
@@ -539,7 +590,9 @@ requestRoutes.put<{ requestId: string }>(
               }
             }
 
-            request.serverId = req.body.serverId;
+            if (!independent && req.body.serverId !== undefined) {
+              request.serverId = req.body.serverId;
+            }
             request.profileId = req.body.profileId;
             request.rootFolder = req.body.rootFolder;
             request.tags = req.body.tags;
@@ -548,7 +601,9 @@ requestRoutes.put<{ requestId: string }>(
             await requestRepository.save(request);
           } else if (req.body.mediaType === MediaType.TV) {
             const mediaRepository = getRepository(Media);
-            request.serverId = req.body.serverId;
+            if (!independent && req.body.serverId !== undefined) {
+              request.serverId = req.body.serverId;
+            }
             request.profileId = req.body.profileId;
             request.rootFolder = req.body.rootFolder;
             request.languageProfileId = req.body.languageProfileId;
@@ -577,14 +632,33 @@ requestRoutes.put<{ requestId: string }>(
                   relations: { requests: true },
                 });
 
+                const requestsInSlot = independent
+                  ? media.requests.filter(
+                      (candidate) => candidate.serverId === request.serverId
+                    )
+                  : (
+                      await Promise.all(
+                        media.requests.map(async (candidate) => ({
+                          candidate,
+                          isNative: await isNativeRequest(
+                            candidate,
+                            requestRepository.manager
+                          ),
+                        }))
+                      )
+                    )
+                      .filter(({ isNative }) => isNative)
+                      .map(({ candidate }) => candidate);
+
                 // Get all requested seasons that are not part of this request we are editing
-                const existingSeasons = media.requests
+                const existingSeasons = requestsInSlot
                   .filter(
                     (r) =>
-                      r.is4k === request.is4k &&
+                      (independent
+                        ? r.serverId === request.serverId
+                        : r.is4k === request.is4k) &&
                       r.id !== request.id &&
-                      r.status !== MediaRequestStatus.DECLINED &&
-                      r.status !== MediaRequestStatus.COMPLETED
+                      isActiveRequestStatus(r.status)
                   )
                   .reduce((seasons, r) => {
                     const combinedSeasons = r.seasons.map(
@@ -600,16 +674,40 @@ requestRoutes.put<{ requestId: string }>(
 
                 // Seasons the media already covers cannot be requested again, while
                 // the ones this request holds stay on it
-                const coveredSeasons = (media.seasons ?? [])
-                  .filter(
-                    (season) =>
-                      season[request.is4k ? 'status4k' : 'status'] !==
-                        MediaStatus.UNKNOWN &&
-                      season[request.is4k ? 'status4k' : 'status'] !==
-                        MediaStatus.DELETED
-                  )
-                  .map((season) => season.seasonNumber)
-                  .filter((sn) => !currentSeasons.includes(sn));
+                let coveredSeasons: number[];
+                let destination: MediaDestinationStatus | null = null;
+                if (independent) {
+                  destination = await getRepository(
+                    MediaDestinationStatus
+                  ).findOne({
+                    where: {
+                      mediaId: media.id,
+                      serverId: request.serverId,
+                    },
+                  });
+                  const destinationSeasons = destination
+                    ? await getRepository(MediaDestinationSeasonStatus).find({
+                        where: { destinationStatusId: destination.id },
+                      })
+                    : [];
+                  coveredSeasons = destinationSeasons
+                    .filter(
+                      (season) => !isRequestableDestinationStatus(season.status)
+                    )
+                    .map((season) => season.seasonNumber)
+                    .filter((sn) => !currentSeasons.includes(sn));
+                } else {
+                  coveredSeasons = (media.seasons ?? [])
+                    .filter(
+                      (season) =>
+                        season[request.is4k ? 'status4k' : 'status'] !==
+                          MediaStatus.UNKNOWN &&
+                        season[request.is4k ? 'status4k' : 'status'] !==
+                          MediaStatus.DELETED
+                    )
+                    .map((season) => season.seasonNumber)
+                    .filter((sn) => !currentSeasons.includes(sn));
+                }
 
                 const filteredSeasons = requestedSeasons.filter(
                   (rs) => !existingSeasons.includes(rs)
@@ -667,6 +765,10 @@ requestRoutes.put<{ requestId: string }>(
                   }
                 }
 
+                const removedSeasons = currentSeasons.filter(
+                  (seasonNumber) => !keptSeasons.includes(seasonNumber)
+                );
+
                 request.seasons = request.seasons.filter((rs) =>
                   keptSeasons.includes(rs.seasonNumber)
                 );
@@ -687,6 +789,9 @@ requestRoutes.put<{ requestId: string }>(
                   );
                 }
 
+                if (independent) {
+                  request.destinationSeasonNumbersToRelease = removedSeasons;
+                }
                 await requestRepository.save(request);
 
                 return res.status(200).json(request);
@@ -761,12 +866,184 @@ requestRoutes.post<{
           });
         }
 
-        // this also triggers updating the parent media's status & sending to *arr
-        request.status = MediaRequestStatus.APPROVED;
-        request.modifiedBy = req.user;
-        await requestRepository.save(request);
+        const retry = async () => {
+          const persistedServer =
+            request.serverId == null
+              ? undefined
+              : getConfiguredRequestServer(request);
+          if (request.serverId != null && !persistedServer) {
+            return next({
+              status: 409,
+              message:
+                'The original request destination is no longer available.',
+            });
+          }
 
-        return res.status(200).json(request);
+          const independent = await isIndependentRequest(
+            request,
+            requestRepository.manager
+          );
+          if (request.serverId != null) {
+            // Independent creation prepares this durable row before inserting
+            // the request, so it preserves the request's original role.
+            const hasIndependentDestination = await getRepository(
+              MediaDestinationStatus
+            ).exists({
+              where: {
+                mediaId: request.media.id,
+                serverId: request.serverId,
+              },
+            });
+
+            if (independent !== hasIndependentDestination) {
+              return next({
+                status: 409,
+                message:
+                  'The original request destination role is no longer available.',
+              });
+            }
+          }
+
+          if (independent) {
+            if (
+              persistedServer?.independentRequestDestination !== true ||
+              persistedServer.is4k !== request.is4k ||
+              persistedServer.syncEnabled !== true
+            ) {
+              return next({
+                status: 409,
+                message:
+                  'The original independent request destination is no longer available.',
+              });
+            }
+
+            return mediaLock.dispatch(
+              mediaKey(request.type, request.media.tmdbId),
+              async () => {
+                const otherActive = await requestRepository.find({
+                  where: {
+                    media: { id: request.media.id },
+                    serverId: request.serverId,
+                    id: Not(request.id),
+                    status: In([...ACTIVE_REQUEST_STATUSES]),
+                  },
+                });
+                const destination = await getRepository(
+                  MediaDestinationStatus
+                ).findOne({
+                  where: {
+                    mediaId: request.media.id,
+                    serverId: request.serverId,
+                  },
+                });
+
+                let occupied = false;
+                if (request.type === MediaType.MOVIE) {
+                  occupied =
+                    otherActive.length > 0 ||
+                    !isRequestableDestinationStatus(destination?.status);
+                } else {
+                  const requestedSeasons = request.seasons.map(
+                    (season) => season.seasonNumber
+                  );
+                  const occupiedByRequest = otherActive.some((otherRequest) =>
+                    otherRequest.seasons.some((season) =>
+                      requestedSeasons.includes(season.seasonNumber)
+                    )
+                  );
+                  const seasonStatuses = destination
+                    ? await getRepository(MediaDestinationSeasonStatus).find({
+                        where: {
+                          destinationStatusId: destination.id,
+                          seasonNumber: In(requestedSeasons),
+                        },
+                      })
+                    : [];
+                  occupied =
+                    occupiedByRequest ||
+                    seasonStatuses.some(
+                      (season) => !isRequestableDestinationStatus(season.status)
+                    );
+                }
+
+                if (occupied) {
+                  return next({
+                    status: 409,
+                    message:
+                      'The original independent request slot is no longer available.',
+                  });
+                }
+
+                request.status = MediaRequestStatus.APPROVED;
+                request.modifiedBy = req.user;
+                await requestRepository.save(request);
+
+                return res.status(200).json(request);
+              }
+            );
+          }
+
+          return mediaLock.dispatch(
+            mediaKey(request.type, request.media.tmdbId),
+            async () => {
+              const activeCandidates = await requestRepository.find({
+                where: {
+                  media: { id: request.media.id },
+                  is4k: request.is4k,
+                  id: Not(request.id),
+                  status: In([...ACTIVE_REQUEST_STATUSES]),
+                },
+              });
+              const otherNativeRequests = (
+                await Promise.all(
+                  activeCandidates.map(async (candidate) => ({
+                    candidate,
+                    isNative: await isNativeRequest(
+                      candidate,
+                      requestRepository.manager
+                    ),
+                  }))
+                )
+              )
+                .filter(({ isNative }) => isNative)
+                .map(({ candidate }) => candidate);
+
+              const occupied =
+                request.type === MediaType.MOVIE
+                  ? otherNativeRequests.length > 0
+                  : otherNativeRequests.some((candidate) =>
+                      candidate.seasons.some((season) =>
+                        request.seasons.some(
+                          (requestSeason) =>
+                            requestSeason.seasonNumber === season.seasonNumber
+                        )
+                      )
+                    );
+
+              if (occupied) {
+                return next({
+                  status: 409,
+                  message:
+                    'The original native request slot is no longer available.',
+                });
+              }
+
+              // this also triggers updating the parent media's status & sending to *arr
+              request.status = MediaRequestStatus.APPROVED;
+              request.modifiedBy = req.user;
+              await requestRepository.save(request);
+
+              return res.status(200).json(request);
+            }
+          );
+        };
+
+        if (request.serverId == null) {
+          return retry();
+        }
+
+        const dvrKind = request.type === MediaType.MOVIE ? 'radarr' : 'sonarr';
+        return withDvrIdentityLock(dvrKind, request.serverId, retry);
       });
     } catch (e) {
       logger.error('Error processing request retry', {

@@ -9,9 +9,21 @@ import type { MediaRequestBody } from '@server/interfaces/api/requestInterfaces'
 import notificationManager, { Notification } from '@server/lib/notifications';
 import overrideRules from '@server/lib/overrideRules';
 import { Permission } from '@server/lib/permissions';
+import {
+  isActiveRequestStatus,
+  isRequestableDestinationStatus,
+} from '@server/lib/requestSlot';
+import {
+  isIndependentRequest,
+  isNativeRequest,
+  resolveRequestTarget,
+  validateRequestCreationTarget,
+  type RequestCreationTarget,
+} from '@server/lib/requestTarget';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
+import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
 import requestLock, {
   mediaKey,
   mediaLock,
@@ -32,6 +44,8 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 import Media from './Media';
+import { MediaDestinationSeasonStatus } from './MediaDestinationSeasonStatus';
+import { MediaDestinationStatus } from './MediaDestinationStatus';
 import SeasonRequest from './SeasonRequest';
 import { User } from './User';
 
@@ -47,13 +61,26 @@ type MediaRequestOptions = {
 
 @Entity()
 export class MediaRequest {
+  /** Transient target identity used only during the initial save lifecycle. */
+  public creationTarget?: RequestCreationTarget;
+
+  /**
+   * Transient edit context consumed by MediaRequestSubscriber before the
+   * request save. It deliberately is not persisted.
+   */
+  public destinationSeasonNumbersToRelease?: number[];
+
   public static async request(
     requestBody: MediaRequestBody,
     user: User,
     options: MediaRequestOptions = {}
   ): Promise<MediaRequest> {
-    // is4k is optional, and an undefined one binds as null in the duplicate query
-    const body = { ...requestBody, is4k: !!requestBody.is4k };
+    const target = resolveRequestTarget(requestBody);
+    const body = {
+      ...requestBody,
+      serverId: target.serverId,
+      is4k: target.effectiveIs4k,
+    };
 
     // Only a caller allowed to set the request user may queue on their lock
     const lockUserId =
@@ -62,19 +89,26 @@ export class MediaRequest {
         ? body.userId
         : user.id;
 
-    // No is4k in the key: one media row holds both statuses, so a 4k and a
-    // non-4k request for the same title race to create it
-    return requestLock.dispatch(userKey(lockUserId), () =>
-      mediaLock.dispatch(mediaKey(body.mediaType, body.mediaId), () =>
-        MediaRequest.createRequest(body, user, options)
-      )
-    );
+    const dvrKind = body.mediaType === MediaType.MOVIE ? 'radarr' : 'sonarr';
+
+    return withDvrIdentityLock(dvrKind, target.serverId, () => {
+      validateRequestCreationTarget({ mediaType: body.mediaType, target });
+
+      // No is4k in the key: one media row holds both statuses, so a 4k and a
+      // non-4k request for the same title race to create it.
+      return requestLock.dispatch(userKey(lockUserId), () =>
+        mediaLock.dispatch(mediaKey(body.mediaType, body.mediaId), () =>
+          MediaRequest.createRequest(body, user, options, target)
+        )
+      );
+    });
   }
 
   private static async createRequest(
     requestBody: MediaRequestBody,
     user: User,
-    options: MediaRequestOptions
+    options: MediaRequestOptions,
+    target: ReturnType<typeof resolveRequestTarget>
   ): Promise<MediaRequest> {
     const tmdb = new TheMovieDb();
     const mediaRepository = getRepository(Media);
@@ -183,8 +217,16 @@ export class MediaRequest {
       media = new Media({
         tmdbId: tmdbMedia.id,
         tvdbId: requestBody.tvdbId ?? tmdbMedia.external_ids.tvdb_id,
-        status: !requestBody.is4k ? MediaStatus.PENDING : MediaStatus.UNKNOWN,
-        status4k: requestBody.is4k ? MediaStatus.PENDING : MediaStatus.UNKNOWN,
+        status: target.isIndependent
+          ? MediaStatus.UNKNOWN
+          : !requestBody.is4k
+            ? MediaStatus.PENDING
+            : MediaStatus.UNKNOWN,
+        status4k: target.isIndependent
+          ? MediaStatus.UNKNOWN
+          : requestBody.is4k
+            ? MediaStatus.PENDING
+            : MediaStatus.UNKNOWN,
         mediaType: requestBody.mediaType,
       });
     } else {
@@ -199,6 +241,7 @@ export class MediaRequest {
       }
 
       if (
+        !target.isIndependent &&
         (media.status === MediaStatus.UNKNOWN ||
           media.status === MediaStatus.DELETED) &&
         !requestBody.is4k
@@ -207,6 +250,7 @@ export class MediaRequest {
       }
 
       if (
+        !target.isIndependent &&
         (media.status4k === MediaStatus.UNKNOWN ||
           media.status4k === MediaStatus.DELETED) &&
         requestBody.is4k
@@ -215,23 +259,45 @@ export class MediaRequest {
       }
     }
 
-    const existing = await requestRepository
+    let existingQuery = requestRepository
       .createQueryBuilder('request')
       .leftJoinAndSelect('request.media', 'media')
       .leftJoinAndSelect('request.requestedBy', 'user')
-      .where('request.is4k = :is4k', { is4k: requestBody.is4k })
-      .andWhere('media.tmdbId = :tmdbId', { tmdbId: tmdbMedia.id })
+      .leftJoinAndSelect('request.seasons', 'seasonRequest')
+      .where('media.tmdbId = :tmdbId', { tmdbId: tmdbMedia.id })
       .andWhere('media.mediaType = :mediaType', {
         mediaType: requestBody.mediaType,
-      })
-      .getMany();
+      });
+
+    existingQuery = target.isIndependent
+      ? existingQuery.andWhere('request.serverId = :serverId', {
+          serverId: target.serverId,
+        })
+      : existingQuery.andWhere('request.is4k = :is4k', {
+          is4k: requestBody.is4k,
+        });
+
+    const existingCandidates = await existingQuery.getMany();
+    const existing = target.isIndependent
+      ? existingCandidates
+      : (
+          await Promise.all(
+            existingCandidates.map(async (request) => ({
+              request,
+              isNative: await isNativeRequest(
+                request,
+                requestRepository.manager
+              ),
+            }))
+          )
+        )
+          .filter(({ isNative }) => isNative)
+          .map(({ request }) => request);
 
     if (existing && existing.length > 0) {
-      // If there is an existing movie request that isn't declined, don't allow a new one.
       if (
         requestBody.mediaType === MediaType.MOVIE &&
-        existing[0].status !== MediaRequestStatus.DECLINED &&
-        existing[0].status !== MediaRequestStatus.COMPLETED
+        existing.some((request) => isActiveRequestStatus(request.status))
       ) {
         logger.warn('Duplicate request for media blocked', {
           tmdbId: tmdbMedia.id,
@@ -262,6 +328,31 @@ export class MediaRequest {
       }
     }
 
+    let destinationStatus: MediaDestinationStatus | null = null;
+    let destinationSeasonStatuses: MediaDestinationSeasonStatus[] = [];
+    if (target.isIndependent && media.id) {
+      destinationStatus = await getRepository(MediaDestinationStatus).findOne({
+        where: { mediaId: media.id, serverId: target.serverId },
+      });
+      if (destinationStatus) {
+        destinationSeasonStatuses = await getRepository(
+          MediaDestinationSeasonStatus
+        ).find({
+          where: { destinationStatusId: destinationStatus.id },
+        });
+      }
+    }
+
+    if (
+      target.isIndependent &&
+      requestBody.mediaType === MediaType.MOVIE &&
+      !isRequestableDestinationStatus(destinationStatus?.status)
+    ) {
+      throw new DuplicateMediaRequestError(
+        'Request for this media destination is not currently available.'
+      );
+    }
+
     let rootFolder = requestBody.rootFolder;
     let profileId = requestBody.profileId;
     let tags = requestBody.tags;
@@ -272,6 +363,7 @@ export class MediaRequest {
       tmdbMedia,
       requestUser,
       tags,
+      serviceId: target.serverId,
     });
     const isAdvanced = user.hasPermission(
       [Permission.MANAGE_REQUESTS, Permission.REQUEST_ADVANCED],
@@ -342,7 +434,13 @@ export class MediaRequest {
           ? user
           : undefined,
         is4k: requestBody.is4k,
-        serverId: requestBody.serverId,
+        serverId: target.serverId,
+        creationTarget: {
+          serverId: target.serverId,
+          isIndependent: target.isIndependent,
+          effectiveIs4k: target.effectiveIs4k,
+          serverIs4k: target.serverIs4k,
+        },
         profileId: profileId,
         rootFolder: rootFolder,
         tags: tags,
@@ -374,14 +472,9 @@ export class MediaRequest {
       // We need to check existing requests on this title to make sure we don't double up on seasons that were
       // already requested. In the case they were, we just throw out any duplicates but still approve the request.
       // (Unless there are no seasons, in which case we abort)
-      if (media.requests) {
-        existingSeasons = media.requests
-          .filter(
-            (request) =>
-              request.is4k === requestBody.is4k &&
-              request.status !== MediaRequestStatus.DECLINED &&
-              request.status !== MediaRequestStatus.COMPLETED
-          )
+      if (existing) {
+        existingSeasons = existing
+          .filter((request) => isActiveRequestStatus(request.status))
           .reduce((seasons, request) => {
             const combinedSeasons = request.seasons.map(
               (season) => season.seasonNumber
@@ -392,7 +485,14 @@ export class MediaRequest {
       }
 
       // We should also check seasons that are available/partially available but don't have existing requests
-      if (media.seasons) {
+      if (target.isIndependent) {
+        existingSeasons = [
+          ...existingSeasons,
+          ...destinationSeasonStatuses
+            .filter((season) => !isRequestableDestinationStatus(season.status))
+            .map((season) => season.seasonNumber),
+        ];
+      } else if (media.seasons) {
         existingSeasons = [
           ...existingSeasons,
           ...media.seasons
@@ -457,7 +557,13 @@ export class MediaRequest {
           ? user
           : undefined,
         is4k: requestBody.is4k,
-        serverId: requestBody.serverId,
+        serverId: target.serverId,
+        creationTarget: {
+          serverId: target.serverId,
+          isIndependent: target.isIndependent,
+          effectiveIs4k: target.effectiveIs4k,
+          serverIs4k: target.serverIs4k,
+        },
         profileId: profileId,
         rootFolder: rootFolder,
         languageProfileId: requestBody.languageProfileId,
@@ -650,8 +756,12 @@ export class MediaRequest {
         return;
       }
 
+      const independent =
+        this.creationTarget?.isIndependent ??
+        (await isIndependentRequest(this, mediaRepository.manager));
       if (
         this.status === MediaRequestStatus.APPROVED &&
+        !independent &&
         media[this.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
       ) {
         logger.info(

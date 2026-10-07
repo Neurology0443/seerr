@@ -14,10 +14,23 @@ import {
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import notificationManager, { Notification } from '@server/lib/notifications';
+import {
+  ACTIVE_REQUEST_STATUSES,
+  isActiveRequestStatus,
+  isRequestDrivenDestinationStatus,
+  isRequestableDestinationStatus,
+} from '@server/lib/requestSlot';
+import {
+  isIndependentRequest,
+  isNativeRequest,
+  validateRequestCreationTarget,
+} from '@server/lib/requestTarget';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { withNestedTransaction } from '@server/utils/nestedTransaction';
@@ -29,7 +42,7 @@ import type {
   RemoveEvent,
   UpdateEvent,
 } from 'typeorm';
-import { EventSubscriber, Not } from 'typeorm';
+import { EventSubscriber, In, Not } from 'typeorm';
 
 const sanitizeDisplayName = (displayName: string): string => {
   return displayName
@@ -181,14 +194,263 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     }
   }
 
+  private approvedRequestExistsSql(): string {
+    return `EXISTS (SELECT 1 FROM "media_request" "approvedRequest" WHERE "approvedRequest"."id" = :approvedRequestId AND "approvedRequest"."status" = :approvedRequestStatus)`;
+  }
+
+  private approvedRequestParameters(requestId: number) {
+    return {
+      approvedRequestId: requestId,
+      approvedRequestStatus: MediaRequestStatus.APPROVED,
+    };
+  }
+
+  private async isStillApproved(
+    requestId: number,
+    manager: EntityManager
+  ): Promise<boolean> {
+    return (
+      (await manager.count(MediaRequest, {
+        where: {
+          id: requestId,
+          status: MediaRequestStatus.APPROVED,
+        },
+      })) === 1
+    );
+  }
+
+  private async markFailedIfStillApproved(
+    requestId: number,
+    manager: EntityManager,
+    currentEntity?: MediaRequest
+  ): Promise<MediaRequest | null> {
+    const result = await manager
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.FAILED })
+      .where('id = :requestId', { requestId })
+      .andWhere('status = :approved', {
+        approved: MediaRequestStatus.APPROVED,
+      })
+      .callListeners(false)
+      .execute();
+
+    if (result.affected !== 1) {
+      return null;
+    }
+    if (currentEntity) {
+      currentEntity.status = MediaRequestStatus.FAILED;
+    }
+
+    const failedRequest = await manager.findOneOrFail(MediaRequest, {
+      where: { id: requestId },
+    });
+    await this.updateParentStatus(manager, failedRequest);
+    return failedRequest;
+  }
+
+  private async updateDestinationLinkIfStillApproved(
+    requestId: number,
+    mediaId: number,
+    serverId: number,
+    externalServiceId: number | null,
+    externalServiceSlug: string,
+    manager: EntityManager
+  ): Promise<MediaDestinationStatus | null> {
+    const result = await manager
+      .createQueryBuilder()
+      .update(MediaDestinationStatus)
+      .set({
+        externalServiceId,
+        externalServiceSlug,
+        status: () =>
+          `CASE WHEN "status" = ${MediaStatus.PENDING} THEN ${MediaStatus.PROCESSING} ELSE "status" END`,
+      })
+      .where('"mediaId" = :mediaId', { mediaId })
+      .andWhere('"serverId" = :serverId', { serverId })
+      .andWhere(this.approvedRequestExistsSql())
+      .setParameters(this.approvedRequestParameters(requestId))
+      .callListeners(false)
+      .execute();
+
+    if (result.affected !== 1) {
+      if (await this.isStillApproved(requestId, manager)) {
+        throw new Error(
+          'Independent destination state missing after Arr accepted the request.'
+        );
+      }
+      return null;
+    }
+
+    return manager.findOneOrFail(MediaDestinationStatus, {
+      where: { mediaId, serverId },
+    });
+  }
+
+  private async updateDestinationSeasonsIfStillApproved(
+    requestId: number,
+    destinationStatusId: number,
+    seasonNumbers: number[],
+    manager: EntityManager
+  ): Promise<boolean> {
+    const uniqueSeasonNumbers = [...new Set(seasonNumbers)];
+    const result = await manager
+      .createQueryBuilder()
+      .update(MediaDestinationSeasonStatus)
+      .set({
+        status: () =>
+          `CASE WHEN "status" = ${MediaStatus.PENDING} THEN ${MediaStatus.PROCESSING} ELSE "status" END`,
+      })
+      .where('"destinationStatusId" = :destinationStatusId', {
+        destinationStatusId,
+      })
+      .andWhere('"seasonNumber" IN (:...seasonNumbers)', {
+        seasonNumbers: uniqueSeasonNumbers,
+      })
+      .andWhere(this.approvedRequestExistsSql())
+      .setParameters(this.approvedRequestParameters(requestId))
+      .callListeners(false)
+      .execute();
+
+    if (result.affected !== uniqueSeasonNumbers.length) {
+      if (await this.isStillApproved(requestId, manager)) {
+        throw new Error(
+          'Independent destination season state missing after Sonarr accepted the request.'
+        );
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  private async updateNativeMediaLinkIfStillApproved(
+    entity: MediaRequest,
+    serverId: number,
+    externalServiceId: number | null,
+    externalServiceSlug: string,
+    manager: EntityManager
+  ): Promise<boolean> {
+    const result = await manager
+      .createQueryBuilder()
+      .update(Media)
+      .set(
+        entity.is4k
+          ? {
+              externalServiceId4k: externalServiceId,
+              externalServiceSlug4k: externalServiceSlug,
+              serviceId4k: serverId,
+            }
+          : {
+              externalServiceId,
+              externalServiceSlug,
+              serviceId: serverId,
+            }
+      )
+      .where('id = :mediaId', { mediaId: entity.media.id })
+      .andWhere(this.approvedRequestExistsSql())
+      .setParameters(this.approvedRequestParameters(entity.id))
+      .callListeners(false)
+      .execute();
+
+    if (result.affected !== 1) {
+      if (await this.isStillApproved(entity.id, manager)) {
+        throw new Error('Media data not found');
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  private async withApprovedRequestSuccessGuard(
+    requestId: number,
+    manager: EntityManager,
+    mutation: (guardedManager: EntityManager) => Promise<boolean>
+  ): Promise<boolean> {
+    if (manager.connection.options.type !== 'postgres') {
+      return mutation(manager);
+    }
+
+    return manager.transaction(async (transactionManager) => {
+      const lockedRequest = await transactionManager
+        .createQueryBuilder(MediaRequest, 'request')
+        .setLock('pessimistic_write')
+        .where('request.id = :requestId', { requestId })
+        .getOne();
+
+      if (
+        !lockedRequest ||
+        lockedRequest.status !== MediaRequestStatus.APPROVED
+      ) {
+        return false;
+      }
+
+      return mutation(transactionManager);
+    });
+  }
+
+  private async applyArrSuccessIfStillApproved(
+    entity: MediaRequest,
+    serverId: number,
+    externalServiceId: number | null,
+    externalServiceSlug: string,
+    independent: boolean,
+    manager: EntityManager
+  ): Promise<boolean> {
+    return this.withApprovedRequestSuccessGuard(
+      entity.id,
+      manager,
+      async (guardedManager) => {
+        if (!independent) {
+          return this.updateNativeMediaLinkIfStillApproved(
+            entity,
+            serverId,
+            externalServiceId,
+            externalServiceSlug,
+            guardedManager
+          );
+        }
+
+        const destination = await this.updateDestinationLinkIfStillApproved(
+          entity.id,
+          entity.media.id,
+          serverId,
+          externalServiceId,
+          externalServiceSlug,
+          guardedManager
+        );
+        if (!destination) {
+          return false;
+        }
+
+        if (entity.type === MediaType.TV) {
+          return this.updateDestinationSeasonsIfStillApproved(
+            entity.id,
+            destination.id,
+            entity.seasons.map((season) => season.seasonNumber),
+            guardedManager
+          );
+        }
+
+        return true;
+      }
+    );
+  }
+
   public async sendToRadarr(
     entity: MediaRequest,
-    manager: EntityManager
+    manager: EntityManager,
+    independentOverride?: boolean
   ): Promise<void> {
     if (
       entity.status === MediaRequestStatus.APPROVED &&
       entity.type === MediaType.MOVIE
     ) {
+      const independent =
+        independentOverride ??
+        entity.creationTarget?.isIndependent ??
+        (await isIndependentRequest(entity, manager));
       try {
         const mediaRepository = manager.getRepository(Media);
         const settings = getSettings();
@@ -204,20 +466,16 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           return;
         }
 
-        let radarrSettings = settings.radarr.find(
-          (radarr) => radarr.isDefault && radarr.is4k === entity.is4k
-        );
+        const radarrSettings =
+          entity.serverId == null
+            ? settings.radarr.find(
+                (radarr) => radarr.isDefault && radarr.is4k === entity.is4k
+              )
+            : settings.radarr.find((radarr) => radarr.id === entity.serverId);
 
-        if (
-          entity.serverId !== null &&
-          entity.serverId >= 0 &&
-          radarrSettings?.id !== entity.serverId
-        ) {
-          radarrSettings = settings.radarr.find(
-            (radarr) => radarr.id === entity.serverId
-          );
+        if (entity.serverId != null) {
           logger.info(
-            `Request has an override server: ${radarrSettings?.name}`,
+            `Request targets Radarr server: ${radarrSettings?.name}`,
             {
               label: 'Media Request',
               requestId: entity.id,
@@ -298,6 +556,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         }
 
         if (
+          !independent &&
           media[entity.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
         ) {
           logger.warn('Media already exists, marking request as COMPLETED', {
@@ -381,34 +640,31 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         radarr
           .addMovie(radarrMovieOptions)
           .then(async (radarrMovie) => {
-            // Needs its own repository as this runs detached from the request transaction
-            const mediaRepository = getRepository(Media);
-            // We grab media again here to make sure we have the latest version of it
-            const media = await mediaRepository.findOne({
-              where: { id: entity.media.id },
-            });
-
-            if (!media) {
-              throw new Error('Media data not found');
+            const applied = await this.applyArrSuccessIfStillApproved(
+              entity,
+              radarrSettings.id,
+              radarrMovie.id,
+              radarrMovie.titleSlug,
+              independent,
+              getRepository(MediaRequest).manager
+            );
+            if (!applied) {
+              return;
             }
 
-            media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
-              radarrMovie.id;
-            media[
-              entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
-            ] = radarrMovie.titleSlug;
-            media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
-              radarrSettings?.id;
-            await mediaRepository.save(media);
+            radarr.clearCache({
+              tmdbId: movie.id,
+              externalId: radarrMovie.id,
+            });
           })
           .catch(async () => {
+            let failedRequest: MediaRequest | null;
             try {
-              const requestRepository = getRepository(MediaRequest);
-
-              if (entity.status !== MediaRequestStatus.FAILED) {
-                entity.status = MediaRequestStatus.FAILED;
-                await requestRepository.save(entity);
-              }
+              failedRequest = await this.markFailedIfStillApproved(
+                entity.id,
+                getRepository(MediaRequest).manager,
+                entity
+              );
             } catch (saveError) {
               logger.error('Failed to mark request as FAILED', {
                 label: 'Media Request',
@@ -418,8 +674,11 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
                     ? saveError.message
                     : String(saveError),
               });
+              return;
             }
-
+            if (!failedRequest) {
+              return;
+            }
             logger.warn(
               'Something went wrong sending movie request to Radarr, marking status as FAILED',
               {
@@ -431,18 +690,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             );
 
             MediaRequest.sendNotification(
-              entity,
+              failedRequest,
               media,
               Notification.MEDIA_FAILED
             );
-          })
-          .finally(() => {
-            radarr.clearCache({
-              tmdbId: movie.id,
-              externalId: entity.is4k
-                ? media.externalServiceId4k
-                : media.externalServiceId,
-            });
           });
         logger.info('Sent request to Radarr', {
           label: 'Media Request',
@@ -450,16 +701,33 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           mediaId: entity.media.id,
         });
       } catch (e) {
-        const requestRepository = manager.getRepository(MediaRequest);
         const mediaRepository = manager.getRepository(Media);
         const media = await mediaRepository.findOne({
           where: { id: entity.media.id },
         });
 
         if (media) {
-          entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
-
+          let failedRequest: MediaRequest | null;
+          try {
+            failedRequest = await this.markFailedIfStillApproved(
+              entity.id,
+              manager,
+              entity
+            );
+          } catch (saveError) {
+            logger.error('Failed to mark request as FAILED', {
+              label: 'Media Request',
+              requestId: entity.id,
+              errorMessage:
+                saveError instanceof Error
+                  ? saveError.message
+                  : String(saveError),
+            });
+            return;
+          }
+          if (!failedRequest) {
+            return;
+          }
           logger.warn(
             'Failed to send movie request to Radarr due to connection or configuration error, marking status as FAILED',
             {
@@ -471,7 +739,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           );
 
           MediaRequest.sendNotification(
-            entity,
+            failedRequest,
             media,
             Notification.MEDIA_FAILED
           );
@@ -482,12 +750,17 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
 
   public async sendToSonarr(
     entity: MediaRequest,
-    manager: EntityManager
+    manager: EntityManager,
+    independentOverride?: boolean
   ): Promise<void> {
     if (
       entity.status === MediaRequestStatus.APPROVED &&
       entity.type === MediaType.TV
     ) {
+      const independent =
+        independentOverride ??
+        entity.creationTarget?.isIndependent ??
+        (await isIndependentRequest(entity, manager));
       try {
         const mediaRepository = manager.getRepository(Media);
         const settings = getSettings();
@@ -503,20 +776,16 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           return;
         }
 
-        let sonarrSettings = settings.sonarr.find(
-          (sonarr) => sonarr.isDefault && sonarr.is4k === entity.is4k
-        );
+        const sonarrSettings =
+          entity.serverId == null
+            ? settings.sonarr.find(
+                (sonarr) => sonarr.isDefault && sonarr.is4k === entity.is4k
+              )
+            : settings.sonarr.find((sonarr) => sonarr.id === entity.serverId);
 
-        if (
-          entity.serverId !== null &&
-          entity.serverId >= 0 &&
-          sonarrSettings?.id !== entity.serverId
-        ) {
-          sonarrSettings = settings.sonarr.find(
-            (sonarr) => sonarr.id === entity.serverId
-          );
+        if (entity.serverId != null) {
           logger.info(
-            `Request has an override server: ${sonarrSettings?.name}`,
+            `Request targets Sonarr server: ${sonarrSettings?.name}`,
             {
               label: 'Media Request',
               requestId: entity.id,
@@ -550,6 +819,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         }
 
         if (
+          !independent &&
           media[entity.is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE
         ) {
           logger.warn('Media already exists, marking request as COMPLETED', {
@@ -576,9 +846,11 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         const tvdbId = series.external_ids.tvdb_id ?? media.tvdbId;
 
         if (!tvdbId) {
-          const requestRepository = manager.getRepository(MediaRequest);
-          await mediaRepository.remove(media);
-          await requestRepository.remove(entity);
+          if (!independent) {
+            const requestRepository = manager.getRepository(MediaRequest);
+            await mediaRepository.remove(media);
+            await requestRepository.remove(entity);
+          }
           throw new Error('TVDB ID not found');
         }
 
@@ -729,34 +1001,32 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         sonarr
           .addSeries(sonarrSeriesOptions)
           .then(async (sonarrSeries) => {
-            // Needs its own repository as this runs detached from the request transaction
-            const mediaRepository = getRepository(Media);
-            // We grab media again here to make sure we have the latest version of it
-            const media = await mediaRepository.findOne({
-              where: { id: entity.media.id },
-            });
-
-            if (!media) {
-              throw new Error('Media data not found');
+            const applied = await this.applyArrSuccessIfStillApproved(
+              entity,
+              sonarrSettings.id,
+              sonarrSeries.id ?? null,
+              sonarrSeries.titleSlug,
+              independent,
+              getRepository(MediaRequest).manager
+            );
+            if (!applied) {
+              return;
             }
 
-            media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] =
-              sonarrSeries.id;
-            media[
-              entity.is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'
-            ] = sonarrSeries.titleSlug;
-            media[entity.is4k ? 'serviceId4k' : 'serviceId'] =
-              sonarrSettings?.id;
-            await mediaRepository.save(media);
+            sonarr.clearCache({
+              tvdbId,
+              externalId: sonarrSeries.id,
+              title: series.name,
+            });
           })
           .catch(async () => {
+            let failedRequest: MediaRequest | null;
             try {
-              const requestRepository = getRepository(MediaRequest);
-
-              if (entity.status !== MediaRequestStatus.FAILED) {
-                entity.status = MediaRequestStatus.FAILED;
-                await requestRepository.save(entity);
-              }
+              failedRequest = await this.markFailedIfStillApproved(
+                entity.id,
+                getRepository(MediaRequest).manager,
+                entity
+              );
             } catch (saveError) {
               logger.error('Failed to mark request as FAILED', {
                 label: 'Media Request',
@@ -766,8 +1036,11 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
                     ? saveError.message
                     : String(saveError),
               });
+              return;
             }
-
+            if (!failedRequest) {
+              return;
+            }
             logger.warn(
               'Something went wrong sending series request to Sonarr, marking status as FAILED',
               {
@@ -779,19 +1052,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             );
 
             MediaRequest.sendNotification(
-              entity,
+              failedRequest,
               media,
               Notification.MEDIA_FAILED
             );
-          })
-          .finally(() => {
-            sonarr.clearCache({
-              tvdbId,
-              externalId: entity.is4k
-                ? media.externalServiceId4k
-                : media.externalServiceId,
-              title: series.name,
-            });
           });
         logger.info('Sent request to Sonarr', {
           label: 'Media Request',
@@ -799,16 +1063,33 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           mediaId: entity.media.id,
         });
       } catch (e) {
-        const requestRepository = manager.getRepository(MediaRequest);
         const mediaRepository = manager.getRepository(Media);
         const media = await mediaRepository.findOne({
           where: { id: entity.media.id },
         });
 
         if (media) {
-          entity.status = MediaRequestStatus.FAILED;
-          await requestRepository.save(entity);
-
+          let failedRequest: MediaRequest | null;
+          try {
+            failedRequest = await this.markFailedIfStillApproved(
+              entity.id,
+              manager,
+              entity
+            );
+          } catch (saveError) {
+            logger.error('Failed to mark request as FAILED', {
+              label: 'Media Request',
+              requestId: entity.id,
+              errorMessage:
+                saveError instanceof Error
+                  ? saveError.message
+                  : String(saveError),
+            });
+            return;
+          }
+          if (!failedRequest) {
+            return;
+          }
           logger.warn(
             'Failed to send series request to Sonarr due to connection or configuration error, marking status as FAILED',
             {
@@ -820,7 +1101,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           );
 
           MediaRequest.sendNotification(
-            entity,
+            failedRequest,
             media,
             Notification.MEDIA_FAILED
           );
@@ -833,6 +1114,11 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     manager: EntityManager,
     entity: MediaRequest
   ): Promise<void> {
+    if (await isIndependentRequest(entity, manager)) {
+      await this.updateIndependentDestination(manager, entity);
+      return;
+    }
+
     const mediaRepository = manager.getRepository(Media);
     const media = await mediaRepository.findOne({
       where: { id: entity.media.id },
@@ -881,14 +1167,21 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       entity.status === MediaRequestStatus.DECLINED &&
       media[statusKey] === MediaStatus.PENDING
     ) {
-      const pendingCount = await requestRepository.count({
+      const activeCandidates = await requestRepository.find({
         where: {
           media: { id: media.id },
-          status: MediaRequestStatus.PENDING,
+          status: In([...ACTIVE_REQUEST_STATUSES]),
           is4k: entity.is4k,
           id: Not(entity.id),
         },
       });
+      const pendingCount = (
+        await Promise.all(
+          activeCandidates.map(async (request) =>
+            isNativeRequest(request, manager)
+          )
+        )
+      ).filter(Boolean).length;
 
       if (pendingCount === 0) {
         // Re-fetch media without requests to avoid cascade issues
@@ -921,22 +1214,26 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         );
 
         if (season && season[statusKey] === MediaStatus.PENDING) {
-          const otherActiveRequests = await requestRepository
+          const otherActiveCandidates = await requestRepository
             .createQueryBuilder('request')
             .leftJoinAndSelect('request.seasons', 'season')
             .where('request.mediaId = :mediaId', { mediaId: media.id })
             .andWhere('request.id != :requestId', { requestId: entity.id })
             .andWhere('request.is4k = :is4k', { is4k: entity.is4k })
-            .andWhere('request.status NOT IN (:...statuses)', {
-              statuses: [
-                MediaRequestStatus.DECLINED,
-                MediaRequestStatus.COMPLETED,
-              ],
+            .andWhere('request.status IN (:...statuses)', {
+              statuses: ACTIVE_REQUEST_STATUSES,
             })
             .andWhere('season.seasonNumber = :seasonNumber', {
               seasonNumber: season.seasonNumber,
             })
-            .getCount();
+            .getMany();
+          const otherActiveRequests = (
+            await Promise.all(
+              otherActiveCandidates.map(async (request) =>
+                isNativeRequest(request, manager)
+              )
+            )
+          ).filter(Boolean).length;
 
           if (otherActiveRequests === 0) {
             season[statusKey] = MediaStatus.UNKNOWN;
@@ -958,26 +1255,223 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     }
   }
 
+  private async ensureIndependentDestination(
+    manager: EntityManager,
+    entity: MediaRequest
+  ): Promise<MediaDestinationStatus> {
+    const destinationRepository = manager.getRepository(MediaDestinationStatus);
+    const seasonStatusRepository = manager.getRepository(
+      MediaDestinationSeasonStatus
+    );
+    let destination = await destinationRepository.findOne({
+      where: { mediaId: entity.media.id, serverId: entity.serverId },
+    });
+
+    if (!destination) {
+      destination = new MediaDestinationStatus({
+        mediaId: entity.media.id,
+        serverId: entity.serverId,
+        status: MediaStatus.PENDING,
+      });
+    } else if (isRequestableDestinationStatus(destination.status)) {
+      destination.status = MediaStatus.PENDING;
+    }
+    destination = await destinationRepository.save(destination);
+
+    if (entity.type === MediaType.TV) {
+      const existing = await seasonStatusRepository.find({
+        where: {
+          destinationStatusId: destination.id,
+          seasonNumber: In(entity.seasons.map((season) => season.seasonNumber)),
+        },
+      });
+      const bySeason = new Map(
+        existing.map((season) => [season.seasonNumber, season])
+      );
+      const changed = entity.seasons.map((requestSeason) => {
+        const status = bySeason.get(requestSeason.seasonNumber);
+        if (!status) {
+          return new MediaDestinationSeasonStatus({
+            destinationStatusId: destination.id,
+            seasonNumber: requestSeason.seasonNumber,
+            status: MediaStatus.PENDING,
+          });
+        }
+        if (isRequestableDestinationStatus(status.status)) {
+          status.status = MediaStatus.PENDING;
+        }
+        return status;
+      });
+      await seasonStatusRepository.save(changed);
+    }
+
+    return destination;
+  }
+
+  private async releaseIndependentDestination(
+    manager: EntityManager,
+    entity: MediaRequest
+  ): Promise<void> {
+    const requestRepository = manager.getRepository(MediaRequest);
+    const destinationRepository = manager.getRepository(MediaDestinationStatus);
+    const destination = await destinationRepository.findOne({
+      where: { mediaId: entity.media.id, serverId: entity.serverId },
+    });
+    if (!destination) {
+      return;
+    }
+
+    if (entity.type === MediaType.TV) {
+      await this.releaseIndependentDestinationSeasons(
+        manager,
+        entity,
+        destination,
+        entity.seasons.map((season) => season.seasonNumber)
+      );
+    }
+
+    const otherActive = await requestRepository.count({
+      where: {
+        media: { id: entity.media.id },
+        serverId: entity.serverId,
+        id: Not(entity.id),
+        status: In([...ACTIVE_REQUEST_STATUSES]),
+      },
+    });
+    if (
+      otherActive === 0 &&
+      isRequestDrivenDestinationStatus(destination.status)
+    ) {
+      destination.status = MediaStatus.UNKNOWN;
+      await destinationRepository.save(destination);
+    }
+  }
+
+  private async releaseIndependentDestinationSeasons(
+    manager: EntityManager,
+    entity: MediaRequest,
+    destination: MediaDestinationStatus,
+    seasonNumbers: number[]
+  ): Promise<void> {
+    if (seasonNumbers.length === 0) {
+      return;
+    }
+
+    const requestRepository = manager.getRepository(MediaRequest);
+    const seasonStatusRepository = manager.getRepository(
+      MediaDestinationSeasonStatus
+    );
+    const seasonStatuses = await seasonStatusRepository.find({
+      where: {
+        destinationStatusId: destination.id,
+        seasonNumber: In(seasonNumbers),
+      },
+    });
+
+    for (const seasonStatus of seasonStatuses) {
+      if (!isRequestDrivenDestinationStatus(seasonStatus.status)) {
+        continue;
+      }
+      const otherActive = await requestRepository
+        .createQueryBuilder('request')
+        .innerJoin('request.seasons', 'season')
+        .where('request.mediaId = :mediaId', { mediaId: entity.media.id })
+        .andWhere('request.serverId = :serverId', {
+          serverId: entity.serverId,
+        })
+        .andWhere('request.id != :requestId', { requestId: entity.id })
+        .andWhere('request.status IN (:...statuses)', {
+          statuses: ACTIVE_REQUEST_STATUSES,
+        })
+        .andWhere('season.seasonNumber = :seasonNumber', {
+          seasonNumber: seasonStatus.seasonNumber,
+        })
+        .getCount();
+      if (otherActive === 0) {
+        seasonStatus.status = MediaStatus.UNKNOWN;
+        await seasonStatusRepository.save(seasonStatus);
+      }
+    }
+  }
+
+  private async updateIndependentDestination(
+    manager: EntityManager,
+    entity: MediaRequest
+  ): Promise<void> {
+    const seasonRequestRepository = manager.getRepository(SeasonRequest);
+
+    await this.prepareIndependentDestination(manager, entity);
+
+    if (
+      entity.type === MediaType.TV &&
+      entity.status === MediaRequestStatus.APPROVED
+    ) {
+      for (const season of entity.seasons) {
+        season.status = MediaRequestStatus.APPROVED;
+        await seasonRequestRepository.save(season);
+      }
+    }
+
+    if (
+      entity.type === MediaType.TV &&
+      entity.status === MediaRequestStatus.DECLINED
+    ) {
+      for (const season of entity.seasons) {
+        season.status = MediaRequestStatus.DECLINED;
+        await seasonRequestRepository.save(season);
+      }
+    }
+
+    if (
+      entity.status === MediaRequestStatus.DECLINED ||
+      entity.status === MediaRequestStatus.FAILED
+    ) {
+      await this.releaseIndependentDestination(manager, entity);
+    }
+  }
+
+  private async prepareIndependentDestination(
+    manager: EntityManager,
+    entity: MediaRequest
+  ): Promise<void> {
+    if (
+      entity.status === MediaRequestStatus.PENDING ||
+      entity.status === MediaRequestStatus.APPROVED
+    ) {
+      await this.ensureIndependentDestination(manager, entity);
+    }
+  }
+
   public async handleRemoveParentUpdate(
     manager: EntityManager,
     entity: MediaRequest
   ): Promise<void> {
+    if (await isIndependentRequest(entity, manager)) {
+      await this.releaseIndependentDestination(manager, entity);
+      return;
+    }
+
     const fullMedia = await manager.findOneOrFail(Media, {
       where: { id: entity.media.id },
       relations: { requests: { seasons: true }, seasons: true },
     });
 
-    const hasActive = fullMedia.requests.some(
-      (request) =>
-        !request.is4k &&
-        request.status !== MediaRequestStatus.COMPLETED &&
-        request.status !== MediaRequestStatus.DECLINED
+    const nativeRequests = (
+      await Promise.all(
+        fullMedia.requests.map(async (request) => ({
+          request,
+          isNative: await isNativeRequest(request, manager),
+        }))
+      )
+    )
+      .filter(({ isNative }) => isNative)
+      .map(({ request }) => request);
+
+    const hasActive = nativeRequests.some(
+      (request) => !request.is4k && isActiveRequestStatus(request.status)
     );
-    const hasActive4k = fullMedia.requests.some(
-      (request) =>
-        request.is4k &&
-        request.status !== MediaRequestStatus.COMPLETED &&
-        request.status !== MediaRequestStatus.DECLINED
+    const hasActive4k = nativeRequests.some(
+      (request) => request.is4k && isActiveRequestStatus(request.status)
     );
 
     const needsStatusUpdate =
@@ -997,7 +1491,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       });
 
       if (needsStatusUpdate) {
-        const hadCompleted = fullMedia.requests.some(
+        const hadCompleted = nativeRequests.some(
           (r) => !r.is4k && r.status === MediaRequestStatus.COMPLETED
         );
         cleanMedia.status = hadCompleted
@@ -1006,7 +1500,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       }
 
       if (needs4kStatusUpdate) {
-        const hadCompleted4k = fullMedia.requests.some(
+        const hadCompleted4k = nativeRequests.some(
           (r) => r.is4k && r.status === MediaRequestStatus.COMPLETED
         );
         cleanMedia.status4k = hadCompleted4k
@@ -1024,12 +1518,11 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         entity.seasons.map((s) => s.seasonNumber)
       );
       const activeSeasonNumbers = new Set(
-        fullMedia.requests
+        nativeRequests
           .filter(
             (request) =>
               request.is4k === entity.is4k &&
-              request.status !== MediaRequestStatus.COMPLETED &&
-              request.status !== MediaRequestStatus.DECLINED
+              isActiveRequestStatus(request.status)
           )
           .flatMap((request) => request.seasons.map((s) => s.seasonNumber))
       );
@@ -1052,44 +1545,153 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     }
   }
 
+  public async beforeInsert(event: InsertEvent<MediaRequest>): Promise<void> {
+    if (!event.entity) {
+      return;
+    }
+
+    if (event.entity.creationTarget) {
+      validateRequestCreationTarget({
+        mediaType: event.entity.type,
+        target: event.entity.creationTarget,
+      });
+      if (event.entity.creationTarget.isIndependent) {
+        await this.prepareIndependentDestination(event.manager, event.entity);
+      }
+      return;
+    }
+
+    if (await isIndependentRequest(event.entity, event.manager)) {
+      await this.prepareIndependentDestination(event.manager, event.entity);
+    }
+  }
+
+  public async beforeUpdate(event: UpdateEvent<MediaRequest>): Promise<void> {
+    if (!event.entity) {
+      return;
+    }
+
+    const entity = event.entity as MediaRequest;
+    if (!(await isIndependentRequest(entity, event.manager))) {
+      return;
+    }
+
+    await this.updateParentStatus(event.manager, entity);
+
+    const seasonNumbers = entity.destinationSeasonNumbersToRelease ?? [];
+    if (
+      entity.type === MediaType.TV &&
+      entity.status === MediaRequestStatus.PENDING &&
+      seasonNumbers.length > 0
+    ) {
+      const destination = await event.manager.findOneOrFail(
+        MediaDestinationStatus,
+        {
+          where: {
+            mediaId: entity.media.id,
+            serverId: entity.serverId,
+          },
+        }
+      );
+      await this.releaseIndependentDestinationSeasons(
+        event.manager,
+        entity,
+        destination,
+        seasonNumbers
+      );
+    }
+    entity.destinationSeasonNumbersToRelease = undefined;
+  }
+
   public async afterUpdate(event: UpdateEvent<MediaRequest>): Promise<void> {
     if (!event.entity) {
       return;
     }
 
+    let entity = event.entity as MediaRequest;
+
+    let independent: boolean;
     try {
-      await this.sendToRadarr(event.entity as MediaRequest, event.manager);
-      await this.sendToSonarr(event.entity as MediaRequest, event.manager);
+      independent = await isIndependentRequest(entity, event.manager);
     } catch (e) {
-      logger.error('Error while sending to *arr in afterUpdate subscriber', {
+      logger.error('Error while classifying request target in afterUpdate', {
         label: 'Media Request',
-        requestId: (event.entity as MediaRequest).id,
+        requestId: event.entity.id,
         errorMessage: e instanceof Error ? e.message : String(e),
       });
+      return;
     }
 
-    try {
-      await withNestedTransaction(event.manager, async (manager) => {
-        await this.updateParentStatus(manager, event.entity as MediaRequest);
-      });
-
-      if (event.entity.status === MediaRequestStatus.COMPLETED) {
-        if (event.entity.media.mediaType === MediaType.MOVIE) {
-          await this.notifyAvailableMovie(event.entity as MediaRequest, event);
-        }
-        if (event.entity.media.mediaType === MediaType.TV) {
-          await this.notifyAvailableSeries(event.entity as MediaRequest, event);
-        }
-      }
-    } catch (e) {
-      logger.error(
-        'Error while updating parent status in afterUpdate subscriber',
-        {
+    if (!independent) {
+      try {
+        await this.sendToRadarr(entity, event.manager);
+        await this.sendToSonarr(entity, event.manager);
+      } catch (e) {
+        logger.error('Error while sending to *arr in afterUpdate subscriber', {
           label: 'Media Request',
-          requestId: (event.entity as MediaRequest).id,
+          requestId: entity.id,
           errorMessage: e instanceof Error ? e.message : String(e),
+        });
+      }
+
+      try {
+        const currentRequest = await event.manager.findOne(MediaRequest, {
+          where: { id: entity.id },
+        });
+        if (!currentRequest || currentRequest.status !== entity.status) {
+          return;
         }
-      );
+        entity = currentRequest;
+      } catch (e) {
+        logger.error(
+          'Error while reloading request in afterUpdate subscriber',
+          {
+            label: 'Media Request',
+            requestId: entity.id,
+            errorMessage: e instanceof Error ? e.message : String(e),
+          }
+        );
+        return;
+      }
+    }
+
+    if (!independent) {
+      try {
+        await withNestedTransaction(event.manager, async (manager) => {
+          await this.updateParentStatus(manager, entity);
+        });
+      } catch (e) {
+        logger.error(
+          'Error while updating parent status in afterUpdate subscriber',
+          {
+            label: 'Media Request',
+            requestId: (event.entity as MediaRequest).id,
+            errorMessage: e instanceof Error ? e.message : String(e),
+          }
+        );
+      }
+    }
+
+    if (entity.status === MediaRequestStatus.COMPLETED) {
+      if (entity.media.mediaType === MediaType.MOVIE) {
+        await this.notifyAvailableMovie(entity, event);
+      }
+      if (entity.media.mediaType === MediaType.TV) {
+        await this.notifyAvailableSeries(entity, event);
+      }
+    }
+
+    if (independent) {
+      try {
+        await this.sendToRadarr(entity, event.manager);
+        await this.sendToSonarr(entity, event.manager);
+      } catch (e) {
+        logger.error('Error while sending to *arr in afterUpdate subscriber', {
+          label: 'Media Request',
+          requestId: entity.id,
+          errorMessage: e instanceof Error ? e.message : String(e),
+        });
+      }
     }
   }
 
@@ -1098,30 +1700,84 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       return;
     }
 
+    let entity = event.entity;
+
+    let independent: boolean;
     try {
-      await this.sendToRadarr(event.entity as MediaRequest, event.manager);
-      await this.sendToSonarr(event.entity as MediaRequest, event.manager);
+      independent =
+        event.entity.creationTarget?.isIndependent ??
+        (await isIndependentRequest(event.entity, event.manager));
     } catch (e) {
-      logger.error('Error while sending to *arr in afterInsert subscriber', {
+      logger.error('Error while classifying request target in afterInsert', {
         label: 'Media Request',
-        requestId: (event.entity as MediaRequest).id,
+        requestId: event.entity.id,
         errorMessage: e instanceof Error ? e.message : String(e),
       });
+      return;
+    }
+    event.entity.creationTarget = undefined;
+
+    if (!independent) {
+      try {
+        await this.sendToRadarr(entity, event.manager, independent);
+        await this.sendToSonarr(entity, event.manager, independent);
+      } catch (e) {
+        logger.error('Error while sending to *arr in afterInsert subscriber', {
+          label: 'Media Request',
+          requestId: entity.id,
+          errorMessage: e instanceof Error ? e.message : String(e),
+        });
+      }
+
+      try {
+        const currentRequest = await event.manager.findOne(MediaRequest, {
+          where: { id: entity.id },
+        });
+        if (!currentRequest || currentRequest.status !== entity.status) {
+          return;
+        }
+        entity = currentRequest;
+      } catch (e) {
+        logger.error(
+          'Error while reloading request in afterInsert subscriber',
+          {
+            label: 'Media Request',
+            requestId: entity.id,
+            errorMessage: e instanceof Error ? e.message : String(e),
+          }
+        );
+        return;
+      }
     }
 
-    try {
-      await withNestedTransaction(event.manager, async (manager) => {
-        await this.updateParentStatus(manager, event.entity as MediaRequest);
-      });
-    } catch (e) {
-      logger.error(
-        'Error while updating parent status in afterInsert subscriber',
-        {
+    if (!independent) {
+      try {
+        await withNestedTransaction(event.manager, async (manager) => {
+          await this.updateParentStatus(manager, entity);
+        });
+      } catch (e) {
+        logger.error(
+          'Error while updating parent status in afterInsert subscriber',
+          {
+            label: 'Media Request',
+            requestId: (event.entity as MediaRequest).id,
+            errorMessage: e instanceof Error ? e.message : String(e),
+          }
+        );
+      }
+    }
+
+    if (independent) {
+      try {
+        await this.sendToRadarr(entity, event.manager, independent);
+        await this.sendToSonarr(entity, event.manager, independent);
+      } catch (e) {
+        logger.error('Error while sending to *arr in afterInsert subscriber', {
           label: 'Media Request',
-          requestId: (event.entity as MediaRequest).id,
+          requestId: entity.id,
           errorMessage: e instanceof Error ? e.message : String(e),
-        }
-      );
+        });
+      }
     }
   }
 
