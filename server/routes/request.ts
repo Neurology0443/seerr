@@ -35,6 +35,10 @@ import {
   isIndependentRequest,
   isNativeRequest,
 } from '@server/lib/requestTarget';
+import {
+  addEffectiveTargetStatusJoin,
+  serializeMediaRequest,
+} from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
@@ -151,13 +155,11 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
         .leftJoinAndSelect('request.requestedBy', 'requestedBy')
         .where('request.status IN (:...requestStatus)', {
           requestStatus: statusFilter,
-        })
-        .andWhere(
-          '((request.is4k = false AND media.status IN (:...mediaStatus)) OR (request.is4k = true AND media.status4k IN (:...mediaStatus)))',
-          {
-            mediaStatus: mediaStatusFilter,
-          }
-        );
+        });
+      const effectiveStatus = addEffectiveTargetStatusJoin(query);
+      query = query.andWhere(`${effectiveStatus} IN (:...mediaStatus)`, {
+        mediaStatus: mediaStatusFilter,
+      });
 
       if (
         !req.user?.hasPermission(
@@ -235,28 +237,36 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
       );
 
       // add profile names to the media requests, with undefined if not found
-      let mappedRequests = requests.map((r) => {
-        switch (r.type) {
-          case MediaType.MOVIE: {
-            const profileName = radarrServers
-              .find((serverr) => serverr.id === r.serverId)
-              ?.profiles?.find((profile) => profile.id === r.profileId)?.name;
+      let mappedRequests = await Promise.all(
+        requests.map(async (r) => {
+          const serialized = await serializeMediaRequest(
+            r,
+            getRepository(MediaRequest).manager
+          );
 
-            return {
-              ...r,
-              profileName,
-            };
-          }
-          case MediaType.TV: {
-            return {
-              ...r,
-              profileName: sonarrServers
+          switch (r.type) {
+            case MediaType.MOVIE: {
+              const profileName = radarrServers
                 .find((serverr) => serverr.id === r.serverId)
-                ?.profiles?.find((profile) => profile.id === r.profileId)?.name,
-            };
+                ?.profiles?.find((profile) => profile.id === r.profileId)?.name;
+
+              return {
+                ...serialized,
+                profileName,
+              };
+            }
+            case MediaType.TV: {
+              return {
+                ...serialized,
+                profileName: sonarrServers
+                  .find((serverr) => serverr.id === r.serverId)
+                  ?.profiles?.find((profile) => profile.id === r.profileId)
+                  ?.name,
+              };
+            }
           }
-        }
-      });
+        })
+      );
 
       // add canRemove prop if user has permission
       if (req.user?.hasPermission(Permission.MANAGE_REQUESTS)) {
@@ -266,22 +276,28 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
               return {
                 ...r,
                 // check if the radarr server for this request is configured
-                canRemove: radarrServers.some(
-                  (server) =>
-                    server.id ===
-                    (r.is4k ? r.media.serviceId4k : r.media.serviceId)
-                ),
+                canRemove:
+                  r.target?.isIndependent === true
+                    ? false
+                    : radarrServers.some(
+                        (server) =>
+                          server.id ===
+                          (r.is4k ? r.media.serviceId4k : r.media.serviceId)
+                      ),
               };
             }
             case MediaType.TV: {
               return {
                 ...r,
                 // check if the sonarr server for this request is configured
-                canRemove: sonarrServers.some(
-                  (server) =>
-                    server.id ===
-                    (r.is4k ? r.media.serviceId4k : r.media.serviceId)
-                ),
+                canRemove:
+                  r.target?.isIndependent === true
+                    ? false
+                    : sonarrServers.some(
+                        (server) =>
+                          server.id ===
+                          (r.is4k ? r.media.serviceId4k : r.media.serviceId)
+                      ),
               };
             }
           }
@@ -333,7 +349,14 @@ requestRoutes.post<never, MediaRequest, MediaRequestBody>(
       }
       const request = await MediaRequest.request(req.body, req.user);
 
-      return res.status(201).json(request);
+      return res
+        .status(201)
+        .json(
+          await serializeMediaRequest(
+            request,
+            getRepository(MediaRequest).manager
+          )
+        );
     } catch (error) {
       if (!(error instanceof Error)) {
         return;
@@ -365,6 +388,7 @@ requestRoutes.get('/count', async (_req, res, next) => {
     const query = requestRepository
       .createQueryBuilder('request')
       .innerJoinAndSelect('request.media', 'media');
+    const effectiveStatus = addEffectiveTargetStatusJoin(query);
 
     const totalCount = await query.getCount();
 
@@ -402,24 +426,18 @@ requestRoutes.get('/count', async (_req, res, next) => {
       .where('request.status = :requestStatus', {
         requestStatus: MediaRequestStatus.APPROVED,
       })
-      .andWhere(
-        '((request.is4k = false AND media.status != :availableStatus) OR (request.is4k = true AND media.status4k != :availableStatus))',
-        {
-          availableStatus: MediaStatus.AVAILABLE,
-        }
-      )
+      .andWhere(`${effectiveStatus} != :availableStatus`, {
+        availableStatus: MediaStatus.AVAILABLE,
+      })
       .getCount();
 
     const availableCount = await query
       .where('request.status = :requestStatus', {
         requestStatus: MediaRequestStatus.APPROVED,
       })
-      .andWhere(
-        '((request.is4k = false AND media.status = :availableStatus) OR (request.is4k = true AND media.status4k = :availableStatus))',
-        {
-          availableStatus: MediaStatus.AVAILABLE,
-        }
-      )
+      .andWhere(`${effectiveStatus} = :availableStatus`, {
+        availableStatus: MediaStatus.AVAILABLE,
+      })
       .getCount();
 
     const completedCount = await query
@@ -470,7 +488,9 @@ requestRoutes.get('/:requestId', async (req, res, next) => {
       });
     }
 
-    return res.status(200).json(request);
+    return res
+      .status(200)
+      .json(await serializeMediaRequest(request, requestRepository.manager));
   } catch (e) {
     logger.debug('Failed to retrieve request.', {
       label: 'API',
@@ -794,12 +814,23 @@ requestRoutes.put<{ requestId: string }>(
                 }
                 await requestRepository.save(request);
 
-                return res.status(200).json(request);
+                return res
+                  .status(200)
+                  .json(
+                    await serializeMediaRequest(
+                      request,
+                      requestRepository.manager
+                    )
+                  );
               }
             );
           }
 
-          return res.status(200).json(request);
+          return res
+            .status(200)
+            .json(
+              await serializeMediaRequest(request, requestRepository.manager)
+            );
         });
       });
     } catch (e) {
@@ -978,7 +1009,14 @@ requestRoutes.post<{
                 request.modifiedBy = req.user;
                 await requestRepository.save(request);
 
-                return res.status(200).json(request);
+                return res
+                  .status(200)
+                  .json(
+                    await serializeMediaRequest(
+                      request,
+                      requestRepository.manager
+                    )
+                  );
               }
             );
           }
@@ -1033,7 +1071,14 @@ requestRoutes.post<{
               request.modifiedBy = req.user;
               await requestRepository.save(request);
 
-              return res.status(200).json(request);
+              return res
+                .status(200)
+                .json(
+                  await serializeMediaRequest(
+                    request,
+                    requestRepository.manager
+                  )
+                );
             }
           );
         };
@@ -1099,7 +1144,11 @@ requestRoutes.post<{
         request.modifiedBy = req.user;
         await requestRepository.save(request);
 
-        return res.status(200).json(request);
+        return res
+          .status(200)
+          .json(
+            await serializeMediaRequest(request, requestRepository.manager)
+          );
       });
     } catch (e) {
       logger.error('Error processing request update', {

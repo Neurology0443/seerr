@@ -31,6 +31,8 @@ import {
   assertNoCredentials,
   seedUserSettings,
 } from '@server/test/userSettings';
+import type { AxiosInstance } from 'axios';
+import axios from 'axios';
 import type { Express } from 'express';
 import express from 'express';
 import session from 'express-session';
@@ -1463,6 +1465,315 @@ describe('GET /request/:requestId', () => {
     assert.ok(!('settings' in res.body.modifiedBy));
     assertNoCredentials(res.body);
   });
+
+  it('returns the exact independent target instead of contradictory native state', async () => {
+    configureRadarr([
+      {
+        id: 301,
+        name: 'French',
+        independentRequestDestination: true,
+      },
+    ]);
+    const pending = await seedRequest();
+    pending.serverId = 301;
+    pending.media.status = MediaStatus.AVAILABLE;
+    await getRepository(Media).save(pending.media);
+    await getRepository(MediaRequest).save(pending);
+    await getRepository(MediaDestinationStatus).upsert(
+      {
+        mediaId: pending.media.id,
+        serverId: 301,
+        status: MediaStatus.PROCESSING,
+      },
+      ['mediaId', 'serverId']
+    );
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).get(`/request/${pending.id}`);
+
+    assert.strictEqual(response.status, 200);
+    assert.deepStrictEqual(response.body.target, {
+      serverId: 301,
+      name: 'French',
+      is4k: false,
+      isIndependent: true,
+      deleted: false,
+      status: MediaStatus.PROCESSING,
+    });
+  });
+
+  it('returns null for an unresolved legacy target and a stable deleted placeholder', async () => {
+    const legacy = await seedRequest();
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const legacyResponse = await admin.get(`/request/${legacy.id}`);
+    assert.strictEqual(legacyResponse.body.target, null);
+
+    legacy.serverId = 777;
+    await getRepository(MediaRequest).save(legacy);
+    const deletedResponse = await admin.get(`/request/${legacy.id}`);
+    assert.strictEqual(
+      deletedResponse.body.target.name,
+      'Deleted Radarr server (#777)'
+    );
+    assert.strictEqual(deletedResponse.body.target.deleted, true);
+  });
+});
+
+describe('GET /request target-aware list and count', () => {
+  const mockProfiles = (t: TestContext) => {
+    t.mock.method(
+      axios,
+      'create',
+      () =>
+        ({
+          interceptors: { request: { use: () => 0 } },
+          get: async () => ({ data: [] }),
+        }) as unknown as AxiosInstance
+    );
+  };
+
+  it('filters independent requests by destination state before pagination', async (t) => {
+    mockProfiles(t);
+    configureRadarr([
+      { id: 311, independentRequestDestination: true, name: 'Independent' },
+    ]);
+    const requestRepo = getRepository(MediaRequest);
+    const independent = await seedRequest(MediaRequestStatus.COMPLETED);
+    independent.serverId = 311;
+    independent.media.status = MediaStatus.UNKNOWN;
+    await getRepository(Media).save(independent.media);
+    await requestRepo.save(independent);
+    await getRepository(MediaDestinationStatus).upsert(
+      {
+        mediaId: independent.media.id,
+        serverId: 311,
+        status: MediaStatus.AVAILABLE,
+      },
+      ['mediaId', 'serverId']
+    );
+    const otherMedia = await getRepository(Media).save(
+      new Media({
+        mediaType: MediaType.MOVIE,
+        tmdbId: 12346,
+        status: MediaStatus.UNKNOWN,
+      })
+    );
+    const requestedBy = await getRepository(User).findOneByOrFail({ id: 1 });
+    await requestRepo.save(
+      new MediaRequest({
+        type: MediaType.MOVIE,
+        status: MediaRequestStatus.COMPLETED,
+        media: otherMedia,
+        requestedBy,
+        serverId: 311,
+        is4k: false,
+      })
+    );
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).get('/request?filter=available&take=1&skip=0');
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.body.pageInfo.results, 1);
+    assert.strictEqual(response.body.results.length, 1);
+    assert.strictEqual(response.body.results[0].id, independent.id);
+    assert.strictEqual(
+      response.body.results[0].target.status,
+      MediaStatus.AVAILABLE
+    );
+  });
+
+  it('uses destination state for processing and available counts without changing lifecycle counts', async () => {
+    configureRadarr([
+      { id: 321, independentRequestDestination: true },
+      { id: 322, independentRequestDestination: false },
+    ]);
+    const requestRepo = getRepository(MediaRequest);
+    const independent = await seedRequest(MediaRequestStatus.APPROVED);
+    independent.serverId = 321;
+    independent.media.status = MediaStatus.UNKNOWN;
+    await getRepository(Media).save(independent.media);
+    await requestRepo.save(independent);
+    await getRepository(MediaDestinationStatus).upsert(
+      {
+        mediaId: independent.media.id,
+        serverId: 321,
+        status: MediaStatus.AVAILABLE,
+      },
+      ['mediaId', 'serverId']
+    );
+    const nativeMedia = await getRepository(Media).save(
+      new Media({
+        mediaType: MediaType.MOVIE,
+        tmdbId: 12347,
+        status: MediaStatus.PROCESSING,
+      })
+    );
+    const requestedBy = await getRepository(User).findOneByOrFail({ id: 1 });
+    const native = await requestRepo.save(
+      new MediaRequest({
+        type: MediaType.MOVIE,
+        status: MediaRequestStatus.APPROVED,
+        media: nativeMedia,
+        requestedBy,
+        serverId: 322,
+        is4k: false,
+      })
+    );
+    await requestRepo
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.APPROVED })
+      .where('id IN (:...ids)', { ids: [independent.id, native.id] })
+      .callListeners(false)
+      .execute();
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).get('/request/count');
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.body.total, 2);
+    assert.strictEqual(response.body.movie, 2);
+    assert.strictEqual(response.body.approved, 2);
+    assert.strictEqual(response.body.available, 1);
+    assert.strictEqual(response.body.processing, 1);
+  });
+
+  it('classifies processing and deleted filters from exact destination state', async (t) => {
+    mockProfiles(t);
+    configureRadarr([{ id: 325, independentRequestDestination: true }]);
+    const requestRepo = getRepository(MediaRequest);
+    const processing = await seedRequest(MediaRequestStatus.APPROVED);
+    processing.serverId = 325;
+    processing.media.status = MediaStatus.AVAILABLE;
+    await getRepository(Media).save(processing.media);
+    await requestRepo.save(processing);
+    await getRepository(MediaDestinationStatus).upsert(
+      {
+        mediaId: processing.media.id,
+        serverId: 325,
+        status: MediaStatus.PROCESSING,
+      },
+      ['mediaId', 'serverId']
+    );
+    const deletedMedia = await getRepository(Media).save(
+      new Media({
+        mediaType: MediaType.MOVIE,
+        tmdbId: 12349,
+        status: MediaStatus.AVAILABLE,
+      })
+    );
+    const requestedBy = await getRepository(User).findOneByOrFail({ id: 1 });
+    const deleted = await requestRepo.save(
+      new MediaRequest({
+        type: MediaType.MOVIE,
+        status: MediaRequestStatus.COMPLETED,
+        media: deletedMedia,
+        requestedBy,
+        serverId: 325,
+        is4k: false,
+      })
+    );
+    await getRepository(MediaDestinationStatus).upsert(
+      {
+        mediaId: deletedMedia.id,
+        serverId: 325,
+        status: MediaStatus.DELETED,
+      },
+      ['mediaId', 'serverId']
+    );
+    await requestRepo
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.APPROVED })
+      .where('id = :id', { id: processing.id })
+      .callListeners(false)
+      .execute();
+    await requestRepo
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ status: MediaRequestStatus.COMPLETED })
+      .where('id = :id', { id: deleted.id })
+      .callListeners(false)
+      .execute();
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+
+    const processingResponse = await admin.get('/request?filter=processing');
+    const deletedResponse = await admin.get('/request?filter=deleted');
+
+    assert.deepStrictEqual(
+      processingResponse.body.results.map(
+        (candidate: { id: number }) => candidate.id
+      ),
+      [processing.id]
+    );
+    assert.deepStrictEqual(
+      deletedResponse.body.results.map(
+        (candidate: { id: number }) => candidate.id
+      ),
+      [deleted.id]
+    );
+  });
+
+  it('guards independent removal while preserving native canRemove', async (t) => {
+    mockProfiles(t);
+    configureRadarr([
+      { id: 331, independentRequestDestination: true },
+      { id: 332, independentRequestDestination: false },
+    ]);
+    const independent = await seedRequest(MediaRequestStatus.COMPLETED);
+    independent.serverId = 331;
+    independent.media.serviceId = 331;
+    await getRepository(Media).save(independent.media);
+    await getRepository(MediaRequest).save(independent);
+    await getRepository(MediaDestinationStatus).upsert(
+      {
+        mediaId: independent.media.id,
+        serverId: 331,
+        status: MediaStatus.AVAILABLE,
+      },
+      ['mediaId', 'serverId']
+    );
+    const nativeMedia = await getRepository(Media).save(
+      new Media({
+        mediaType: MediaType.MOVIE,
+        tmdbId: 12348,
+        status: MediaStatus.AVAILABLE,
+        serviceId: 332,
+      })
+    );
+    const requestedBy = await getRepository(User).findOneByOrFail({ id: 1 });
+    const native = await getRepository(MediaRequest).save(
+      new MediaRequest({
+        type: MediaType.MOVIE,
+        status: MediaRequestStatus.COMPLETED,
+        media: nativeMedia,
+        requestedBy,
+        serverId: 332,
+        is4k: false,
+      })
+    );
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).get('/request?filter=available');
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(
+      response.body.results.find(
+        (candidate: { id: number }) => candidate.id === independent.id
+      ).canRemove,
+      false
+    );
+    assert.strictEqual(
+      response.body.results.find(
+        (candidate: { id: number }) => candidate.id === native.id
+      ).canRemove,
+      true
+    );
+  });
 });
 
 describe('POST /request/:requestId/:status', () => {
@@ -1493,6 +1804,80 @@ describe('POST /request/:requestId/:status', () => {
       assert.ok(persisted.updatedAt > pending.updatedAt);
     });
   }
+
+  it('returns freshly persisted native target state after approval', async (t) => {
+    configureRadarr([
+      { id: 341, isDefault: true, independentRequestDestination: false },
+    ]);
+    const requestRepository = getRepository(MediaRequest);
+    const pending = await seedRequest();
+    pending.serverId = 341;
+    pending.media.status = MediaStatus.PENDING;
+    await getRepository(Media).save(pending.media);
+    await requestRepository.save(pending);
+    t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).post(`/request/${pending.id}/approve`);
+    const persistedMedia = await getRepository(Media).findOneByOrFail({
+      id: pending.media.id,
+    });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(persistedMedia.status, MediaStatus.PROCESSING);
+    assert.strictEqual(response.body.target.status, persistedMedia.status);
+    assert.strictEqual(response.body.target.serverId, 341);
+    assert.strictEqual(response.body.target.isIndependent, false);
+  });
+
+  it('keeps independent approval state isolated from contradictory native state', async (t) => {
+    configureRadarr([
+      { id: 342, isDefault: true, independentRequestDestination: true },
+    ]);
+    const pending = await seedRequest();
+    pending.media.status = MediaStatus.AVAILABLE;
+    await getRepository(Media).save(pending.media);
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ serverId: 342 })
+      .where('id = :id', { id: pending.id })
+      .callListeners(false)
+      .execute();
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: pending.media.id,
+        serverId: 342,
+        status: MediaStatus.UNKNOWN,
+      })
+    );
+    t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).post(`/request/${pending.id}/approve`);
+    const destination = await getRepository(
+      MediaDestinationStatus
+    ).findOneByOrFail({
+      mediaId: pending.media.id,
+      serverId: 342,
+    });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.body.target.status, destination.status);
+    assert.notStrictEqual(response.body.target.status, MediaStatus.AVAILABLE);
+    assert.strictEqual(response.body.target.serverId, 342);
+    assert.strictEqual(response.body.target.isIndependent, true);
+  });
 
   it('rejects a status the route does not define', async () => {
     const repo = getRepository(MediaRequest);
@@ -1563,6 +1948,36 @@ describe('POST /request/:requestId/:status', () => {
 });
 
 describe('POST /request/:requestId/retry', () => {
+  it('returns freshly persisted native target state after retry', async (t) => {
+    configureRadarr([
+      { id: 343, isDefault: true, independentRequestDestination: false },
+    ]);
+    const requestRepository = getRepository(MediaRequest);
+    const failed = await seedRequest(MediaRequestStatus.FAILED);
+    failed.serverId = 343;
+    failed.media.status = MediaStatus.PENDING;
+    await getRepository(Media).save(failed.media);
+    await requestRepository.save(failed);
+    t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    const response = await (
+      await loginAs('admin@seerr.dev', 'test1234')
+    ).post(`/request/${failed.id}/retry`);
+    const persistedMedia = await getRepository(Media).findOneByOrFail({
+      id: failed.media.id,
+    });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(persistedMedia.status, MediaStatus.PROCESSING);
+    assert.strictEqual(response.body.target.status, persistedMedia.status);
+    assert.strictEqual(response.body.target.serverId, 343);
+    assert.strictEqual(response.body.target.isIndependent, false);
+  });
+
   it('preserves default fallback for a legacy request without serverId', async () => {
     const repo = getRepository(MediaRequest);
     const failed = await seedRequest(MediaRequestStatus.FAILED);
@@ -2318,6 +2733,8 @@ describe('POST /request (movie), override rules', () => {
     assert.strictEqual(res.status, 201);
     assert.strictEqual(res.body.serverId, 72);
     assert.strictEqual(res.body.rootFolder, '/explicit');
+    assert.strictEqual(res.body.target.serverId, 72);
+    assert.strictEqual(res.body.target.isIndependent, true);
   });
 
   it('rejects an unknown explicit server and a desynchronized independent server', async () => {

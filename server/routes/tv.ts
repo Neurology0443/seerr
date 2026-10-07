@@ -6,13 +6,120 @@ import type { TmdbKeyword } from '@server/api/themoviedb/interfaces';
 import { MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { Watchlist } from '@server/entity/Watchlist';
+import type { TvRequestTarget } from '@server/interfaces/api/requestInterfaces';
+import {
+  classifyActiveRequestTargets,
+  getConfiguredRequestTargetState,
+} from '@server/lib/requestTargetState';
+import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { mapTvResult } from '@server/models/Search';
 import { mapSeasonWithEpisodes, mapTvDetails } from '@server/models/Tv';
 import { Router } from 'express';
+import { In } from 'typeorm';
 
 const tvRoutes = Router();
+
+tvRoutes.get<{ id: string }, TvRequestTarget[]>(
+  '/:id/request-targets',
+  async (req, res, next) => {
+    try {
+      const tmdb = new TheMovieDb();
+      const show = await tmdb.getTvShow({ tvId: Number(req.params.id) });
+      const settings = getSettings();
+      const seasonNumbers = show.seasons
+        .filter(
+          (season) =>
+            season.episode_count > 0 &&
+            (settings.main.enableSpecialEpisodes || season.season_number > 0)
+        )
+        .map((season) => season.season_number);
+      const mediaRepository = getRepository(Media);
+      const media = await mediaRepository.findOne({
+        where: { tmdbId: Number(req.params.id), mediaType: MediaType.TV },
+        relations: { requests: true },
+      });
+      const destinations = media
+        ? await getRepository(MediaDestinationStatus).find({
+            where: { mediaId: media.id },
+          })
+        : [];
+      const destinationSeasons =
+        destinations.length > 0
+          ? await getRepository(MediaDestinationSeasonStatus).find({
+              where: {
+                destinationStatusId: In(
+                  destinations.map((destination) => destination.id)
+                ),
+              },
+            })
+          : [];
+      const activeRequests = await classifyActiveRequestTargets(
+        media?.requests ?? [],
+        mediaRepository.manager
+      );
+
+      const targets = settings.sonarr.map((server) => {
+        const destination = destinations.find(
+          (candidate) => candidate.serverId === server.id
+        );
+        const seasons = seasonNumbers.map((seasonNumber) => {
+          const state = getConfiguredRequestTargetState({
+            server,
+            destinationStatus: destinationSeasons.find(
+              (season) =>
+                season.destinationStatusId === destination?.id &&
+                season.seasonNumber === seasonNumber
+            )?.status,
+            nativeStatus: media?.seasons?.find(
+              (season) => season.seasonNumber === seasonNumber
+            )?.[server.is4k ? 'status4k' : 'status'],
+            activeRequests,
+            seasonNumber,
+          });
+
+          return {
+            seasonNumber,
+            status: state.status,
+            requestable: state.requestable,
+          };
+        });
+        const parentState = getConfiguredRequestTargetState({
+          media: media ?? undefined,
+          server,
+          destinationStatus: destination?.status,
+          activeRequests,
+        });
+
+        return {
+          serverId: server.id,
+          name: server.name,
+          is4k: Boolean(server.is4k),
+          isDefault: Boolean(server.isDefault),
+          isIndependent: parentState.isIndependent,
+          status: parentState.status,
+          requestable: seasons.some((season) => season.requestable),
+          seasons,
+        };
+      });
+
+      return res.status(200).json(targets);
+    } catch (e) {
+      logger.debug('Something went wrong retrieving series request targets', {
+        label: 'API',
+        errorMessage: e.message,
+        tvId: req.params.id,
+      });
+      return next({
+        status: 500,
+        message: 'Unable to retrieve series request targets.',
+      });
+    }
+  }
+);
 
 tvRoutes.get('/:id', async (req, res, next) => {
   const tmdb = new TheMovieDb();

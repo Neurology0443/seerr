@@ -5,13 +5,78 @@ import TheMovieDb from '@server/api/themoviedb';
 import { MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { Watchlist } from '@server/entity/Watchlist';
+import type { MovieRequestTarget } from '@server/interfaces/api/requestInterfaces';
+import {
+  classifyActiveRequestTargets,
+  getConfiguredRequestTargetState,
+} from '@server/lib/requestTargetState';
+import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { mapMovieDetails } from '@server/models/Movie';
 import { mapMovieResult } from '@server/models/Search';
 import { Router } from 'express';
 
 const movieRoutes = Router();
+
+movieRoutes.get<{ id: string }, MovieRequestTarget[]>(
+  '/:id/request-targets',
+  async (req, res, next) => {
+    try {
+      const mediaRepository = getRepository(Media);
+      const media = await mediaRepository.findOne({
+        where: {
+          tmdbId: Number(req.params.id),
+          mediaType: MediaType.MOVIE,
+        },
+        relations: { requests: true },
+      });
+      const destinations = media
+        ? await getRepository(MediaDestinationStatus).find({
+            where: { mediaId: media.id },
+          })
+        : [];
+      const activeRequests = await classifyActiveRequestTargets(
+        media?.requests ?? [],
+        mediaRepository.manager
+      );
+
+      const targets = getSettings().radarr.map((server) => {
+        const state = getConfiguredRequestTargetState({
+          media: media ?? undefined,
+          server,
+          destinationStatus: destinations.find(
+            (destination) => destination.serverId === server.id
+          )?.status,
+          activeRequests,
+        });
+
+        return {
+          serverId: server.id,
+          name: server.name,
+          is4k: Boolean(server.is4k),
+          isDefault: Boolean(server.isDefault),
+          isIndependent: state.isIndependent,
+          status: state.status,
+          requestable: state.requestable,
+        };
+      });
+
+      return res.status(200).json(targets);
+    } catch (e) {
+      logger.debug('Something went wrong retrieving movie request targets', {
+        label: 'API',
+        errorMessage: e.message,
+        movieId: req.params.id,
+      });
+      return next({
+        status: 500,
+        message: 'Unable to retrieve movie request targets.',
+      });
+    }
+  }
+);
 
 movieRoutes.get('/:id', async (req, res, next) => {
   const tmdb = new TheMovieDb();

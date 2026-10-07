@@ -1,4 +1,4 @@
-import type { MediaType } from '@server/constants/media';
+import type { MediaStatus, MediaType } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties, PaginatedResponse } from './common';
 
@@ -6,11 +6,41 @@ export interface RequestResultsResponse extends PaginatedResponse {
   results: (NonFunctionProperties<MediaRequest> & {
     profileName?: string;
     canRemove?: boolean;
+    target: MediaRequestTarget | null;
   })[];
   serviceErrors: {
     radarr: { id: number; name: string }[];
     sonarr: { id: number; name: string }[];
   };
+}
+
+export interface MediaRequestTarget {
+  serverId: number;
+  name: string;
+  is4k: boolean;
+  isIndependent: boolean;
+  deleted: boolean;
+  status: MediaStatus;
+}
+
+export interface MovieRequestTarget {
+  serverId: number;
+  name: string;
+  is4k: boolean;
+  isDefault: boolean;
+  isIndependent: boolean;
+  status: MediaStatus;
+  requestable: boolean;
+}
+
+export interface TvRequestTargetSeason {
+  seasonNumber: number;
+  status: MediaStatus;
+  requestable: boolean;
+}
+
+export interface TvRequestTarget extends MovieRequestTarget {
+  seasons: TvRequestTargetSeason[];
 }
 
 export type MediaRequestBody = {
