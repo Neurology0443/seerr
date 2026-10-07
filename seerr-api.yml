@@ -1243,6 +1243,7 @@ components:
             $ref: '#/components/schemas/WatchProviders'
     MediaRequestTarget:
       type: object
+      nullable: true
       properties:
         serverId:
           type: number
@@ -1356,9 +1357,7 @@ components:
           example: false
           description: If true, this request will not count against the user's quota. Requires MANAGE_REQUESTS permission.
         target:
-          nullable: true
-          allOf:
-            - $ref: '#/components/schemas/MediaRequestTarget'
+          $ref: '#/components/schemas/MediaRequestTarget'
       required:
         - id
         - status
