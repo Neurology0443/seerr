@@ -936,6 +936,22 @@ describe('Sonarr Scanner', () => {
   });
 
   describe('independent destination scanning', () => {
+    it('scans canonically equivalent native configurations separately under upstream raw deduplication', async () => {
+      configureSonarr([
+        { id: 28, hostname: 'localhost', port: 8989, baseUrl: '' },
+        { id: 29, hostname: 'localhost', port: 8989, baseUrl: '/' },
+      ]);
+      let inventoryCalls = 0;
+      getSeriesImpl = async () => {
+        inventoryCalls++;
+        return [];
+      };
+
+      await runWithMockTimers(() => sonarrScanner.run());
+
+      assert.strictEqual(inventoryCalls, 2);
+    });
+
     it('creates minimal TV identity without native season state', async () => {
       configureSonarr([
         {
@@ -2114,7 +2130,11 @@ describe('Sonarr Scanner', () => {
           independentRequestDestination: true,
         },
       ]);
-      getSeriesImpl = async () => [fakeSonarrSeries({ tvdbId: 9999 })];
+      let inventoryCalls = 0;
+      getSeriesImpl = async () => {
+        inventoryCalls++;
+        return [fakeSonarrSeries({ tvdbId: 9999 })];
+      };
       getLibrarySeriesByTvdbIdImpl = async () => [];
 
       await runWithMockTimers(() => sonarrScanner.run());
@@ -2131,6 +2151,7 @@ describe('Sonarr Scanner', () => {
         ).status,
         MediaStatus.PROCESSING
       );
+      assert.strictEqual(inventoryCalls, 0);
     });
   });
 });

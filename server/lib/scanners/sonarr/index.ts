@@ -24,10 +24,7 @@ import type {
 import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
-import {
-  findAmbiguousIndependentDvrServerIds,
-  isSameDvrEndpoint,
-} from '@server/lib/settings/dvrValidation';
+import { findAmbiguousIndependentDvrServerIds } from '@server/lib/settings/dvrValidation';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -90,7 +87,10 @@ class SonarrScanner
       }
       this.servers = uniqWith(
         settings.sonarr.filter((server) => !ambiguousServerIds.has(server.id)),
-        isSameDvrEndpoint
+        (sonarrA, sonarrB) =>
+          sonarrA.hostname === sonarrB.hostname &&
+          sonarrA.port === sonarrB.port &&
+          sonarrA.baseUrl === sonarrB.baseUrl
       );
 
       for (const server of this.servers) {

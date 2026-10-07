@@ -725,6 +725,22 @@ describe('Radarr Scanner', () => {
   });
 
   describe('independent destination scanning', () => {
+    it('scans canonically equivalent native configurations separately under upstream raw deduplication', async () => {
+      configureRadarr([
+        { id: 8, hostname: 'localhost', port: 7878, baseUrl: '' },
+        { id: 9, hostname: 'localhost', port: 7878, baseUrl: '/' },
+      ]);
+      let inventoryCalls = 0;
+      getMoviesImpl = async () => {
+        inventoryCalls++;
+        return [];
+      };
+
+      await runWithMockTimers(() => radarrScanner.run());
+
+      assert.strictEqual(inventoryCalls, 2);
+    });
+
     it('creates only minimal native identity when an independent movie is first discovered', async () => {
       configureRadarr([
         {
@@ -1135,7 +1151,11 @@ describe('Radarr Scanner', () => {
           independentRequestDestination: true,
         },
       ]);
-      getMoviesImpl = async () => [fakeRadarrMovie({ tmdbId: 999 })];
+      let inventoryCalls = 0;
+      getMoviesImpl = async () => {
+        inventoryCalls++;
+        return [fakeRadarrMovie({ tmdbId: 999 })];
+      };
       getLibraryMoviesByTmdbIdImpl = async () => [];
 
       await runWithMockTimers(() => radarrScanner.run());
@@ -1152,6 +1172,7 @@ describe('Radarr Scanner', () => {
         ).status,
         MediaStatus.PROCESSING
       );
+      assert.strictEqual(inventoryCalls, 0);
     });
   });
 });
