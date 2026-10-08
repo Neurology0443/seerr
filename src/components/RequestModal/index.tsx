@@ -5,7 +5,7 @@ import { Transition } from '@headlessui/react';
 import type { MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 
 interface RequestModalProps {
   show: boolean;
@@ -37,9 +37,24 @@ const RequestModal = ({
   const editorKey = editRequest ? `${editRequest.id}:${session.number}` : 'new';
   const sessionKey = `${type}:${tmdbId}:${editorKey}`;
   const activeSession = useRef<string | undefined>(undefined);
-  // Invalidate immediately on close, including Transition's leave interval.
-  activeSession.current = show ? sessionKey : undefined;
+  // Only a committed opening can activate a session. Conditional cleanup also
+  // protects a newer session from invalidation by an older one.
+  useLayoutEffect(() => {
+    if (!show) return;
+    activeSession.current = sessionKey;
+    return () => {
+      if (activeSession.current === sessionKey) {
+        activeSession.current = undefined;
+      }
+    };
+  }, [show, sessionKey]);
   const isEditSessionActive = () => activeSession.current === sessionKey;
+  const cancelEdit: typeof onCancel = () => {
+    if (!isEditSessionActive()) return;
+    // Close handlers invalidate before the parent's show change is committed.
+    activeSession.current = undefined;
+    onCancel?.();
+  };
   const completeEdit: typeof onComplete = (status) => {
     if (isEditSessionActive()) onComplete?.(status);
   };
@@ -61,7 +76,7 @@ const RequestModal = ({
         <MovieRequestModal
           key={editRequest ? sessionKey : editorKey}
           onComplete={editRequest ? completeEdit : onComplete}
-          onCancel={onCancel}
+          onCancel={editRequest && onCancel ? cancelEdit : onCancel}
           tmdbId={tmdbId}
           onUpdating={editRequest ? updateEdit : onUpdating}
           isEditSessionActive={isEditSessionActive}
@@ -72,7 +87,7 @@ const RequestModal = ({
         <TvRequestModal
           key={editRequest ? sessionKey : editorKey}
           onComplete={editRequest ? completeEdit : onComplete}
-          onCancel={onCancel}
+          onCancel={editRequest && onCancel ? cancelEdit : onCancel}
           tmdbId={tmdbId}
           onUpdating={editRequest ? updateEdit : onUpdating}
           isEditSessionActive={isEditSessionActive}

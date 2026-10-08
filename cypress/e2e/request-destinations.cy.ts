@@ -214,6 +214,7 @@ const visitMedia = (
       `View Request — ${destination}`
     );
   }
+  return title;
 };
 
 const clickAction = (label: RegExp) => {
@@ -238,6 +239,28 @@ const refreshEditCaches = () => {
   });
   cy.tick(0);
   cy.clock().then((clock) => clock.restore());
+};
+
+// Hold a revalidation while a parent/form rerender commits newer callbacks.
+const delayRequestDetail = (
+  request: ReturnType<typeof pending> & { type: 'movie' | 'tv' }
+) => {
+  let release: (() => void) | undefined;
+  cy.intercept(
+    'GET',
+    `/api/v1/request/${request.id}`,
+    (req) =>
+      new Promise<void>((resolve) => {
+        release = () => {
+          req.reply(request);
+          resolve();
+        };
+      })
+  ).as('remoteDetail');
+  return () => {
+    cy.wrap(null).should(() => expect(release).to.be.a('function'));
+    cy.then(() => release?.());
+  };
 };
 
 // Custom controls must reject activation themselves; fieldset disabling alone
@@ -382,6 +405,55 @@ describe('Request destinations', () => {
   }
 
   for (const type of ['movie', 'tv'] as const) {
+    it(
+      `completes an active ${type} edit exactly once after a committed parent rerender`,
+      { defaultCommandTimeout: 15000 },
+      () => {
+        cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+        const title = visitMedia(type, [pending(101, 1)]);
+        let release: (() => void) | undefined;
+        cy.intercept(
+          'PUT',
+          '/api/v1/request/101',
+          (req) =>
+            new Promise<void>((resolve) => {
+              release = () => {
+                req.reply({ editRevision: 'saved-revision' });
+                resolve();
+              };
+            })
+        ).as('delayedEdit');
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile').select('10');
+        cy.contains('[role="dialog"] button', /^Approve Request$/).click();
+        cy.wrap(null).should(() => expect(release).to.be.a('function'));
+        const path = `/api/v1/${type}/${type === 'movie' ? movieId : tvId}`;
+        const rerendered = {
+          ...title,
+          overview: 'Active edit parent rerender committed',
+        };
+        cy.intercept('GET', path, rerendered).as('parentRerender');
+        refreshEditCaches();
+        cy.wait('@parentRerender');
+        cy.contains(rerendered.overview).should('be.visible');
+        cy.get('#profile').should('have.value', '10').and('be.disabled');
+        cy.intercept('GET', path, rerendered).as('completionRefresh');
+        cy.then(() => release?.());
+        cy.wait('@delayedEdit');
+        cy.wait('@approve');
+        // One mutation cache refresh and exactly one parent's onComplete refresh.
+        cy.wait(['@completionRefresh', '@completionRefresh']);
+        cy.get('@completionRefresh.all').should('have.length', 2);
+        cy.get('@approve.all').should('have.length', 1);
+        cy.get('[role="dialog"]').should('not.exist');
+        cy.get('.toast')
+          .filter(
+            `:contains("Request for Correction ${type === 'movie' ? 'Movie' : 'Series'} approved!")`
+          )
+          .should('have.length', 1);
+      }
+    );
+
     for (const outcome of ['success', 'error'] as const) {
       it(
         `isolates a reopened ${type} editor from an obsolete PUT ${outcome}`,
@@ -580,90 +652,125 @@ describe('Request destinations', () => {
       cy.get('@edit.all').should('have.length', 0);
     });
 
-    it(`adopts a complete pristine ${type} revision and uses the returned revision for approval`, () => {
-      cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
-      visitMedia(type, [pending(101, 1)]);
-      clickAction(/^View Request — FR$/);
-      cy.get('#profile').should('have.value', '11');
-      const remote = {
-        ...pending(101, 2),
-        type,
-        editRevision: 'remote-revision',
-        profileId: 21,
-        rootFolder: '/2',
-        languageProfileId: 20,
-        tags: [2],
-        requestedBy: beneficiary,
-        seasons: [1, 2].map((seasonNumber) => ({
-          id: seasonNumber,
-          seasonNumber,
-          status: 1,
-        })),
-      };
-      cy.intercept('GET', '/api/v1/request/101', remote).as('remoteDetail');
-      refreshEditCaches();
-      cy.wait('@remoteDetail');
-      cy.get('#server').should('have.value', '2');
-      cy.get('#profile').should('have.value', '21');
-      cy.get('#folder').should('have.value', '/2');
-      cy.get('[role="dialog"]').should('contain.text', 'Beneficiary');
-      if (type === 'tv') {
-        cy.get('#language').should('have.value', '20');
-        cy.contains('[role="dialog"] tbody tr', 'Season 2')
-          .find('[role="checkbox"]')
-          .should('have.attr', 'aria-checked', 'true');
+    it(
+      `adopts a complete pristine ${type} revision and uses the returned revision for approval`,
+      { defaultCommandTimeout: 15000 },
+      () => {
+        cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+        const title = visitMedia(type, [pending(101, 1)]);
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile').should('have.value', '11');
+        const remote = {
+          ...pending(101, 2),
+          type,
+          editRevision: 'remote-revision',
+          profileId: 21,
+          rootFolder: '/2',
+          languageProfileId: 20,
+          tags: [2],
+          requestedBy: beneficiary,
+          seasons: [1, 2].map((seasonNumber) => ({
+            id: seasonNumber,
+            seasonNumber,
+            status: 1,
+          })),
+        };
+        const release = delayRequestDetail(remote);
+        const rerendered = {
+          ...title,
+          overview: 'Pristine revalidation parent rerender committed',
+        };
+        cy.intercept(
+          'GET',
+          `/api/v1/${type}/${type === 'movie' ? movieId : tvId}`,
+          rerendered
+        ).as('parentRerender');
+        refreshEditCaches();
+        cy.wait('@parentRerender');
+        cy.contains(rerendered.overview).should('be.visible');
+        cy.get('#profile').should('have.value', '11');
+        release();
+        cy.wait('@remoteDetail');
+        cy.get('#server').should('have.value', '2');
+        cy.get('#profile').should('have.value', '21');
+        cy.get('#folder').should('have.value', '/2');
+        cy.get('[role="dialog"]').should('contain.text', 'Beneficiary');
+        if (type === 'tv') {
+          cy.get('#language').should('have.value', '20');
+          cy.contains('[role="dialog"] tbody tr', 'Season 2')
+            .find('[role="checkbox"]')
+            .should('have.attr', 'aria-checked', 'true');
+        }
+        cy.contains('[role="dialog"] button', /^Approve Request$/)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@edit').then(({ request }) => {
+          expect(request.headers['if-match']).to.eq('"remote-revision"');
+          expect(request.body.serverId).to.eq(2);
+          expect(request.body.profileId).to.eq(21);
+          expect(request.body.rootFolder).to.eq('/2');
+          expect(request.body.userId).to.eq(beneficiary.id);
+          expect(request.body.tags).to.deep.eq([2]);
+          if (type === 'tv') expect(request.body.seasons).to.deep.eq([1, 2]);
+        });
+        cy.wait('@approve')
+          .its('request.headers.if-match')
+          .should('eq', '"saved-revision"');
       }
-      cy.contains('[role="dialog"] button', /^Approve Request$/)
-        .should('not.be.disabled')
-        .click();
-      cy.wait('@edit').then(({ request }) => {
-        expect(request.headers['if-match']).to.eq('"remote-revision"');
-        expect(request.body.serverId).to.eq(2);
-        expect(request.body.profileId).to.eq(21);
-        expect(request.body.rootFolder).to.eq('/2');
-        expect(request.body.userId).to.eq(beneficiary.id);
-        expect(request.body.tags).to.deep.eq([2]);
-        if (type === 'tv') expect(request.body.seasons).to.deep.eq([1, 2]);
-      });
-      cy.wait('@approve')
-        .its('request.headers.if-match')
-        .should('eq', '"saved-revision"');
-    });
+    );
 
-    it(`preserves dirty ${type} choices and blocks all submissions on a remote revision`, () => {
-      cy.intercept('GET', '/api/v1/user/*/quota', {
-        movie: { limit: 10, remaining: 10, restricted: false },
-        tv: { limit: 10, remaining: 10, restricted: false },
-      });
-      cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
-      visitMedia(type, [pending(101, 1)]);
-      clickAction(/^View Request — FR$/);
-      cy.get('#profile').select('10').should('have.value', '10');
-      cy.intercept('GET', '/api/v1/request/101', {
-        ...pending(101, 2),
-        type,
-        editRevision: 'remote-revision',
-        profileId: 21,
-      }).as('remoteDetail');
-      refreshEditCaches();
-      cy.wait('@remoteDetail');
-      cy.contains('[role="dialog"]', 'Close and reopen the editor').should(
-        'be.visible'
-      );
-      expectLockedEditControls(type);
-      cy.get('#profile').should('have.value', '10');
-      cy.get('#server').should('have.value', '1');
-      cy.contains('[role="dialog"] button', /^Approve Request$/).should(
-        'be.disabled'
-      );
-      if (type === 'movie')
-        cy.contains('[role="dialog"] button', /^Cancel Request$/).should(
+    it(
+      `preserves dirty ${type} choices and blocks all submissions on a remote revision`,
+      { defaultCommandTimeout: 15000 },
+      () => {
+        cy.intercept('GET', '/api/v1/user/*/quota', {
+          movie: { limit: 10, remaining: 10, restricted: false },
+          tv: { limit: 10, remaining: 10, restricted: false },
+        });
+        cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+        const title = visitMedia(type, [pending(101, 1)]);
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile').should('have.value', '11');
+        const release = delayRequestDetail({
+          ...pending(101, 2),
+          type,
+          editRevision: 'remote-revision',
+          profileId: 21,
+        });
+        const rerendered = {
+          ...title,
+          overview: 'Dirty revalidation parent rerender committed',
+        };
+        cy.intercept(
+          'GET',
+          `/api/v1/${type}/${type === 'movie' ? movieId : tvId}`,
+          rerendered
+        ).as('parentRerender');
+        refreshEditCaches();
+        cy.wait('@parentRerender');
+        cy.contains(rerendered.overview).should('be.visible');
+        // This change commits after revalidation starts, before it resolves.
+        cy.get('#profile').select('10').should('have.value', '10');
+        release();
+        cy.wait('@remoteDetail');
+        cy.contains('[role="dialog"]', 'Close and reopen the editor').should(
+          'be.visible'
+        );
+        expectLockedEditControls(type);
+        cy.get('#profile').should('have.value', '10');
+        cy.get('#server').should('have.value', '1');
+        cy.contains('[role="dialog"] button', /^Approve Request$/).should(
           'be.disabled'
         );
-      cy.get('@edit.all').should('have.length', 0);
-      cy.get('@approve.all').should('have.length', 0);
-      cy.get('@delete.all').should('have.length', 0);
-    });
+        if (type === 'movie')
+          cy.contains('[role="dialog"] button', /^Cancel Request$/).should(
+            'be.disabled'
+          );
+        cy.get('@edit.all').should('have.length', 0);
+        cy.get('@approve.all').should('have.length', 0);
+        cy.get('@delete.all').should('have.length', 0);
+      }
+    );
 
     it(`keeps manual ${type} values on a same-revision request and metadata refresh`, () => {
       cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);

@@ -1,6 +1,12 @@
 import { MediaRequestStatus } from '@server/constants/media';
 import type { RequestDetailResponse } from '@server/interfaces/api/requestInterfaces';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import useSWR from 'swr';
 
 // Shared only by the movie/TV request editors. A list or cached detail object
@@ -15,14 +21,17 @@ export const useRequestEditSession = (
   const [confirmed, setConfirmed] = useState(false);
   const [conflicted, setConflicted] = useState(false);
   const [initialError, setInitialError] = useState<unknown>();
-  const mounted = useRef(true);
+  const mounted = useRef(false);
   const callbacks = useRef({ dirty, onAccept, isSessionActive });
-  callbacks.current = { dirty, onAccept, isSessionActive };
+  // Async work observes committed form/callback values, never a pending render.
+  useLayoutEffect(() => {
+    callbacks.current = { dirty, onAccept, isSessionActive };
+  }, [dirty, onAccept, isSessionActive]);
   const isActive = useCallback(
     () => mounted.current && (callbacks.current.isSessionActive?.() ?? true),
     []
   );
-  useEffect(() => {
+  useLayoutEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
