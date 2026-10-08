@@ -170,6 +170,10 @@ const AdvancedRequester = ({
   const manualValuesRef = useRef<DestinationValues>({});
   const ruleEvaluationRef = useRef<{
     key: string;
+    inputKey: string;
+    tags: number[];
+    defaults: DestinationValues;
+    applied: boolean;
     result: Promise<Partial<OverrideRulesResult>>;
   } | null>(null);
   const initializedServer = useRef<number | null>(null);
@@ -244,20 +248,33 @@ const AdvancedRequester = ({
   const usePersistedOverrides =
     !destinationChanged &&
     (original?.server == null || original.server === selectedServer);
-  const ruleTags =
-    manualValues.tags ??
-    (usePersistedOverrides ? original?.tags : undefined) ??
-    (serverData
-      ? getDestinationDefaults(serverData.server, isAnime).tags
-      : []) ??
-    [];
-  const ruleTagsKey = JSON.stringify(ruleTags);
-
   const [selectedUser, setSelectedUser] = useState<User | null>(
     requestUser ?? null
   );
   const selectedUserId = selectedUser?.id;
   const previousSelectedUserIdRef = useRef<number | undefined>(selectedUserId);
+  const ruleParameters = {
+    mediaType: type,
+    is4k,
+    requestUser: selectedUserId ?? requestUser?.id ?? currentUser?.id,
+    tmdbId,
+    serviceId: selectedServer,
+    requestId,
+  };
+  const ruleInputKey = JSON.stringify([ruleParameters, rulesRetry]);
+  // A default-tag metadata change is not a user/rule-input change. Retain the
+  // evaluation's tags until another resolution event or explicit tag selection.
+  const ruleTags =
+    manualValues.tags ??
+    (usePersistedOverrides ? original?.tags : undefined) ??
+    (initializedServer.current === selectedServer &&
+    ruleEvaluationRef.current?.inputKey === ruleInputKey
+      ? ruleEvaluationRef.current.tags
+      : serverData
+        ? getDestinationDefaults(serverData.server, isAnime).tags
+        : []) ??
+    [];
+  const ruleTagsKey = JSON.stringify(ruleTags);
 
   const { data: userData } = useSWR<UserResultsResponse>(
     currentHasPermission([Permission.MANAGE_REQUESTS, Permission.MANAGE_USERS])
@@ -393,22 +410,14 @@ const AdvancedRequester = ({
         setSelectedTags(values.tags ?? []);
       };
 
-      // Initialize once per destination; metadata refreshes and rule results
-      // must not reset protected manual selections.
-      if (initializedServer.current !== selectedServer) {
+      // Initialize once per destination, including an explicit return to it.
+      const initializing = initializedServer.current !== selectedServer;
+      if (initializing) {
         initializedServer.current = selectedServer;
         applyValues(applyDestinationRules(defaults, {}, protectedValues));
       }
       try {
-        const parameters = {
-          mediaType: type,
-          is4k,
-          requestUser: selectedUserId ?? requestUser?.id ?? currentUser?.id,
-          tmdbId,
-          tags: ruleTags,
-          serviceId: serverData.server.id,
-          requestId,
-        };
+        const parameters = { ...ruleParameters, tags: ruleTags };
         const key = JSON.stringify([parameters, rulesRetry]);
         // Reuse the current evaluation (including an in-flight response or
         // failure) when API inputs are unchanged. Only Retry repeats failures.
@@ -417,6 +426,10 @@ const AdvancedRequester = ({
           setOverrideRulesError(false);
           ruleEvaluationRef.current = {
             key,
+            inputKey: ruleInputKey,
+            tags: ruleTags,
+            defaults,
+            applied: false,
             result: tmdbId
               ? axios
                   .post<OverrideRulesResult>(
@@ -427,17 +440,26 @@ const AdvancedRequester = ({
               : Promise.resolve({}),
           };
         }
-        const override = await ruleEvaluationRef.current.result;
+        const evaluation = ruleEvaluationRef.current;
+        if (initializing) {
+          evaluation.defaults = defaults;
+          evaluation.applied = false;
+        }
+        // Metadata-only refreshes validate established values without replaying
+        // defaults or cached rules. A pending evaluation keeps its own defaults.
+        if (evaluation.applied) return;
+        const override = await evaluation.result;
         if (cancelled || revision !== formRevision.current) {
           return;
         }
 
         applyValues(
-          applyDestinationRules(defaults, override, {
+          applyDestinationRules(evaluation.defaults, override, {
             ...protectedValues,
             ...manualValuesRef.current,
           })
         );
+        evaluation.applied = true;
         setConfiguredServerId(serverData.server.id);
       } catch {
         if (!cancelled && revision === formRevision.current) {
