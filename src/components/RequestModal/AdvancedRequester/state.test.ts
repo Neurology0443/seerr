@@ -129,6 +129,66 @@ describe('AdvancedRequester value precedence', () => {
 });
 
 describe('partial request edit configuration', () => {
+  it('uses the new destination configuration instead of old persisted values', () => {
+    const resolved = { profile: 20, folder: '/en', language: 21, tags: [2] };
+    assert.deepEqual(
+      getEditedDestinationValues(
+        { profile: 30, folder: '/fr', language: 31, tags: [] },
+        {},
+        { ...resolved, destinationChanged: true }
+      ),
+      resolved
+    );
+  });
+
+  it('preserves manual selections made on the new destination', () => {
+    assert.deepEqual(
+      getEditedDestinationValues(
+        { profile: 30, folder: '/fr', language: 31, tags: [1] },
+        { profile: 22, tags: [] },
+        {
+          profile: 20,
+          folder: '/en',
+          language: 21,
+          tags: [2],
+          destinationChanged: true,
+        }
+      ),
+      { profile: 22, folder: '/en', language: 21, tags: [] }
+    );
+  });
+
+  it('preserves persisted nulls on an unchanged or restored destination', () => {
+    const persisted = {
+      profile: null,
+      folder: null,
+      language: null,
+      tags: null,
+    };
+    assert.deepEqual(
+      getEditedDestinationValues(
+        persisted,
+        { folder: '/custom' },
+        {
+          ...getDestinationDefaults(server, false),
+          destinationChanged: false,
+        }
+      ),
+      { ...persisted, folder: '/custom' }
+    );
+  });
+
+  it('clears an old language override when the new destination has none', () => {
+    assert.deepEqual(
+      getEditedDestinationValues(
+        { profile: 30, folder: '/fr', language: 31, tags: [1] },
+        {},
+        { profile: 20, folder: '/en', tags: [], destinationChanged: true }
+      ),
+      { profile: 20, folder: '/en', language: null, tags: [] }
+    );
+  });
+
   it('preserves nullable historical fields when only the folder changes', () => {
     assert.deepEqual(
       getEditedDestinationValues(

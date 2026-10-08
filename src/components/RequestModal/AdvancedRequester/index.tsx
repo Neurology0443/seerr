@@ -75,6 +75,7 @@ export type RequestOverrides = {
   isReady?: boolean;
   hasConfigurationChanges?: boolean;
   manualValues?: DestinationValues;
+  destinationChanged?: boolean;
 };
 
 interface AdvancedRequesterProps {
@@ -148,6 +149,7 @@ const AdvancedRequester = ({
   const [overrideRulesError, setOverrideRulesError] = useState(false);
   const [rulesRetry, setRulesRetry] = useState(0);
   const [destinationChanged, setDestinationChanged] = useState(false);
+  const originalServer = useRef(selectedServer);
   const [manualValues, setManualValues] = useState<DestinationValues>({});
   const manualValuesRef = useRef<DestinationValues>({});
   const ruleEvaluationRef = useRef<{
@@ -260,6 +262,7 @@ const AdvancedRequester = ({
     const nextServer = requestedServer ?? defaultServer?.id;
 
     if (selectedServer === null && nextServer !== undefined) {
+      originalServer.current ??= nextServer;
       setSelectedServer(nextServer);
     }
   }, [data, defaultOverrides?.server, initialServerId, is4k]);
@@ -290,6 +293,7 @@ const AdvancedRequester = ({
       isReady: isConfigurationReady,
       hasConfigurationChanges,
       manualValues,
+      destinationChanged,
     });
   }, [
     selectedFolder,
@@ -428,7 +432,7 @@ const AdvancedRequester = ({
 
     formRevision.current += 1;
     initializedServer.current = null;
-    setDestinationChanged(true);
+    setDestinationChanged(serverId !== originalServer.current);
     manualValuesRef.current = {};
     setManualValues({});
     setConfiguredServerId(null);

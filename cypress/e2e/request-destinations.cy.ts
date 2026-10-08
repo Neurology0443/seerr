@@ -294,8 +294,109 @@ describe('Request destinations', () => {
       cy.contains('[role="dialog"] button', /^Approve Request$/)
         .should('not.be.disabled')
         .click();
-      cy.wait('@edit').its('request.body.serverId').should('eq', 2);
+      cy.wait('@edit').then(({ request }) => {
+        expect(request.body.serverId).to.eq(2);
+        expect(request.body.profileId).to.eq(20);
+        expect(request.body.rootFolder).to.eq('/2');
+        expect(request.body.tags).to.deep.eq([2]);
+        if (type === 'tv') expect(request.body.languageProfileId).to.eq(20);
+      });
     });
+
+    for (const manual of [false, true]) {
+      it(`saves ${manual ? 'manual' : 'resolved'} ${type} configuration after switching native destinations`, () => {
+        cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', (req) => {
+          req.reply({
+            body:
+              req.body.serviceId === 2
+                ? { profileId: 21, rootFolder: '/2', tags: [2] }
+                : {},
+          });
+        }).as('switchRules');
+        visitMedia(type, [pending(101, 1)]);
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile').should('not.be.disabled').and('have.value', '11');
+        cy.get('#server').select('2');
+        cy.get('#profile').should('not.be.disabled').and('have.value', '21');
+        cy.get('#folder').should('have.value', '/2');
+        cy.contains('.react-select__multi-value', 'Tag 2').should('be.visible');
+        if (type === 'tv') cy.get('#language').should('have.value', '20');
+        if (manual) {
+          cy.get('@switchRules.all').then((calls) => {
+            const count = (calls as unknown as unknown[]).length;
+            cy.get('#profile').select('20');
+            cy.get('#folder').select('/custom');
+            if (type === 'tv') cy.get('#language').select('31');
+            cy.get('@switchRules.all').should('have.length', count);
+          });
+          cy.get('[role="dialog"] .react-select__multi-value__remove').click();
+          cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+          cy.get('#folder').should('have.value', '/custom');
+          cy.get('[role="dialog"] .react-select__multi-value').should(
+            'not.exist'
+          );
+        }
+        cy.contains('[role="dialog"] button', /^Approve Request$/)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@edit').then(({ request }) => {
+          expect(request.body.serverId).to.eq(2);
+          expect(request.body.profileId).to.eq(manual ? 20 : 21);
+          expect(request.body.rootFolder).to.eq(manual ? '/custom' : '/2');
+          expect(request.body.tags).to.deep.eq(manual ? [] : [2]);
+          if (type === 'tv')
+            expect(request.body.languageProfileId).to.eq(manual ? 31 : 20);
+        });
+        cy.wait('@approve');
+      });
+    }
+
+    for (const historical of [false, true]) {
+      it(`restores ${historical ? 'historical nullable' : 'explicit'} ${type} settings after returning to the original effective destination`, () => {
+        const original = historical
+          ? {
+              ...pending(101, null),
+              profileId: null,
+              rootFolder: null,
+              languageProfileId: null,
+              tags: null,
+            }
+          : pending(101, 1);
+        visitMedia(type, [original]);
+        clickAction(
+          historical ? /^View Request — Request #101$/ : /^View Request — FR$/
+        );
+        cy.get('#profile').should('not.be.disabled');
+        cy.get('#server').select('2');
+        cy.get('#profile')
+          .should('not.be.disabled')
+          .and('have.value', '20')
+          .select('21');
+        cy.get('#folder').select('/custom');
+        cy.get('#server').select('1');
+        cy.get('#profile')
+          .should('not.be.disabled')
+          .and('have.value', historical ? '10' : '11');
+        cy.get('#folder').should('have.value', historical ? '/1' : '/custom');
+        if (type === 'tv')
+          cy.get('#language').should('have.value', historical ? '10' : '31');
+        cy.contains('[role="dialog"] button', /^Approve Request$/)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@edit').then(({ request }) => {
+          if (historical) expect(request.body).not.to.have.property('serverId');
+          else expect(request.body.serverId).to.eq(1);
+          expect(request.body.profileId).to.eq(original.profileId);
+          expect(request.body.rootFolder).to.eq(original.rootFolder);
+          expect(request.body.tags).to.deep.eq(original.tags);
+          if (type === 'tv')
+            expect(request.body.languageProfileId).to.eq(
+              original.languageProfileId
+            );
+        });
+        cy.wait('@approve');
+      });
+    }
 
     it(`preserves nullable historical ${type} fields when only the folder is edited`, () => {
       cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
@@ -552,6 +653,110 @@ describe('Request destinations', () => {
       cy.contains(
         `${type === 'movie' ? 'Correction Movie' : 'Correction Series'} requested successfully!`
       ).should('be.visible');
+    });
+  }
+
+  for (const alsoApprove of [false, true]) {
+    it(`keeps a refused TV ${alsoApprove ? 'Edit and Approve' : 'edit'} open without approval and retries successfully`, () => {
+      if (!alsoApprove) {
+        cy.intercept('GET', '/api/v1/auth/me', {
+          ...admin,
+          permissions: 32 | 8192 | 16384, // REQUEST, REQUEST_ADVANCED, REQUEST_VIEW
+        });
+      }
+      visitMedia('tv', [pending(101, 1)], false, alsoApprove);
+      clickAction(/^View Request — FR$/);
+      cy.get('#profile').should('not.be.disabled');
+      cy.contains('[role="dialog"] tbody tr', 'Season 1')
+        .find('[role="checkbox"]')
+        .click();
+      cy.contains('[role="dialog"] tbody tr', 'Season 2')
+        .find('[role="checkbox"]')
+        .click();
+      cy.intercept(
+        'GET',
+        `/api/v1/tv/${tvId}/request-targets`,
+        servers.map((server) => ({
+          serverId: server.id,
+          name: server.name,
+          is4k: false,
+          isDefault: server.isDefault,
+          isIndependent: alsoApprove,
+          status: 2,
+          requestable: true,
+          seasons: [1, 2].map((seasonNumber) => ({
+            seasonNumber,
+            status: seasonNumber === 1 ? 2 : 5,
+            requestable: false,
+          })),
+        }))
+      ).as('editRefreshedTargets');
+      cy.intercept('PUT', '/api/v1/request/101', {
+        statusCode: 202,
+        body: { message: 'No seasons available to request' },
+      }).as('refusedEdit');
+      const submit = alsoApprove ? /^Approve Request$/ : /^Edit Request$/;
+      cy.get('@title.all').then((calls) => {
+        const count = (calls as unknown as unknown[]).length;
+        cy.contains('[role="dialog"] button', submit)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@refusedEdit')
+          .its('request.body.seasons')
+          .should('deep.eq', [2]);
+        cy.wait('@editRefreshedTargets');
+        cy.get('@title.all').should((requests) => {
+          expect((requests as unknown as unknown[]).length).to.be.greaterThan(
+            count
+          );
+        });
+      });
+      cy.contains('No seasons available to request').should('be.visible');
+      cy.contains('Request for Correction Series edited successfully!').should(
+        'not.exist'
+      );
+      cy.contains('Request for Correction Series approved!').should(
+        'not.exist'
+      );
+      cy.get('[role="dialog"]').should('be.visible');
+      cy.get('@approve.all').should('have.length', 0);
+      cy.get('@delete.all').should('have.length', 0);
+      cy.contains('[role="dialog"] tbody tr', 'Season 1')
+        .find('[role="checkbox"]')
+        .should('have.attr', 'aria-checked', 'true');
+      cy.contains('[role="dialog"] tbody tr', 'Season 2').should(
+        'contain.text',
+        'Available'
+      );
+      const updatedRequest = createdRequest('tv', 1, [1]);
+      cy.intercept('PUT', '/api/v1/request/101', {
+        statusCode: 200,
+        body: {
+          ...updatedRequest,
+          ...pending(101, 1),
+          target: {
+            ...updatedRequest.target,
+            isIndependent: alsoApprove,
+            status: 2,
+          },
+        },
+      }).as('successfulEdit');
+      cy.contains('[role="dialog"] button', submit)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@successfulEdit')
+        .its('request.body.seasons')
+        .should('deep.eq', [1]);
+      if (alsoApprove) {
+        cy.wait('@approve');
+        cy.get('@approve.all').should('have.length', 1);
+      } else cy.get('@approve.all').should('have.length', 0);
+      cy.contains(
+        alsoApprove
+          ? 'Request for Correction Series approved!'
+          : 'Request for Correction Series edited successfully!'
+      ).should('be.visible');
+      cy.get('[role="dialog"]').should('not.exist');
     });
   }
 
@@ -1031,9 +1236,9 @@ describe('Request destinations', () => {
       .click();
     cy.wait('@edit').then(({ request }) => {
       expect(request.body.serverId).to.eq(2);
-      expect(request.body.profileId).to.eq(11);
-      expect(request.body.rootFolder).to.eq('/custom');
-      expect(request.body.tags).to.deep.eq([]);
+      expect(request.body.profileId).to.eq(20);
+      expect(request.body.rootFolder).to.eq('/2');
+      expect(request.body.tags).to.deep.eq([2]);
     });
   });
 

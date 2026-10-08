@@ -244,7 +244,8 @@ const MovieRequestModal = ({
           folder: editRequest?.rootFolder,
           tags: editRequest?.tags,
         },
-        requestOverrides?.manualValues
+        requestOverrides?.manualValues,
+        requestOverrides ?? undefined
       );
       await axios.put(`/api/v1/request/${editRequest?.id}`, {
         mediaType: 'movie',

@@ -13,11 +13,23 @@ type PersistedDestinationValues = {
 };
 
 // Display defaults and rule results are not persisted overrides. PUT assigns
-// every configuration field, so untouched fields must retain their exact value.
+// every configuration field, so untouched fields must retain their exact value
+// unless the destination changes, in which case the new resolved values apply.
 export const getEditedDestinationValues = (
   persisted: PersistedDestinationValues,
-  manual: DestinationValues = {}
-): PersistedDestinationValues => ({ ...persisted, ...manual });
+  manual: DestinationValues = {},
+  resolved?: DestinationValues & { destinationChanged?: boolean }
+): PersistedDestinationValues => ({
+  ...(resolved?.destinationChanged
+    ? {
+        profile: resolved.profile ?? null,
+        folder: resolved.folder ?? null,
+        language: resolved.language ?? null,
+        tags: resolved.tags ?? null,
+      }
+    : persisted),
+  ...manual,
+});
 
 export const getDestinationDefaults = (
   server: ServiceCommonServer,

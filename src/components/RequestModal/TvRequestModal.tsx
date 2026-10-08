@@ -165,22 +165,30 @@ const TvRequestModal = ({
             language: editRequest.languageProfileId,
             tags: editRequest.tags,
           },
-          requestOverrides?.manualValues
+          requestOverrides?.manualValues,
+          requestOverrides ?? undefined
         );
-        await axios.put(`/api/v1/request/${editRequest.id}`, {
-          mediaType: 'tv',
-          serverId: getEditServerId(
-            editRequest.serverId,
-            editTarget,
-            requestOverrides?.server
-          ),
-          profileId: editedValues.profile,
-          rootFolder: editedValues.folder,
-          languageProfileId: editedValues.language,
-          userId: requestOverrides?.user?.id,
-          tags: editedValues.tags,
-          seasons: selectedSeasons.toSorted((a, b) => a - b),
-        });
+        await axios.put(
+          `/api/v1/request/${editRequest.id}`,
+          {
+            mediaType: 'tv',
+            serverId: getEditServerId(
+              editRequest.serverId,
+              editTarget,
+              requestOverrides?.server
+            ),
+            profileId: editedValues.profile,
+            rootFolder: editedValues.folder,
+            languageProfileId: editedValues.language,
+            userId: requestOverrides?.user?.id,
+            tags: editedValues.tags,
+            seasons: selectedSeasons.toSorted((a, b) => a - b),
+          },
+          {
+            // A refused edit returns 202; approval must only follow a successful PUT.
+            validateStatus: (status) => status === 200,
+          }
+        );
 
         if (alsoApproveRequest) {
           await axios.post(`/api/v1/request/${editRequest.id}/approve`);
@@ -228,7 +236,14 @@ const TvRequestModal = ({
     } catch (error) {
       const isConflict =
         axios.isAxiosError(error) && error.response?.status === 409;
-      if (isConflict) {
+      const noSeasonsAvailable =
+        axios.isAxiosError(error) && error.response?.status === 202;
+      if (noSeasonsAvailable) {
+        // The edit was not applied. Restore the held seasons rather than leave
+        // an unavailable selection or turn a retry into cancellation.
+        setSelectedSeasons(editingSeasons);
+      }
+      if (isConflict || noSeasonsAvailable) {
         revalidateRequestData({
           mediaType: 'tv',
           tmdbId,
@@ -237,9 +252,12 @@ const TvRequestModal = ({
       }
       addToast(
         <span>
-          {intl.formatMessage(
-            isConflict ? messages.requestconflict : messages.errorediting
-          )}
+          {noSeasonsAvailable
+            ? (error.response?.data?.message ??
+              intl.formatMessage(messages.errorediting))
+            : intl.formatMessage(
+                isConflict ? messages.requestconflict : messages.errorediting
+              )}
         </span>,
         {
           appearance: 'error',
