@@ -1,4 +1,6 @@
 /* eslint-disable react-hooks/exhaustive-deps */
+import Alert from '@app/components/Common/Alert';
+import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import { SmallLoadingSpinner } from '@app/components/Common/LoadingSpinner';
 import SlideCheckbox from '@app/components/Common/SlideCheckbox';
@@ -7,7 +9,6 @@ import {
   getDestinationDefaults,
   type DestinationValues,
 } from '@app/components/RequestModal/AdvancedRequester/state';
-import useToasts from '@app/hooks/useToasts';
 import type { User } from '@app/hooks/useUser';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
@@ -49,6 +50,8 @@ const messages = defineMessages('components.RequestModal.AdvancedRequester', {
   default: '{name} (Default)',
   selectserver: 'Select destination server',
   unavailableserver: 'Unavailable destination (#{id})',
+  overrideruleserror:
+    'Unable to load Override Rules. Retry to finish configuring this request.',
   folder: '{path} ({space})',
   requestas: 'Request As',
   languageprofile: 'Language Profile',
@@ -104,7 +107,6 @@ const AdvancedRequester = ({
   onChange,
 }: AdvancedRequesterProps) => {
   const intl = useIntl();
-  const { addToast } = useToasts();
   const { user: currentUser, hasPermission: currentHasPermission } = useUser();
   const { data, error } = useSWR<ServiceCommonServer[]>(
     `/api/v1/service/${type === 'movie' ? 'radarr' : 'sonarr'}`,
@@ -141,6 +143,8 @@ const AdvancedRequester = ({
   const [configuredServerId, setConfiguredServerId] = useState<number | null>(
     null
   );
+  const [overrideRulesError, setOverrideRulesError] = useState(false);
+  const [rulesRetry, setRulesRetry] = useState(0);
   const [destinationChanged, setDestinationChanged] = useState(false);
   const [manualValues, setManualValues] = useState<DestinationValues>({});
   const initializedServer = useRef<number | null>(null);
@@ -321,6 +325,7 @@ const AdvancedRequester = ({
         applyValues(applyDestinationRules(defaults, {}, protectedValues));
       }
       setConfiguredServerId(null);
+      setOverrideRulesError(false);
 
       try {
         const override = tmdbId
@@ -348,10 +353,7 @@ const AdvancedRequester = ({
         setConfiguredServerId(serverData.server.id);
       } catch {
         if (!cancelled && revision === formRevision.current) {
-          addToast(intl.formatMessage(globalMessages.error), {
-            appearance: 'error',
-            autoDismiss: true,
-          });
+          setOverrideRulesError(true);
         }
       }
     })();
@@ -371,6 +373,7 @@ const AdvancedRequester = ({
     requestId,
     destinationChanged,
     manualValues,
+    rulesRetry,
   ]);
 
   const tierServers =
@@ -398,6 +401,7 @@ const AdvancedRequester = ({
     setDestinationChanged(true);
     setManualValues({});
     setConfiguredServerId(null);
+    setOverrideRulesError(false);
     setSelectedProfile(-1);
     setSelectedFolder('');
     setSelectedLanguage(-1);
@@ -408,11 +412,20 @@ const AdvancedRequester = ({
   const changeValue = (values: DestinationValues) => {
     formRevision.current += 1;
     setConfiguredServerId(null);
+    setOverrideRulesError(false);
     setManualValues((previous) => ({ ...previous, ...values }));
     if (values.profile !== undefined) setSelectedProfile(values.profile);
     if (values.folder !== undefined) setSelectedFolder(values.folder);
     if (values.language !== undefined) setSelectedLanguage(values.language);
     if (values.tags !== undefined) setSelectedTags(values.tags);
+  };
+  const retryOverrideRules = () => {
+    if (!serverData || serverError || isValidating) return;
+
+    formRevision.current += 1;
+    setOverrideRulesError(false);
+    setConfiguredServerId(null);
+    setRulesRetry((previous) => previous + 1);
   };
 
   if (!data && !error) {
@@ -424,6 +437,7 @@ const AdvancedRequester = ({
   }
 
   if (
+    !overrideRulesError &&
     (!data ||
       (selectedServer !== null &&
         tierServers.length < 2 &&
@@ -442,6 +456,23 @@ const AdvancedRequester = ({
       <div className="mb-2 mt-4 flex items-center text-lg font-semibold">
         {intl.formatMessage(messages.advancedoptions)}
       </div>
+      {overrideRulesError && (
+        <div role="alert">
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.overrideruleserror)}
+          >
+            <Button
+              type="button"
+              buttonSize="sm"
+              onClick={retryOverrideRules}
+              disabled={!serverData || !!serverError || isValidating}
+            >
+              {intl.formatMessage(globalMessages.retry)}
+            </Button>
+          </Alert>
+        </div>
+      )}
       <div className="rounded-md">
         {!!data && tierServers.length > 0 && (
           <div className="flex flex-col md:flex-row">
@@ -721,6 +752,7 @@ const AdvancedRequester = ({
               onChange={(value) => {
                 formRevision.current += 1;
                 setConfiguredServerId(null);
+                setOverrideRulesError(false);
                 setIgnoreQuota(false);
                 setSelectedUser(value);
               }}

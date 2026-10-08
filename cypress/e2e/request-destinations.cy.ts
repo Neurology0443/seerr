@@ -1,5 +1,10 @@
 // Runs against the existing Cypress app/database, like movie-details.cy.ts.
 // Arr, request mutations and requestability are stubbed for these UI regressions.
+import type {
+  MovieRequestTarget,
+  TvRequestTarget,
+} from '@server/interfaces/api/requestInterfaces';
+
 const movieId = 438148;
 const tvId = 66732;
 const admin = {
@@ -55,11 +60,47 @@ const pending = (id: number, serverId: number | null) => ({
   seasons: [{ id, seasonNumber: 1, status: 1 }],
 });
 
+const createdRequest = (
+  type: 'movie' | 'tv',
+  serverId: number,
+  seasons: number[] = []
+) => ({
+  ...pending(201, serverId),
+  type,
+  status: 2,
+  profileId: serverId * 10,
+  rootFolder: `/${serverId}`,
+  languageProfileId: type === 'tv' ? serverId * 10 : undefined,
+  tags: [serverId],
+  seasonCount: seasons.length,
+  seasons: seasons.map((number) => ({
+    id: 200 + number,
+    seasonNumber: number,
+    status: 2,
+  })),
+  media: {
+    id: 100,
+    tmdbId: type === 'movie' ? movieId : tvId,
+    mediaType: type,
+    status: 1,
+    status4k: 1,
+  },
+  target: {
+    serverId,
+    name: servers[serverId - 1].name,
+    is4k: false,
+    isIndependent: true,
+    deleted: false,
+    status: 3,
+  },
+});
+
 const visitMedia = (
   type: 'movie' | 'tv',
   requests: ReturnType<typeof pending>[] = [],
   blocklisted = false,
-  independent = false
+  independent = false,
+  targetOverrides?: (MovieRequestTarget | TvRequestTarget)[]
 ) => {
   const id = type === 'movie' ? movieId : tvId;
   const media = {
@@ -123,7 +164,7 @@ const visitMedia = (
           })),
         };
   cy.intercept('GET', `/api/v1/${type}/${id}`, title).as('title');
-  cy.intercept('GET', `/api/v1/${type}/${id}/request-targets`, [
+  const requestTargets = targetOverrides ?? [
     ...servers.map((server) => ({
       serverId: server.id,
       name: server.name,
@@ -148,7 +189,12 @@ const visitMedia = (
       requestable: true,
       seasons: [],
     },
-  ]).as('targets');
+  ];
+  cy.intercept(
+    'GET',
+    `/api/v1/${type}/${id}/request-targets`,
+    requestTargets
+  ).as('targets');
   cy.visit(`/${type}/${id}`);
   cy.wait(['@title', '@targets']);
   if (requests.length > 0) {
@@ -177,7 +223,7 @@ const clickAction = (label: RegExp) => {
   });
 };
 
-describe('PR 5 corrective request interactions', () => {
+describe('Request destinations', () => {
   beforeEach(() => {
     cy.loginAsAdmin();
     cy.intercept('GET', '/api/v1/auth/me', admin);
@@ -296,7 +342,348 @@ describe('PR 5 corrective request interactions', () => {
         expect(request.body.profileId).to.eq(11);
       });
     });
+
+    it(`recovers ${type} creation readiness by explicitly retrying failed Override Rules`, () => {
+      cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+        statusCode: 500,
+        body: { message: 'Rules unavailable' },
+      }).as('failedRules');
+      if (type === 'movie') {
+        // Errors must remain recoverable even when no advanced choices would
+        // ordinarily be displayed (one server, profile, folder and user).
+        cy.intercept('GET', '/api/v1/user?*', { results: [admin] });
+        cy.intercept('GET', '/api/v1/service/radarr', [servers[0]]);
+        cy.intercept('GET', '/api/v1/service/radarr/1', {
+          ...details(1),
+          server: { ...servers[0], activeTags: [] },
+          profiles: [{ id: 10, name: 'Default' }],
+          rootFolders: [{ id: 1, path: '/1' }],
+          languageProfiles: [],
+          tags: [],
+        });
+      }
+      visitMedia(type);
+      clickAction(/^Request$/);
+      if (type === 'tv') {
+        cy.contains('[role="dialog"] tbody tr', 'Season 1')
+          .find('[role="checkbox"]')
+          .click();
+      }
+      cy.wait('@failedRules');
+      cy.contains(
+        '[role="dialog"] [role="alert"]',
+        'Unable to load Override Rules'
+      ).should('be.visible');
+      const submit = type === 'movie' ? /^Request$/ : /^Request 1 Season$/;
+      cy.contains('[role="dialog"] button', submit).should('be.disabled');
+      cy.get('@create.all').should('have.length', 0);
+
+      cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {}).as(
+        'retriedRules'
+      );
+      cy.contains('[role="dialog"] button', /^Retry$/).click();
+      cy.wait('@retriedRules').then(({ request }) => {
+        expect(request.body.serviceId).to.eq(1);
+        expect(request.body.requestUser).to.eq(1);
+      });
+      cy.get('@retriedRules.all').should('have.length', 1);
+      cy.get('[role="dialog"] [role="alert"]').should('not.exist');
+      cy.contains('[role="dialog"] button', submit).should('not.be.disabled');
+    });
+
+    it(`allows an unchanged ${type} edit when Override Rules fail`, () => {
+      cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+        statusCode: 500,
+        body: { message: 'Rules unavailable' },
+      }).as('failedRules');
+      visitMedia(type, [pending(101, 1)]);
+      clickAction(/^View Request — FR$/);
+      cy.wait('@failedRules');
+      cy.contains('[role="dialog"] button', /^Retry$/).should('be.visible');
+      cy.contains('[role="dialog"] button', /^Approve Request$/)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@edit').then(({ request }) => {
+        expect(request.body.profileId).to.eq(11);
+        expect(request.body.rootFolder).to.eq('/custom');
+        expect(request.body.tags).to.deep.eq([]);
+        if (type === 'tv') expect(request.body.languageProfileId).to.eq(31);
+      });
+    });
   }
+
+  it('creates a movie on an eligible independent destination when the default is unavailable', () => {
+    const independentServers = servers.map((server) => ({
+      ...server,
+      independentRequestDestination: true,
+    }));
+    cy.intercept('GET', '/api/v1/service/radarr', independentServers);
+    for (const id of [1, 2]) {
+      cy.intercept('GET', `/api/v1/service/radarr/${id}`, {
+        ...details(id),
+        server: independentServers[id - 1],
+      });
+    }
+    const targets: MovieRequestTarget[] = independentServers.map((server) => ({
+      serverId: server.id,
+      name: server.name,
+      is4k: false,
+      isDefault: server.isDefault,
+      isIndependent: true,
+      status: server.id === 1 ? 5 : 1,
+      requestable: server.id === 2,
+    }));
+    cy.intercept('POST', '/api/v1/request', {
+      statusCode: 201,
+      body: createdRequest('movie', 2),
+    }).as('successfulCreate');
+    visitMedia('movie', [], false, true, targets);
+    clickAction(/^Request$/);
+    cy.get('[role="dialog"] #server').should('have.value', '1');
+    cy.get('[role="dialog"] #profile').should('not.be.disabled');
+    cy.contains('[role="dialog"] button', /^Request$/).should('be.disabled');
+    cy.get('[role="dialog"] #server').select('2');
+    cy.get('[role="dialog"] #profile').should('have.value', '20');
+    cy.get('[role="dialog"] #folder').should('have.value', '/2');
+    cy.contains('[role="dialog"] button', /^Request$/)
+      .should('not.be.disabled')
+      .click();
+    cy.wait('@successfulCreate').then(({ request, response }) => {
+      expect(response?.statusCode).to.eq(201);
+      expect(request.body).to.include({
+        mediaType: 'movie',
+        mediaId: movieId,
+        is4k: false,
+        serverId: 2,
+        profileId: 20,
+        rootFolder: '/2',
+        userId: 1,
+      });
+      expect(request.body.tags).to.deep.eq([2]);
+    });
+    cy.get('[role="dialog"]').should('not.exist');
+    cy.contains('Correction Movie requested successfully!').should(
+      'be.visible'
+    );
+  });
+
+  it('creates TV seasons for the selected independent destination and clears selections when switching', () => {
+    const independentServers = servers.map((server) => ({
+      ...server,
+      independentRequestDestination: true,
+    }));
+    cy.intercept('GET', '/api/v1/service/sonarr', independentServers);
+    for (const id of [1, 2]) {
+      cy.intercept('GET', `/api/v1/service/sonarr/${id}`, {
+        ...details(id),
+        server: independentServers[id - 1],
+      });
+    }
+    const targets: TvRequestTarget[] = independentServers.map((server) => ({
+      serverId: server.id,
+      name: server.name,
+      is4k: false,
+      isDefault: server.isDefault,
+      isIndependent: true,
+      status: server.id === 1 ? 2 : 1,
+      requestable: true,
+      seasons: [1, 2].map((number) => ({
+        seasonNumber: number,
+        status: number === server.id ? 1 : server.id === 1 ? 2 : 5,
+        requestable: number === server.id,
+      })),
+    }));
+    cy.intercept('POST', '/api/v1/request', {
+      statusCode: 201,
+      body: createdRequest('tv', 2, [2]),
+    }).as('successfulCreate');
+    // FR's pending Season 2 must not occupy EN's Season 2 request slot.
+    const frRequest = {
+      ...pending(101, 1),
+      seasons: [{ id: 101, seasonNumber: 2, status: 1 }],
+    };
+    visitMedia('tv', [frRequest], false, true, targets);
+    clickAction(/^Request$/);
+    cy.get('[role="dialog"] #server').should('have.value', '1');
+    cy.contains('[role="dialog"] tbody tr', 'Season 2').should(
+      'contain',
+      'Pending'
+    );
+    cy.contains('[role="dialog"] tbody tr', 'Season 1')
+      .find('[role="checkbox"]')
+      .should('have.attr', 'aria-checked', 'false')
+      .click()
+      .should('have.attr', 'aria-checked', 'true');
+    cy.contains('[role="dialog"] button', /^Request 1 Season$/).should(
+      'not.be.disabled'
+    );
+    cy.get('[role="dialog"] #server').select('2');
+    cy.get('[role="dialog"] #profile')
+      .should('not.be.disabled')
+      .and('have.value', '20');
+    cy.contains('[role="dialog"] tbody tr', 'Season 1').should(
+      'contain',
+      'Available'
+    );
+    cy.contains('[role="dialog"] tbody tr', 'Season 2')
+      .find('[role="checkbox"]')
+      .should('have.attr', 'aria-checked', 'false');
+    cy.contains('[role="dialog"] button', /^Select Season\(s\)$/).should(
+      'be.disabled'
+    );
+    cy.contains('[role="dialog"] tbody tr', 'Season 1')
+      .find('[role="checkbox"]')
+      .click();
+    cy.contains('[role="dialog"] button', /^Select Season\(s\)$/).should(
+      'be.disabled'
+    );
+    cy.contains('[role="dialog"] tbody tr', 'Season 2')
+      .find('[role="checkbox"]')
+      .click();
+    cy.contains('[role="dialog"] button', /^Request 1 Season$/)
+      .should('not.be.disabled')
+      .click();
+    cy.wait('@successfulCreate').then(({ request, response }) => {
+      expect(response?.statusCode).to.eq(201);
+      expect(request.body).to.include({
+        mediaType: 'tv',
+        mediaId: tvId,
+        tvdbId: 123,
+        is4k: false,
+        serverId: 2,
+        profileId: 20,
+        rootFolder: '/2',
+        languageProfileId: 20,
+        userId: 1,
+      });
+      expect(request.body.seasons).to.deep.eq([2]);
+      expect(request.body.tags).to.deep.eq([2]);
+    });
+    cy.get('[role="dialog"]').should('not.exist');
+    cy.contains('Correction Series requested successfully!').should(
+      'be.visible'
+    );
+  });
+
+  it('preserves manual fields across a failed beneficiary rule evaluation and retry', () => {
+    visitMedia('movie');
+    clickAction(/^Request$/);
+    cy.get('#profile').should('not.be.disabled').select('11');
+    cy.get('#folder').should('not.be.disabled').select('/custom');
+    cy.contains('[role="dialog"] button', /^Request$/).should(
+      'not.be.disabled'
+    );
+    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+      statusCode: 500,
+      body: { message: 'Rules unavailable' },
+    }).as('failedRules');
+    cy.contains('[role="dialog"] button', 'Admin').click();
+    cy.contains('[role="option"]', 'Beneficiary').click();
+    cy.wait('@failedRules');
+    cy.contains('[role="dialog"] button', /^Retry$/).should('be.visible');
+    cy.contains('[role="dialog"] button', /^Request$/).should('be.disabled');
+    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+      profileId: 10,
+      rootFolder: '/1',
+      tags: [],
+    }).as('retriedRules');
+    cy.contains('[role="dialog"] button', /^Retry$/).click();
+    cy.wait('@retriedRules').then(({ request }) => {
+      expect(request.body.serviceId).to.eq(1);
+      expect(request.body.requestUser).to.eq(2);
+    });
+    cy.get('#profile').should('not.be.disabled').and('have.value', '11');
+    cy.get('#folder').should('have.value', '/custom');
+    cy.contains('[role="dialog"] button', /^Request$/).should(
+      'not.be.disabled'
+    );
+  });
+
+  it('ignores a stale retry response after destination, beneficiary and manual selection changes', () => {
+    let retryStarted = false;
+    let releaseRetry: (() => void) | undefined;
+    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', (req) => {
+      if (req.body.serviceId === 1) {
+        if (!retryStarted) {
+          req.alias = 'failedRules';
+          req.reply({
+            statusCode: 500,
+            body: { message: 'Rules unavailable' },
+          });
+          return;
+        }
+        req.alias = 'staleRetry';
+        return new Promise<void>((resolve) => {
+          releaseRetry = () => {
+            req.reply({ body: { profileId: 11, rootFolder: '/custom' } });
+            resolve();
+          };
+        });
+      }
+      req.reply({
+        body: {
+          profileId: req.body.requestUser === 2 ? 21 : 20,
+          rootFolder: req.body.requestUser === 2 ? '/custom' : '/2',
+        },
+      });
+    });
+    visitMedia('movie');
+    clickAction(/^Request$/);
+    cy.wait('@failedRules');
+    cy.contains('[role="dialog"] button', /^Retry$/).should('be.visible');
+    cy.then(() => {
+      retryStarted = true;
+    });
+    cy.contains('[role="dialog"] button', /^Retry$/).click();
+    cy.wrap(null).should(() => {
+      expect(releaseRetry).to.be.a('function');
+    });
+    cy.get('#server').select('2');
+    cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+    cy.contains('[role="dialog"] button', 'Admin').click();
+    cy.contains('[role="option"]', 'Beneficiary').click();
+    cy.get('#profile')
+      .should('not.be.disabled')
+      .and('have.value', '21')
+      .select('20');
+    cy.contains('[role="dialog"] button', /^Request$/).should(
+      'not.be.disabled'
+    );
+    cy.then(() => {
+      releaseRetry?.();
+    });
+    cy.wait('@staleRetry');
+    cy.get('#server').should('have.value', '2');
+    cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+    cy.get('#folder').should('have.value', '/custom');
+    cy.contains('[role="dialog"] button', /^Request$/).should(
+      'not.be.disabled'
+    );
+  });
+
+  it('cancels a movie and deletes an empty TV edit when Override Rules fail', () => {
+    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+      statusCode: 500,
+      body: { message: 'Rules unavailable' },
+    }).as('failedRules');
+    visitMedia('movie', [pending(101, 1)]);
+    clickAction(/^View Request — FR$/);
+    cy.wait('@failedRules');
+    cy.contains('[role="dialog"] button', /^Retry$/).should('be.visible');
+    cy.contains('[role="dialog"] button', /^Cancel Request$/)
+      .should('not.be.disabled')
+      .click();
+    cy.wait('@delete').its('request.url').should('include', '/request/101');
+    visitMedia('tv', [pending(102, 1)]);
+    clickAction(/^View Request — FR$/);
+    cy.contains('[role="dialog"] button', /^Retry$/).should('be.visible');
+    cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+    cy.contains('[role="dialog"] button', /^Cancel Request$/)
+      .should('not.be.disabled')
+      .click();
+    cy.wait('@delete').its('request.url').should('include', '/request/102');
+    cy.get('@edit.all').should('have.length', 0);
+  });
 
   it('hides native TV Request More actions when globally blocklisted', () => {
     visitMedia('tv', [], true);
@@ -341,6 +728,7 @@ describe('PR 5 corrective request interactions', () => {
     visitMedia('movie');
     clickAction(/^Request$/);
     cy.contains('[role="dialog"] button', /^Request$/).should('be.disabled');
+    cy.contains('[role="dialog"] button', /^Retry$/).should('not.exist');
     cy.get('@create.all').should('have.length', 0);
   });
 

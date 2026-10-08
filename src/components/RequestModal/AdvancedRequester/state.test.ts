@@ -89,4 +89,15 @@ describe('AdvancedRequester value precedence', () => {
       tags: [2],
     });
   });
+
+  it('applies recovered rules only to fields without manual overrides', () => {
+    assert.deepEqual(
+      applyDestinationRules(
+        getDestinationDefaults(server, false),
+        { profileId: 40, rootFolder: '/recovered-rule', tags: [4] },
+        { profile: 30, tags: [] }
+      ),
+      { profile: 30, folder: '/recovered-rule', language: 11, tags: [] }
+    );
+  });
 });
