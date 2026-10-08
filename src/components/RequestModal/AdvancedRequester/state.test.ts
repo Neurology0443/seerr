@@ -1,10 +1,14 @@
-import type { ServiceCommonServer } from '@server/interfaces/api/serviceInterfaces';
+import type {
+  ServiceCommonServer,
+  ServiceCommonServerWithDetails,
+} from '@server/interfaces/api/serviceInterfaces';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   applyDestinationRules,
   getDestinationDefaults,
   getEditedDestinationValues,
+  validateDestinationSelection,
 } from './state';
 
 const server: ServiceCommonServer = {
@@ -125,6 +129,201 @@ describe('AdvancedRequester value precedence', () => {
     );
     manual = { ...manual, profile: 50, folder: '/new-manual', language: 51 };
     assert.deepEqual(await result, manual);
+  });
+});
+
+describe('current destination selection validation', () => {
+  const metadata: ServiceCommonServerWithDetails = {
+    server,
+    profiles: [{ id: 10, name: 'Default' }],
+    rootFolders: [{ id: 1, path: '/fr' }],
+    languageProfiles: [{ id: 11, name: 'Default' }],
+    tags: [{ id: 1, label: 'Default' }],
+  };
+  const valid = {
+    server: false,
+    profile: false,
+    folder: false,
+    language: false,
+    tags: [],
+  };
+  const selection = {
+    selectedServer: 1,
+    is4k: false,
+    servers: [server],
+    eligibleServers: [server],
+    serverData: metadata,
+    values: getDestinationDefaults(server, false),
+  };
+
+  it('validates defaults and rule results as well as manual and historical values', () => {
+    assert.deepEqual(validateDestinationSelection(selection), valid);
+    for (const values of [
+      { profile: 30, folder: '/missing', language: 31, tags: [1, 9] },
+      applyDestinationRules(
+        getDestinationDefaults(server, false),
+        { profileId: 30, rootFolder: '/missing', tags: [1, 9] },
+        { language: 31 }
+      ),
+      getDestinationDefaults(
+        {
+          ...server,
+          activeProfileId: 30,
+          activeDirectory: '/missing',
+          activeLanguageProfileId: 31,
+          activeTags: [1, 9],
+        },
+        false
+      ),
+    ]) {
+      const preserved = structuredClone(values);
+      assert.deepEqual(validateDestinationSelection({ ...selection, values }), {
+        server: false,
+        profile: true,
+        folder: true,
+        language: true,
+        tags: [9],
+      });
+      assert.deepEqual(values, preserved);
+    }
+  });
+
+  it('preserves absence, sentinel values and explicitly empty tags', () => {
+    for (const values of [
+      {},
+      { profile: null, folder: null, language: null, tags: null },
+      { profile: -1, folder: '', language: -1, tags: [] },
+    ]) {
+      assert.deepEqual(
+        validateDestinationSelection({ ...selection, values }),
+        valid
+      );
+    }
+  });
+
+  it('matches the root folder by exact path rather than ID or prefix', () => {
+    assert.equal(
+      validateDestinationSelection({
+        ...selection,
+        values: { folder: '/fr/extra' },
+      }).folder,
+      true
+    );
+  });
+
+  it('does not infer deleted fields or a deleted server from missing metadata', () => {
+    assert.deepEqual(
+      validateDestinationSelection({
+        selectedServer: 1,
+        is4k: false,
+        values: { profile: 30, folder: '/missing', language: 31, tags: [9] },
+      }),
+      valid
+    );
+  });
+
+  it('uses only the exact selected destination inventory', () => {
+    assert.deepEqual(
+      validateDestinationSelection({
+        ...selection,
+        selectedServer: 2,
+        servers: [{ ...server, id: 2 }],
+        eligibleServers: [{ ...server, id: 2 }],
+        values: { profile: 30, folder: '/missing', language: 31, tags: [9] },
+      }),
+      { ...valid, server: true }
+    );
+  });
+
+  it('rejects deleted and ineligible destinations without replacing their ID', () => {
+    assert.equal(
+      validateDestinationSelection({ ...selection, servers: [] }).server,
+      true
+    );
+    assert.equal(
+      validateDestinationSelection({ ...selection, eligibleServers: [] })
+        .server,
+      true
+    );
+    assert.equal(selection.selectedServer, 1);
+  });
+
+  for (const is4k of [false, true]) {
+    it(`rejects list/detail tier disagreement for ${is4k ? '4K' : 'Standard'}`, () => {
+      const matching = { ...server, is4k };
+      const tierSelection = {
+        ...selection,
+        is4k,
+        servers: [matching],
+        eligibleServers: [matching],
+        serverData: { ...metadata, server: matching },
+      };
+      assert.deepEqual(validateDestinationSelection(tierSelection), valid);
+      assert.equal(
+        validateDestinationSelection({
+          ...tierSelection,
+          servers: [{ ...matching, is4k: !is4k }],
+        }).server,
+        true
+      );
+      assert.equal(
+        validateDestinationSelection({
+          ...tierSelection,
+          serverData: { ...metadata, server: { ...matching, is4k: !is4k } },
+        }).server,
+        true
+      );
+    });
+  }
+
+  it('only validates language profiles when their inventory is applicable', () => {
+    for (const languageProfiles of [undefined, null]) {
+      assert.equal(
+        validateDestinationSelection({
+          ...selection,
+          serverData: {
+            ...metadata,
+            languageProfiles,
+          } as ServiceCommonServerWithDetails,
+          values: { language: 31 },
+        }).language,
+        false
+      );
+    }
+    assert.equal(
+      validateDestinationSelection({
+        ...selection,
+        serverData: { ...metadata, languageProfiles: [] },
+      }).language,
+      true
+    );
+  });
+
+  it('retains invalid tags and recovers after explicit removal or metadata repair', () => {
+    const values = { ...selection.values, tags: [1, 9] };
+    assert.deepEqual(
+      validateDestinationSelection({ ...selection, values }).tags,
+      [9]
+    );
+    assert.deepEqual(values.tags, [1, 9]);
+    assert.deepEqual(
+      validateDestinationSelection({
+        ...selection,
+        values: { ...values, tags: [] },
+      }),
+      valid
+    );
+    assert.deepEqual(
+      validateDestinationSelection({
+        ...selection,
+        values,
+        serverData: {
+          ...metadata,
+          tags: [...metadata.tags, { id: 9, label: 'Restored' }],
+        },
+      }),
+      valid
+    );
   });
 });
 

@@ -7,6 +7,7 @@ import SlideCheckbox from '@app/components/Common/SlideCheckbox';
 import {
   applyDestinationRules,
   getDestinationDefaults,
+  validateDestinationSelection,
   type DestinationValues,
 } from '@app/components/RequestModal/AdvancedRequester/state';
 import type { User } from '@app/hooks/useUser';
@@ -51,6 +52,12 @@ const messages = defineMessages('components.RequestModal.AdvancedRequester', {
   default: '{name} (Default)',
   selectserver: 'Select destination server',
   unavailableserver: 'Unavailable destination (#{id})',
+  invalidserver:
+    'Destination {name} (#{id}) is unavailable or incompatible with this request. Select an eligible destination or correct its configuration.',
+  invalidconfiguration:
+    'Some selected configuration values are unavailable. Choose valid replacements or remove unavailable tags to continue.',
+  unavailablevalue: '{value} (Unavailable)',
+  metadataerror: 'Unable to load destination metadata.',
   overrideruleserror:
     'Unable to load Override Rules. Retry to finish configuring this request.',
   folder: '{path} ({space})',
@@ -74,6 +81,7 @@ export type RequestOverrides = {
   ignoreQuota?: boolean;
   isReady?: boolean;
   hasConfigurationChanges?: boolean;
+  hasInvalidConfiguration?: boolean;
   hasLocalChanges?: boolean;
   manualValues?: DestinationValues;
   destinationChanged?: boolean;
@@ -114,7 +122,11 @@ const AdvancedRequester = ({
 }: AdvancedRequesterProps) => {
   const intl = useIntl();
   const { user: currentUser, hasPermission: currentHasPermission } = useUser();
-  const { data, error } = useSWR<ServiceCommonServer[]>(
+  const {
+    data,
+    error,
+    isValidating: isListValidating,
+  } = useSWR<ServiceCommonServer[]>(
     `/api/v1/service/${type === 'movie' ? 'radarr' : 'sonarr'}`,
     {
       refreshInterval: 0,
@@ -189,11 +201,45 @@ const AdvancedRequester = ({
     loadedServerData?.server.id === selectedServer
       ? loadedServerData
       : undefined;
-  const isConfigurationReady =
+  const tierServers =
+    data?.filter(
+      (server) =>
+        server.is4k === is4k &&
+        (!requestId ||
+          destinationReadOnly ||
+          !server.independentRequestDestination)
+    ) ?? [];
+  const invalid = validateDestinationSelection({
+    selectedServer,
+    is4k,
+    servers: data,
+    eligibleServers: data ? tierServers : undefined,
+    serverData: loadedServerData,
+    values: {
+      profile: selectedProfile,
+      folder: selectedFolder,
+      language: type === 'tv' ? selectedLanguage : undefined,
+      tags: selectedTags,
+    },
+  });
+  const hasInvalidConfiguration =
+    invalid.server ||
+    invalid.profile ||
+    invalid.folder ||
+    invalid.language ||
+    invalid.tags.length > 0;
+  const isConfigurationResolved =
     selectedServer !== null &&
+    !!data &&
+    !!serverData &&
     configuredServerId === selectedServer &&
+    !isListValidating &&
+    !error &&
     !isValidating &&
-    !serverError;
+    !serverError &&
+    !overrideRulesError;
+  const isConfigurationReady =
+    isConfigurationResolved && !hasInvalidConfiguration;
   const original = persistedOverrides.current;
   const usePersistedOverrides =
     !destinationChanged &&
@@ -296,6 +342,7 @@ const AdvancedRequester = ({
       ignoreQuota: isIgnoreQuotaVisible && ignoreQuota ? true : undefined,
       isReady: isConfigurationReady,
       hasConfigurationChanges,
+      hasInvalidConfiguration,
       hasLocalChanges: hasLocalActions || hasConfigurationChanges,
       manualValues,
       destinationChanged,
@@ -311,6 +358,7 @@ const AdvancedRequester = ({
     isIgnoreQuotaVisible,
     isConfigurationReady,
     hasConfigurationChanges,
+    hasInvalidConfiguration,
     hasLocalActions,
     manualValues,
     destinationChanged,
@@ -416,17 +464,8 @@ const AdvancedRequester = ({
     rulesRetry,
   ]);
 
-  const tierServers =
-    data?.filter(
-      (server) =>
-        server.is4k === is4k &&
-        (!requestId ||
-          destinationReadOnly ||
-          !server.independentRequestDestination)
-    ) ?? [];
   const isServerConfigurationLoading =
-    selectedServer !== null &&
-    (isValidating || !serverData || !isConfigurationReady);
+    selectedServer !== null && !isConfigurationResolved;
   const changeServer = (serverId: number) => {
     if (
       disabled ||
@@ -494,6 +533,9 @@ const AdvancedRequester = ({
   }
 
   if (
+    isConfigurationReady &&
+    !error &&
+    !serverError &&
     !overrideRulesError &&
     (!data ||
       (selectedServer !== null &&
@@ -513,6 +555,36 @@ const AdvancedRequester = ({
       <div className="mb-2 mt-4 flex items-center text-lg font-semibold">
         {intl.formatMessage(messages.advancedoptions)}
       </div>
+      {invalid.server && (
+        <div role="alert">
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.invalidserver, {
+              name:
+                data?.find((server) => server.id === selectedServer)?.name ??
+                serverData?.server.name ??
+                '',
+              id: selectedServer,
+            })}
+          />
+        </div>
+      )}
+      {hasInvalidConfiguration && !invalid.server && (
+        <div role="alert">
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.invalidconfiguration)}
+          />
+        </div>
+      )}
+      {(error || serverError) && (
+        <div role="alert">
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.metadataerror)}
+          />
+        </div>
+      )}
       {overrideRulesError && (
         <div role="alert">
           <Alert
@@ -533,11 +605,12 @@ const AdvancedRequester = ({
         </div>
       )}
       <div className="rounded-md">
-        {!!data && tierServers.length > 0 && (
+        {(!!data || selectedServer !== null) && (
           <div className="flex flex-col md:flex-row">
             {!hideDestinationSelector &&
               (tierServers.length > 1 ||
                 selectedServer === null ||
+                invalid.server ||
                 destinationReadOnly) && (
                 <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
                   <label htmlFor="server">
@@ -557,31 +630,38 @@ const AdvancedRequester = ({
                       </option>
                     )}
                     {selectedServer !== null &&
-                      !tierServers.some(
-                        (server) => server.id === selectedServer
-                      ) && (
-                        <option value={selectedServer}>
+                      (invalid.server ||
+                        !tierServers.some(
+                          (server) => server.id === selectedServer
+                        )) && (
+                        <option value={selectedServer} disabled>
                           {intl.formatMessage(messages.unavailableserver, {
                             id: selectedServer,
                           })}
                         </option>
                       )}
-                    {tierServers.map((server) => (
-                      <option
-                        key={`server-list-${server.id}`}
-                        value={server.id}
-                      >
-                        {server.isDefault
-                          ? intl.formatMessage(messages.default, {
-                              name: server.name,
-                            })
-                          : server.name}
-                      </option>
-                    ))}
+                    {tierServers
+                      .filter(
+                        (server) =>
+                          !invalid.server || server.id !== selectedServer
+                      )
+                      .map((server) => (
+                        <option
+                          key={`server-list-${server.id}`}
+                          value={server.id}
+                        >
+                          {server.isDefault
+                            ? intl.formatMessage(messages.default, {
+                                name: server.name,
+                              })
+                            : server.name}
+                        </option>
+                      ))}
                   </select>
                 </div>
               )}
             {(isServerConfigurationLoading ||
+              invalid.profile ||
               !serverData ||
               serverData.profiles.length > 1) && (
               <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
@@ -600,6 +680,13 @@ const AdvancedRequester = ({
                     disabled || isServerConfigurationLoading || !serverData
                   }
                 >
+                  {invalid.profile && (
+                    <option value={selectedProfile} disabled>
+                      {intl.formatMessage(messages.unavailablevalue, {
+                        value: selectedProfile,
+                      })}
+                    </option>
+                  )}
                   {(isServerConfigurationLoading || !serverData) && (
                     <option value="">
                       {intl.formatMessage(globalMessages.loading)}
@@ -636,6 +723,7 @@ const AdvancedRequester = ({
               </div>
             )}
             {(isServerConfigurationLoading ||
+              invalid.folder ||
               !serverData ||
               serverData.rootFolders.length > 1) && (
               <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
@@ -652,6 +740,13 @@ const AdvancedRequester = ({
                     disabled || isServerConfigurationLoading || !serverData
                   }
                 >
+                  {invalid.folder && (
+                    <option value={selectedFolder} disabled>
+                      {intl.formatMessage(messages.unavailablevalue, {
+                        value: selectedFolder,
+                      })}
+                    </option>
+                  )}
                   {(isServerConfigurationLoading || !serverData) && (
                     <option value="">
                       {intl.formatMessage(globalMessages.loading)}
@@ -691,6 +786,7 @@ const AdvancedRequester = ({
             )}
             {type === 'tv' &&
               (isServerConfigurationLoading ||
+                invalid.language ||
                 !serverData ||
                 (serverData.languageProfiles ?? []).length > 1) && (
                 <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
@@ -709,6 +805,13 @@ const AdvancedRequester = ({
                       disabled || isServerConfigurationLoading || !serverData
                     }
                   >
+                    {invalid.language && (
+                      <option value={selectedLanguage} disabled>
+                        {intl.formatMessage(messages.unavailablevalue, {
+                          value: selectedLanguage,
+                        })}
+                      </option>
+                    )}
                     {(isServerConfigurationLoading || !serverData) && (
                       <option value="">
                         {intl.formatMessage(globalMessages.loading)}
@@ -743,6 +846,7 @@ const AdvancedRequester = ({
         )}
         {selectedServer !== null &&
           (isServerConfigurationLoading ||
+            invalid.tags.length > 0 ||
             !serverData ||
             !!serverData?.tags?.length) && (
             <div className="mb-2">
@@ -764,24 +868,20 @@ const AdvancedRequester = ({
                 }
                 className="react-select-container react-select-container-dark"
                 classNamePrefix="react-select"
-                value={
-                  selectedTags
-                    .map((tagId) => {
-                      const foundTag = serverData?.tags.find(
-                        (tag) => tag.id === tagId
-                      );
+                value={selectedTags.map((tagId) => {
+                  const foundTag = serverData?.tags.find(
+                    (tag) => tag.id === tagId
+                  );
 
-                      if (!foundTag) {
-                        return undefined;
-                      }
-
-                      return {
-                        value: foundTag.id,
-                        label: foundTag.label,
-                      };
-                    })
-                    .filter((option) => option !== undefined) as OptionType[]
-                }
+                  return {
+                    value: tagId,
+                    label:
+                      foundTag?.label ??
+                      intl.formatMessage(messages.unavailablevalue, {
+                        value: tagId,
+                      }),
+                  };
+                })}
                 onChange={(value) => {
                   changeValue({ tags: value.map((option) => option.value) });
                 }}

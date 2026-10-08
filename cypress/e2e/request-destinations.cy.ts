@@ -350,6 +350,491 @@ describe('Request destinations', () => {
     cy.intercept('POST', '/api/v1/request/*/decline', {}).as('decline');
   });
 
+  describe('confirmed configuration invalidation', () => {
+    // Keep SWR's deduplication timers controlled across multiple retries.
+    const revalidateMetadata = () => {
+      cy.tick(2000);
+      cy.window().then((win) => {
+        win.dispatchEvent(new win.Event('offline'));
+        win.dispatchEvent(new win.Event('online'));
+      });
+      cy.tick(0);
+    };
+    const creationButton = /^Request(?: 1 Season)?(?: in 4K| 4K)?$/;
+    const openCreation = (type: 'movie' | 'tv', is4k = false) => {
+      visitMedia(type);
+      clickAction(is4k ? /^Request in 4K$/ : /^Request$/);
+      cy.get('#server').should('have.prop', 'value', '1');
+      cy.get('#profile').should('not.be.disabled');
+      if (type === 'tv') {
+        cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+      }
+      cy.contains('[role="dialog"] button', creationButton).should(
+        'not.be.disabled'
+      );
+    };
+    beforeEach(() => {
+      cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+    });
+
+    for (const type of ['movie', 'tv'] as const) {
+      const kind = type === 'movie' ? 'radarr' : 'sonarr';
+      for (const field of [
+        'profile',
+        'folder',
+        ...(type === 'tv' ? ['language'] : []),
+      ]) {
+        it(`preserves an invalid ${type} ${field} and exposes its only replacement`, () => {
+          openCreation(type);
+          const selected =
+            field === 'profile' ? '11' : field === 'folder' ? '/custom' : '31';
+          const replacement = field === 'folder' ? '/1' : '10';
+          cy.get(`#${field}`).select(selected);
+          const refreshed = details(1);
+          if (field === 'profile')
+            refreshed.profiles = refreshed.profiles.slice(0, 1);
+          if (field === 'folder')
+            refreshed.rootFolders = refreshed.rootFolders.slice(0, 1);
+          if (field === 'language')
+            refreshed.languageProfiles = refreshed.languageProfiles.slice(0, 1);
+          cy.intercept('GET', `/api/v1/service/${kind}/1`, refreshed).as(
+            'metadata'
+          );
+          revalidateMetadata();
+          cy.wait('@metadata');
+          cy.get(`#${field}`)
+            .should('be.visible')
+            .and('not.be.disabled')
+            .and('have.prop', 'value', selected);
+          cy.get(`#${field} option:selected`)
+            .should('be.disabled')
+            .and('contain', 'Unavailable');
+          cy.contains('[role="dialog"] button', creationButton).should(
+            'be.disabled'
+          );
+          cy.get('#server').should('have.prop', 'value', '1');
+          cy.get(`#${field}`).select(replacement);
+          cy.contains('[role="dialog"] button', creationButton).should(
+            'not.be.disabled'
+          );
+          cy.get('@create.all').should('have.length', 0);
+        });
+      }
+
+      it(`preserves missing ${type} tags until the user removes them`, () => {
+        openCreation(type);
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, {
+          ...details(1),
+          tags: [],
+        }).as('metadata');
+        revalidateMetadata();
+        cy.wait('@metadata');
+        cy.get('.react-select__multi-value').should(
+          'contain',
+          '1 (Unavailable)'
+        );
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'be.disabled'
+        );
+        cy.get('.react-select__multi-value__remove').click();
+        cy.get('.react-select__multi-value').should('not.exist');
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'not.be.disabled'
+        );
+        cy.get('@rules.all').should((calls) => {
+          const requests = calls as unknown as {
+            request: { body: { tags: number[] } };
+          }[];
+          expect(requests[requests.length - 1].request.body.tags).to.deep.eq(
+            []
+          );
+        });
+      });
+
+      for (const is4k of [false, true]) {
+        it(`blocks a ${type} ${is4k ? '4K to Standard' : 'Standard to 4K'} tier change without retargeting`, () => {
+          const initial = servers.map((server) => ({ ...server, is4k }));
+          cy.intercept('GET', `/api/v1/service/${kind}`, initial);
+          for (const id of [1, 2]) {
+            cy.intercept('GET', `/api/v1/service/${kind}/${id}`, {
+              ...details(id),
+              server: initial[id - 1],
+            });
+          }
+          if (is4k) {
+            cy.request('/api/v1/settings/public').then(({ body }) => {
+              cy.intercept('GET', '/api/v1/settings/public', {
+                ...body,
+                movie4kEnabled: true,
+                series4kEnabled: true,
+                partialRequestsEnabled: true,
+              }).as('tierSettings');
+            });
+            // The targets and service inventories describe the same initial tier.
+            visitMedia(
+              type,
+              [],
+              false,
+              false,
+              initial.map((server) => ({
+                serverId: server.id,
+                name: server.name,
+                is4k,
+                isDefault: server.isDefault,
+                isIndependent: false,
+                status: 1,
+                requestable: true,
+                seasons: [1, 2].map((seasonNumber) => ({
+                  seasonNumber,
+                  status: 1,
+                  requestable: true,
+                })),
+              }))
+            );
+            cy.wait('@tierSettings');
+            cy.tick(0);
+            clickAction(/^Request in 4K$/);
+            cy.get('#profile').should('not.be.disabled');
+            if (type === 'tv')
+              cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+          } else openCreation(type);
+          cy.contains('[role="dialog"] button', creationButton).should(
+            'not.be.disabled'
+          );
+          cy.intercept('GET', `/api/v1/service/${kind}`, [
+            { ...initial[0], is4k: !is4k },
+            initial[1],
+          ]).as('inventory');
+          // Deliberately retain the original detail tier to exercise SWR disagreement.
+          revalidateMetadata();
+          cy.wait('@inventory');
+          cy.contains('[role="alert"]', 'Destination FR (#1)').should(
+            'be.visible'
+          );
+          cy.get('#server').should('be.visible').and('have.prop', 'value', '1');
+          cy.contains('[role="dialog"] button', creationButton).should(
+            'be.disabled'
+          );
+          cy.get('#server').select('2');
+          cy.get('#profile')
+            .should('not.be.disabled')
+            .and('have.prop', 'value', '20');
+          if (type === 'tv') {
+            cy.get('[role="dialog"] tbody [role="checkbox"]')
+              .first()
+              .should('have.attr', 'aria-checked', 'false')
+              .click();
+          }
+          cy.contains('[role="dialog"] button', creationButton).should(
+            'not.be.disabled'
+          );
+        });
+      }
+
+      it(`blocks a deleted ${type} destination and a mismatched detail without replacing it`, () => {
+        openCreation(type);
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, {
+          ...details(1),
+          server: { ...servers[0], is4k: true },
+        }).as('metadata');
+        revalidateMetadata();
+        cy.wait('@metadata');
+        cy.get('#server').should('have.prop', 'value', '1');
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'be.disabled'
+        );
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, details(1));
+        cy.intercept('GET', `/api/v1/service/${kind}`, [servers[1]]).as(
+          'inventory'
+        );
+        revalidateMetadata();
+        cy.wait('@inventory');
+        cy.get('#server option:selected')
+          .should('be.disabled')
+          .and('contain', '#1');
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'be.disabled'
+        );
+        cy.get('#server').select('2');
+        cy.get('#profile')
+          .should('not.be.disabled')
+          .and('have.prop', 'value', '20');
+      });
+
+      it(`keeps ${type} manual values through loading, failure and confirmed recovery`, () => {
+        openCreation(type);
+        cy.get('#profile').select('11');
+        cy.get('#folder').select('/custom');
+        let release: (() => void) | undefined;
+        cy.intercept(
+          'GET',
+          `/api/v1/service/${kind}/1`,
+          (req) =>
+            new Promise<void>((resolve) => {
+              release = () => {
+                req.reply({ statusCode: 500 });
+                resolve();
+              };
+            })
+        ).as('failure');
+        revalidateMetadata();
+        cy.wrap(null).should(() => expect(release).to.be.a('function'));
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'be.disabled'
+        );
+        cy.then(() => release?.());
+        cy.wait('@failure');
+        cy.contains(
+          '[role="alert"]',
+          'Unable to load destination metadata.'
+        ).should('be.visible');
+        cy.contains('[role="alert"]', 'Some selected configuration').should(
+          'not.exist'
+        );
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, details(1)).as(
+          'recovery'
+        );
+        revalidateMetadata();
+        cy.wait('@recovery');
+        cy.get('#profile')
+          .should('not.be.disabled')
+          .and('have.prop', 'value', '11');
+        cy.get('#folder').should('have.prop', 'value', '/custom');
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'not.be.disabled'
+        );
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, {
+          ...details(1),
+          profiles: details(1).profiles.slice(0, 1),
+        }).as('removed');
+        revalidateMetadata();
+        cy.wait('@removed');
+        cy.get('#profile').should('have.prop', 'value', '11');
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'be.disabled'
+        );
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, details(1)).as(
+          'restored'
+        );
+        revalidateMetadata();
+        cy.wait('@restored');
+        cy.get('#profile')
+          .should('not.be.disabled')
+          .and('have.prop', 'value', '11');
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'not.be.disabled'
+        );
+      });
+
+      it(`blocks confirmed invalid historical ${type} fields and preserves conditional editing`, () => {
+        visitMedia(type, [pending(101, 1)]);
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile').should('not.be.disabled');
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, {
+          ...details(1),
+          profiles: details(1).profiles.slice(0, 1),
+          rootFolders: details(1).rootFolders.slice(0, 1),
+        }).as('metadata');
+        revalidateMetadata();
+        cy.wait('@metadata');
+        cy.get('#profile')
+          .should('have.prop', 'value', '11')
+          .and('not.be.disabled');
+        cy.get('#folder').should('have.prop', 'value', '/custom');
+        cy.contains(
+          '[role="dialog"] button',
+          /^Approve Request$|^Edit Request$/
+        ).should('be.disabled');
+        cy.get('#profile').select('10');
+        cy.contains(
+          '[role="dialog"] button',
+          /^Approve Request$|^Edit Request$/
+        ).should('be.disabled');
+        cy.get('#folder').select('/1');
+        cy.contains(
+          '[role="dialog"] button',
+          /^Approve Request$|^Edit Request$/
+        )
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@edit').then(({ request }) => {
+          expect(request.headers['if-match']).to.eq('"revision-101"');
+          expect(request.body.serverId).to.eq(1);
+          expect(request.body.profileId).to.eq(10);
+          expect(request.body.rootFolder).to.eq('/1');
+          if (type === 'tv') expect(request.body.seasons).to.deep.eq([1]);
+        });
+      });
+
+      it(`keeps cancellation available for an invalid ${type} configuration`, () => {
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, {
+          ...details(1),
+          profiles: details(1).profiles.slice(0, 1),
+        });
+        visitMedia(type, [pending(101, 1)]);
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile')
+          .should('not.be.disabled')
+          .and('have.prop', 'value', '11');
+        cy.contains(
+          '[role="dialog"] button',
+          /^Approve Request$|^Edit Request$/
+        ).should('be.disabled');
+        if (type === 'tv')
+          cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+        cy.contains('[role="dialog"] button', /^Cancel Request$/)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@delete');
+        cy.get('@edit.all').should('have.length', 0);
+      });
+
+      it(`blocks a confirmed missing unresolved ${type} destination while allowing cancellation`, () => {
+        cy.intercept('GET', `/api/v1/service/${kind}/99`, { statusCode: 404 });
+        visitMedia(type, [pending(101, 99)]);
+        clickAction(/^View Request — Request #101$/);
+        cy.contains('[role="alert"]', '(#99)').should('be.visible');
+        cy.get('#server').should('be.disabled').and('have.prop', 'value', '99');
+        cy.contains('[role="dialog"] button', /^Approve Request$/).should(
+          'be.disabled'
+        );
+        if (type === 'tv')
+          cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+        cy.contains('[role="dialog"] button', /^Cancel Request$/)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@delete');
+        cy.get('@edit.all').should('have.length', 0);
+      });
+
+      for (const independent of [false, true]) {
+        it(`keeps an invalid ${independent ? 'immutable independent' : 'newly ineligible native'} ${type} edit destination`, () => {
+          visitMedia(type, [pending(101, 1)], false, independent);
+          clickAction(/^View Request — FR$/);
+          cy.get('#profile').should('not.be.disabled');
+          cy.intercept('GET', `/api/v1/service/${kind}`, [
+            {
+              ...servers[0],
+              independentRequestDestination: true,
+              is4k: independent,
+            },
+            servers[1],
+          ]).as('inventory');
+          revalidateMetadata();
+          cy.wait('@inventory');
+          cy.contains('[role="alert"]', 'Destination FR (#1)').should(
+            'be.visible'
+          );
+          cy.get('#server')
+            .should('have.prop', 'value', '1')
+            .and(independent ? 'be.disabled' : 'not.be.disabled');
+          cy.contains(
+            '[role="dialog"] button',
+            /^Approve Request$|^Edit Request$/
+          ).should('be.disabled');
+          if (!independent) {
+            cy.get('#server').select('2');
+            cy.get('#profile')
+              .should('not.be.disabled')
+              .and('have.prop', 'value', '20');
+            cy.contains(
+              '[role="dialog"] button',
+              /^Approve Request$|^Edit Request$/
+            ).should('not.be.disabled');
+          }
+        });
+      }
+    }
+
+    for (const languageProfiles of [undefined, null]) {
+      it(`accepts Sonarr v4 with ${String(languageProfiles)} language metadata`, () => {
+        cy.intercept('GET', '/api/v1/service/sonarr/1', {
+          ...details(1),
+          languageProfiles,
+        });
+        openCreation('tv');
+        cy.get('#language').should('not.exist');
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'not.be.disabled'
+        );
+      });
+    }
+
+    it('exposes invalid fields even when every valid selector would otherwise be hidden', () => {
+      cy.intercept('GET', '/api/v1/user?*', { results: [admin] });
+      cy.intercept('GET', '/api/v1/service/radarr', [servers[0]]);
+      cy.intercept('GET', '/api/v1/service/radarr/1', {
+        ...details(1),
+        server: { ...servers[0], activeTags: [] },
+        profiles: details(1).profiles.slice(0, 1),
+        rootFolders: details(1).rootFolders.slice(0, 1),
+        languageProfiles: undefined,
+        tags: [],
+      });
+      visitMedia('movie', [pending(101, 1)]);
+      clickAction(/^View Request — FR$/);
+      cy.contains(
+        '[role="alert"]',
+        'Some selected configuration values are unavailable'
+      ).should('be.visible');
+      cy.get('#profile')
+        .should('be.visible')
+        .and('not.be.disabled')
+        .and('have.prop', 'value', '11');
+      cy.get('#folder')
+        .should('be.visible')
+        .and('not.be.disabled')
+        .and('have.prop', 'value', '/custom');
+      cy.contains('[role="dialog"] button', /^Approve Request$/).should(
+        'be.disabled'
+      );
+      cy.get('#profile').select('10');
+      cy.get('#folder').select('/1');
+      cy.get('#profile').should('not.exist');
+      cy.get('#folder').should('not.exist');
+      cy.contains('[role="dialog"] button', /^Approve Request$/).should(
+        'not.be.disabled'
+      );
+    });
+
+    it('keeps a deleted destination identifiable and blocked when no replacement exists', () => {
+      openCreation('movie');
+      cy.intercept('GET', '/api/v1/service/radarr', []).as('inventory');
+      revalidateMetadata();
+      cy.wait('@inventory');
+      cy.contains('[role="alert"]', 'Destination FR (#1)').should('be.visible');
+      cy.get('#server').should('have.prop', 'value', '1');
+      cy.get('#server option').should('have.length', 1).and('be.disabled');
+      cy.contains('[role="dialog"] button', creationButton).should(
+        'be.disabled'
+      );
+    });
+
+    it('validates resolved defaults and Override Rules without silently replacing them', () => {
+      cy.intercept('GET', '/api/v1/service/radarr/1', {
+        ...details(1),
+        server: { ...servers[0], activeProfileId: 99 },
+      });
+      cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+        rootFolder: '/removed-rule-folder',
+      });
+      visitMedia('movie');
+      clickAction(/^Request$/);
+      cy.get('#profile')
+        .should('not.be.disabled')
+        .and('have.prop', 'value', '99');
+      cy.get('#folder').should('have.prop', 'value', '/removed-rule-folder');
+      cy.contains('[role="dialog"] button', creationButton).should(
+        'be.disabled'
+      );
+      cy.get('#profile').select('10');
+      cy.get('#folder').select('/1');
+      cy.contains('[role="dialog"] button', creationButton).should(
+        'not.be.disabled'
+      );
+    });
+  });
+
   for (const operation of ['approval', 'cancellation'] as const) {
     it(
       `ignores an obsolete successful ${operation} after reopening`,
@@ -1137,8 +1622,16 @@ describe('Request destinations', () => {
     });
 
     it(`does not retarget unresolved ${type} requests or require Arr for an unchanged edit`, () => {
+      // A successful inventory excluding #99 now confirms an invalid target.
+      // This regression covers unavailable metadata without such confirmation.
+      const kind = type === 'movie' ? 'radarr' : 'sonarr';
+      cy.intercept('GET', `/api/v1/service/${kind}`, { statusCode: 500 }).as(
+        'unavailableInventory'
+      );
+      cy.intercept('GET', `/api/v1/service/${kind}/99`, { statusCode: 500 });
       visitMedia(type, [pending(101, 99)]);
       clickAction(/^View Request — Request #101$/);
+      cy.wait('@unavailableInventory');
       cy.contains('[role="dialog"] button', /^Approve Request$/)
         .should('not.be.disabled')
         .click();

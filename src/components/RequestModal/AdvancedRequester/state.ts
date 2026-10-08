@@ -1,4 +1,7 @@
-import type { ServiceCommonServer } from '@server/interfaces/api/serviceInterfaces';
+import type {
+  ServiceCommonServer,
+  ServiceCommonServerWithDetails,
+} from '@server/interfaces/api/serviceInterfaces';
 import type { OverrideRulesResult } from '@server/lib/overrideRules';
 
 export type DestinationValues = {
@@ -10,6 +13,71 @@ export type DestinationValues = {
 
 type PersistedDestinationValues = {
   [Field in keyof DestinationValues]: DestinationValues[Field] | null;
+};
+
+export type InvalidDestinationSelection = {
+  server: boolean;
+  profile: boolean;
+  folder: boolean;
+  language: boolean;
+  tags: number[];
+};
+
+// Undefined metadata cannot confirm invalidity. Cached successful inventories
+// still describe known-invalid selections during a retry or network failure.
+// Only the exact destination's inventory may validate its configuration.
+export const validateDestinationSelection = ({
+  selectedServer,
+  is4k,
+  servers,
+  eligibleServers,
+  serverData,
+  values,
+}: {
+  selectedServer: number | null;
+  is4k: boolean;
+  servers?: ServiceCommonServer[];
+  eligibleServers?: ServiceCommonServer[];
+  serverData?: ServiceCommonServerWithDetails;
+  values: PersistedDestinationValues;
+}): InvalidDestinationSelection => {
+  const exactMetadata =
+    serverData?.server.id === selectedServer ? serverData : undefined;
+  const selected = servers?.find((server) => server.id === selectedServer);
+
+  return {
+    server:
+      selectedServer !== null &&
+      ((servers !== undefined && (!selected || selected.is4k !== is4k)) ||
+        (eligibleServers !== undefined &&
+          !eligibleServers.some((server) => server.id === selectedServer)) ||
+        (serverData !== undefined &&
+          (!exactMetadata || exactMetadata.server.is4k !== is4k))),
+    profile:
+      !!exactMetadata &&
+      values.profile != null &&
+      values.profile >= 0 &&
+      !exactMetadata.profiles.some((profile) => profile.id === values.profile),
+    folder:
+      !!exactMetadata &&
+      values.folder != null &&
+      values.folder !== '' &&
+      !exactMetadata.rootFolders.some(
+        (folder) => folder.path === values.folder
+      ),
+    language:
+      !!exactMetadata?.languageProfiles &&
+      values.language != null &&
+      values.language >= 0 &&
+      !exactMetadata.languageProfiles.some(
+        (profile) => profile.id === values.language
+      ),
+    tags: exactMetadata
+      ? (values.tags ?? []).filter(
+          (id) => !exactMetadata.tags.some((tag) => tag.id === id)
+        )
+      : [],
+  };
 };
 
 // Display defaults and rule results are not persisted overrides. PUT assigns
