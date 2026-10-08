@@ -19,6 +19,8 @@ export type RequestEditState = Pick<
 
 // Fixed field order and canonical DB nulls make this independent of timestamps
 // and entity/object identity. Empty tags intentionally differ from null tags.
+// This fingerprints current editable state, not write history: A -> B -> A
+// returns the original token when the final semantic state is identical.
 export const getRequestEditRevision = (request: RequestEditState): string =>
   createHash('sha256')
     .update(

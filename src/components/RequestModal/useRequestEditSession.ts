@@ -1,6 +1,6 @@
 import { MediaRequestStatus } from '@server/constants/media';
 import type { RequestDetailResponse } from '@server/interfaces/api/requestInterfaces';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
 
 // Shared only by the movie/TV request editors. A list or cached detail object
@@ -8,14 +8,26 @@ import useSWR from 'swr';
 export const useRequestEditSession = (
   requestId: number | undefined,
   dirty: boolean,
-  onAccept: (request: RequestDetailResponse) => void
+  onAccept: (request: RequestDetailResponse) => void,
+  isSessionActive?: () => boolean
 ) => {
   const [accepted, setAccepted] = useState<RequestDetailResponse>();
   const [confirmed, setConfirmed] = useState(false);
   const [conflicted, setConflicted] = useState(false);
   const [initialError, setInitialError] = useState<unknown>();
-  const callbacks = useRef({ dirty, onAccept });
-  callbacks.current = { dirty, onAccept };
+  const mounted = useRef(true);
+  const callbacks = useRef({ dirty, onAccept, isSessionActive });
+  callbacks.current = { dirty, onAccept, isSessionActive };
+  const isActive = useCallback(
+    () => mounted.current && (callbacks.current.isSessionActive?.() ?? true),
+    []
+  );
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const { data, error, mutate } = useSWR<RequestDetailResponse>(
     requestId === undefined ? null : `/api/v1/request/${requestId}`,
     { revalidateOnMount: true }
@@ -32,7 +44,7 @@ export const useRequestEditSession = (
       // subscriber already populated/deduplicated the detail cache.
       void mutate().then(
         (request) => {
-          if (!active) return;
+          if (!active || !isActive()) return;
           if (!request || request.id !== requestId || !request.editRevision) {
             setInitialError(new Error('Unable to retrieve request.'));
             return;
@@ -42,17 +54,18 @@ export const useRequestEditSession = (
           setConfirmed(true);
         },
         (error: unknown) => {
-          if (active) setInitialError(error);
+          if (active && isActive()) setInitialError(error);
         }
       );
     }
     return () => {
       active = false;
     };
-  }, [requestId, mutate]);
+  }, [requestId, mutate, isActive]);
 
   useEffect(() => {
     if (
+      !isActive() ||
       !confirmed ||
       conflicted ||
       !accepted ||
@@ -68,12 +81,13 @@ export const useRequestEditSession = (
       callbacks.current.onAccept(data);
       setAccepted(data);
     }
-  }, [data, accepted, confirmed, conflicted, requestId]);
+  }, [data, accepted, confirmed, conflicted, requestId, isActive]);
 
   return {
     request: accepted?.id === requestId ? accepted : undefined,
     error: (initialError ?? error) as unknown,
     conflicted,
+    isActive,
     blockConflict: () => setConflicted(true),
     blocked:
       !confirmed ||

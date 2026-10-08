@@ -75,6 +75,20 @@ describe('request edit revision', () => {
     });
   }
 
+  it('restores the original token after A -> B -> A, allowing the identical current state', () => {
+    const request = state();
+    const accepted = getRequestEditRevision(request);
+    const originalFolder = request.rootFolder;
+    request.rootFolder = '/other';
+    assert.notEqual(getRequestEditRevision(request), accepted);
+    assert.equal(matchesExpectedEditRevision(`"${accepted}"`, request), false);
+    request.rootFolder = originalFolder;
+    request.updatedAt = new Date('2026-10-08T00:02:00Z');
+    request.seasons.reverse();
+    assert.equal(getRequestEditRevision(request), accepted);
+    assert.ok(matchesExpectedEditRevision(`"${accepted}"`, request));
+  });
+
   it('normalizes nullable values without collapsing empty tags', () => {
     const request = state();
     const nullable = { ...request, tags: null } as unknown as MediaRequest;

@@ -5,7 +5,7 @@ import { Transition } from '@headlessui/react';
 import type { MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 interface RequestModalProps {
   show: boolean;
@@ -35,6 +35,17 @@ const RequestModal = ({
     setSession({ open: show, number: session.number + (show ? 1 : 0) });
   }
   const editorKey = editRequest ? `${editRequest.id}:${session.number}` : 'new';
+  const sessionKey = `${type}:${tmdbId}:${editorKey}`;
+  const activeSession = useRef<string | undefined>(undefined);
+  // Invalidate immediately on close, including Transition's leave interval.
+  activeSession.current = show ? sessionKey : undefined;
+  const isEditSessionActive = () => activeSession.current === sessionKey;
+  const completeEdit: typeof onComplete = (status) => {
+    if (isEditSessionActive()) onComplete?.(status);
+  };
+  const updateEdit: typeof onUpdating = (updating) => {
+    if (isEditSessionActive()) onUpdating?.(updating);
+  };
   return (
     <Transition
       as="div"
@@ -48,21 +59,23 @@ const RequestModal = ({
     >
       {type === 'movie' ? (
         <MovieRequestModal
-          key={editorKey}
-          onComplete={onComplete}
+          key={editRequest ? sessionKey : editorKey}
+          onComplete={editRequest ? completeEdit : onComplete}
           onCancel={onCancel}
           tmdbId={tmdbId}
-          onUpdating={onUpdating}
+          onUpdating={editRequest ? updateEdit : onUpdating}
+          isEditSessionActive={isEditSessionActive}
           is4k={is4k}
           editRequest={editRequest}
         />
       ) : type === 'tv' ? (
         <TvRequestModal
-          key={editorKey}
-          onComplete={onComplete}
+          key={editRequest ? sessionKey : editorKey}
+          onComplete={editRequest ? completeEdit : onComplete}
           onCancel={onCancel}
           tmdbId={tmdbId}
-          onUpdating={onUpdating}
+          onUpdating={editRequest ? updateEdit : onUpdating}
+          isEditSessionActive={isEditSessionActive}
           is4k={is4k}
           editRequest={editRequest}
         />

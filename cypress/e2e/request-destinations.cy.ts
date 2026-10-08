@@ -240,6 +240,49 @@ const refreshEditCaches = () => {
   cy.clock().then((clock) => clock.restore());
 };
 
+// Custom controls must reject activation themselves; fieldset disabling alone
+// does not protect their click and keyboard handlers.
+const expectLockedEditControls = (type: 'movie' | 'tv') => {
+  for (const id of [
+    'server',
+    'profile',
+    'folder',
+    ...(type === 'tv' ? ['language'] : []),
+  ]) {
+    cy.get(`#${id}`)
+      .should('be.disabled')
+      .trigger('mousedown', { force: true })
+      .trigger('keydown', { key: 'ArrowDown', force: true });
+  }
+  cy.get('.react-select__control')
+    .should('have.class', 'react-select__control--is-disabled')
+    .click({ force: true })
+    .trigger('keydown', { key: 'ArrowDown', force: true });
+  cy.get('.react-select__menu').should('not.exist');
+  cy.contains('[role="dialog"] button', 'Admin')
+    .should('be.disabled')
+    .click({ force: true })
+    .trigger('keydown', { key: 'ArrowDown', force: true });
+  cy.get('[role="option"]').should('not.exist');
+  if (type === 'tv') {
+    cy.contains('[role="dialog"] label', 'Bypass User Quota')
+      .parent()
+      .find('[role="checkbox"]')
+      .should('have.attr', 'aria-disabled', 'true')
+      .and('have.attr', 'aria-checked', 'false')
+      .click({ force: true })
+      .trigger('keydown', { key: 'Enter', force: true })
+      .trigger('keydown', { key: ' ', force: true })
+      .should('have.attr', 'aria-checked', 'false');
+  }
+  cy.get('#server').should('have.value', '1');
+  cy.get('#profile').should('have.value', '10');
+  cy.get('#folder').should('have.value', '/custom');
+  if (type === 'tv') cy.get('#language').should('have.value', '31');
+  cy.get('.react-select__multi-value').should('not.exist');
+  cy.contains('[role="dialog"] button', 'Admin').should('be.visible');
+};
+
 describe('Request destinations', () => {
   beforeEach(() => {
     cy.loginAsAdmin();
@@ -284,7 +327,219 @@ describe('Request destinations', () => {
     cy.intercept('POST', '/api/v1/request/*/decline', {}).as('decline');
   });
 
+  for (const operation of ['approval', 'cancellation'] as const) {
+    it(
+      `ignores an obsolete successful ${operation} after reopening`,
+      { defaultCommandTimeout: 15000 },
+      () => {
+        const type = operation === 'approval' ? 'tv' : 'movie';
+        let release: (() => void) | undefined;
+        cy.intercept(
+          operation === 'approval' ? 'POST' : 'DELETE',
+          operation === 'approval'
+            ? '/api/v1/request/101/approve'
+            : '/api/v1/request/101',
+          (req) =>
+            new Promise<void>((resolve) => {
+              release = () => {
+                req.reply({
+                  statusCode: operation === 'approval' ? 200 : 204,
+                  body: {},
+                });
+                resolve();
+              };
+            })
+        ).as('oldMutation');
+        visitMedia(type, [pending(101, 1)]);
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile').should('have.value', '11');
+        cy.contains(
+          '[role="dialog"] button',
+          operation === 'approval' ? /^Approve Request$/ : /^Cancel Request$/
+        ).click();
+        cy.wrap(null).should(() => expect(release).to.be.a('function'));
+        cy.contains('[role="dialog"] button', /^Close$/).click();
+        cy.get('[role="dialog"]').should('not.exist');
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile').select('10');
+        cy.intercept('GET', '/api/v1/request/101', {
+          ...pending(101, 1),
+          type,
+        }).as('afterOldMutation');
+        cy.then(() => release?.());
+        cy.wait('@oldMutation');
+        cy.wait('@afterOldMutation');
+        cy.get('[role="dialog"]').should('be.visible');
+        cy.get('#profile').should('have.value', '10');
+        cy.contains('[role="dialog"] button', /^Approve Request$/).should(
+          'not.be.disabled'
+        );
+        cy.contains(
+          /Request for Correction (Movie|Series) (approved|canceled|cancelled)/
+        ).should('not.exist');
+      }
+    );
+  }
+
   for (const type of ['movie', 'tv'] as const) {
+    for (const outcome of ['success', 'error'] as const) {
+      it(
+        `isolates a reopened ${type} editor from an obsolete PUT ${outcome}`,
+        { defaultCommandTimeout: 15000 },
+        () => {
+          let release: (() => void) | undefined;
+          let releaseCurrent: (() => void) | undefined;
+          const submitAgain = type === 'tv' && outcome === 'error';
+          cy.intercept(
+            'PUT',
+            '/api/v1/request/101',
+            (req) =>
+              new Promise<void>((resolve) => {
+                release = () => {
+                  req.reply(
+                    outcome === 'success'
+                      ? {
+                          statusCode: 200,
+                          body: {
+                            ...pending(101, 1),
+                            editRevision: 'old-saved',
+                          },
+                        }
+                      : { statusCode: 409, body: { message: 'Old conflict' } }
+                  );
+                  resolve();
+                };
+              })
+          ).as('oldEdit');
+          visitMedia(type, [pending(101, 1)]);
+          clickAction(/^View Request — FR$/);
+          cy.get('#profile').select('10');
+          cy.contains('[role="dialog"] button', /^Approve Request$/).click();
+          cy.wrap(null).should(() => expect(release).to.be.a('function'));
+          cy.contains('[role="dialog"] button', /^Close$/).click();
+          cy.get('[role="dialog"]').should('not.exist');
+          clickAction(/^View Request — FR$/);
+          cy.get('#profile').should('have.value', '11').select('10');
+          cy.get('#folder').select('/1');
+          if (submitAgain) {
+            cy.intercept(
+              'PUT',
+              '/api/v1/request/101',
+              (req) =>
+                new Promise<void>((resolve) => {
+                  releaseCurrent = () => {
+                    req.reply({
+                      statusCode: 500,
+                      body: { message: 'Current failure' },
+                    });
+                    resolve();
+                  };
+                })
+            ).as('currentEdit');
+            cy.contains('[role="dialog"] button', /^Approve Request$/).click();
+            cy.wrap(null).should(() =>
+              expect(releaseCurrent).to.be.a('function')
+            );
+          }
+          // The old server operation remains real and must still revalidate caches.
+          cy.intercept('GET', '/api/v1/request/101', {
+            ...pending(101, 1),
+            type,
+          }).as('afterOldMutation');
+          cy.then(() => release?.());
+          cy.wait('@oldEdit');
+          cy.wait('@afterOldMutation');
+          cy.get('[role="dialog"]').should('be.visible');
+          cy.get('#profile').should('have.value', '10');
+          cy.get('#folder').should('have.value', '/1');
+          cy.contains('[role="dialog"] button', /^Approve Request$/).should(
+            submitAgain ? 'be.disabled' : 'not.be.disabled'
+          );
+          cy.get('@approve.all').should(
+            'have.length',
+            outcome === 'success' ? 1 : 0
+          );
+          if (outcome === 'success')
+            cy.get('@approve')
+              .its('request.headers.if-match')
+              .should('eq', '"old-saved"');
+          cy.contains('This request changed while you were editing.').should(
+            'not.exist'
+          );
+          cy.contains(
+            /Request for Correction (Movie|Series) (edited successfully|approved)/
+          ).should('not.exist');
+          if (submitAgain) {
+            cy.get('#profile').should('be.disabled');
+            cy.then(() => releaseCurrent?.());
+            cy.wait('@currentEdit');
+            cy.get('#profile')
+              .should('not.be.disabled')
+              .and('have.value', '10');
+          }
+        }
+      );
+    }
+
+    it(
+      `disables every ${type} edit control during submission and restores them after failure`,
+      { defaultCommandTimeout: 15000 },
+      () => {
+        let release: (() => void) | undefined;
+        cy.intercept('GET', '/api/v1/user/*/quota', {
+          movie: { limit: 10, remaining: 10, restricted: false },
+          tv: { limit: 10, remaining: 10, restricted: false },
+        });
+        cy.intercept(
+          'PUT',
+          '/api/v1/request/101',
+          (req) =>
+            new Promise<void>((resolve) => {
+              release = () => {
+                req.reply({
+                  statusCode: 500,
+                  body: { message: 'Retryable failure' },
+                });
+                resolve();
+              };
+            })
+        ).as('failedEdit');
+        visitMedia(type, [pending(101, 1)]);
+        clickAction(/^View Request — FR$/);
+        cy.get('#profile').select('10');
+        cy.contains('[role="dialog"] button', /^Approve Request$/).click();
+        cy.wrap(null).should(() => expect(release).to.be.a('function'));
+        expectLockedEditControls(type);
+        cy.then(() => release?.());
+        cy.wait('@failedEdit');
+        cy.get('#server').should('not.be.disabled');
+        cy.get('#profile').should('not.be.disabled').select('11');
+        cy.get('#folder').should('not.be.disabled').select('/1');
+        if (type === 'tv') {
+          cy.get('#language').should('not.be.disabled').select('10');
+          cy.contains('[role="dialog"] label', 'Bypass User Quota')
+            .parent()
+            .find('[role="checkbox"]')
+            .should('have.attr', 'aria-disabled', 'false')
+            .focus()
+            .trigger('keydown', { key: ' ' })
+            .should('have.attr', 'aria-checked', 'true')
+            .trigger('keydown', { key: 'Enter' })
+            .should('have.attr', 'aria-checked', 'false');
+        }
+        cy.get('.react-select__input-container input').type('Tag');
+        cy.contains('[role="option"]', 'Tag 1').click();
+        cy.contains('.react-select__multi-value', 'Tag 1').should('be.visible');
+        cy.contains('[role="dialog"] button', 'Admin')
+          .should('not.be.disabled')
+          .click();
+        cy.contains('[role="option"]', 'Beneficiary').click();
+        cy.contains('[role="dialog"] button', 'Beneficiary').should(
+          'be.visible'
+        );
+      }
+    );
+
     it(`blocks ${type} editing when initial detail revalidation fails`, () => {
       visitMedia(type, [pending(101, 1)]);
       cy.intercept('GET', '/api/v1/request/101', {
@@ -376,6 +631,10 @@ describe('Request destinations', () => {
     });
 
     it(`preserves dirty ${type} choices and blocks all submissions on a remote revision`, () => {
+      cy.intercept('GET', '/api/v1/user/*/quota', {
+        movie: { limit: 10, remaining: 10, restricted: false },
+        tv: { limit: 10, remaining: 10, restricted: false },
+      });
       cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
       visitMedia(type, [pending(101, 1)]);
       clickAction(/^View Request — FR$/);
@@ -391,6 +650,7 @@ describe('Request destinations', () => {
       cy.contains('[role="dialog"]', 'Close and reopen the editor').should(
         'be.visible'
       );
+      expectLockedEditControls(type);
       cy.get('#profile').should('have.value', '10');
       cy.get('#server').should('have.value', '1');
       cy.contains('[role="dialog"] button', /^Approve Request$/).should(

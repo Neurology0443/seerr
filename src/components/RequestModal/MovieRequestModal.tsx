@@ -63,6 +63,7 @@ interface RequestModalProps extends React.HTMLAttributes<HTMLDivElement> {
   onCancel?: () => void;
   onComplete?: (newStatus?: MediaStatus) => void;
   onUpdating?: (isUpdating: boolean) => void;
+  isEditSessionActive?: () => boolean;
 }
 
 const MovieRequestModal = ({
@@ -71,6 +72,7 @@ const MovieRequestModal = ({
   tmdbId,
   onUpdating,
   editRequest: requestToEdit,
+  isEditSessionActive,
   is4k = false,
 }: RequestModalProps) => {
   const [isUpdating, setIsUpdating] = useState(false);
@@ -79,9 +81,11 @@ const MovieRequestModal = ({
   const editSession = useRequestEditSession(
     requestToEdit?.id,
     requestOverrides?.hasLocalChanges === true,
-    () => setRequestOverrides(null)
+    () => setRequestOverrides(null),
+    isEditSessionActive
   );
   const editRequest = editSession.request;
+  const isEditActive = editSession.isActive;
   const { addToast } = useToasts();
   const { data, error } = useSWR<MovieDetails>(`/api/v1/movie/${tmdbId}`, {
     revalidateOnMount: true,
@@ -122,10 +126,10 @@ const MovieRequestModal = ({
   );
 
   useEffect(() => {
-    if (onUpdating) {
+    if (onUpdating && (!requestToEdit || isEditActive())) {
       onUpdating(isUpdating);
     }
-  }, [isUpdating, onUpdating]);
+  }, [isUpdating, onUpdating, requestToEdit, isEditActive]);
 
   const sendRequest = useCallback(async () => {
     if (!selectedTarget?.requestable || !isAdvancedConfigurationReady) {
@@ -215,7 +219,13 @@ const MovieRequestModal = ({
   ]);
 
   const cancelRequest = async () => {
-    if (!editRequest || editSession.blocked || isUpdating) return;
+    if (
+      !editSession.isActive() ||
+      !editRequest ||
+      editSession.blocked ||
+      isUpdating
+    )
+      return;
     setIsUpdating(true);
 
     try {
@@ -228,6 +238,8 @@ const MovieRequestModal = ({
         tmdbId,
         requestId: editRequest?.id,
       });
+
+      if (!editSession.isActive()) return;
 
       if (response.status === 204) {
         if (onComplete) {
@@ -245,24 +257,26 @@ const MovieRequestModal = ({
       }
     } catch (error) {
       if (axios.isAxiosError(error) && error.response?.status === 409) {
-        editSession.blockConflict();
         revalidateRequestData({
           mediaType: 'movie',
           tmdbId,
           requestId: editRequest.id,
         });
+        if (!editSession.isActive()) return;
+        editSession.blockConflict();
         addToast(intl.formatMessage(messages.editconflict), {
           appearance: 'error',
           autoDismiss: true,
         });
       }
     } finally {
-      setIsUpdating(false);
+      if (editSession.isActive()) setIsUpdating(false);
     }
   };
 
   const updateRequest = async (alsoApproveRequest = false) => {
     if (
+      !editSession.isActive() ||
       !editRequest ||
       editSession.blocked ||
       editConfigurationBlocked ||
@@ -320,6 +334,7 @@ const MovieRequestModal = ({
         requestId: editRequest?.id,
       });
 
+      if (!editSession.isActive()) return;
       addToast(
         <span>
           {intl.formatMessage(
@@ -344,7 +359,6 @@ const MovieRequestModal = ({
     } catch (error) {
       const isConflict =
         axios.isAxiosError(error) && error.response?.status === 409;
-      if (isConflict) editSession.blockConflict();
       if (isConflict || editSaved) {
         revalidateRequestData({
           mediaType: 'movie',
@@ -352,6 +366,8 @@ const MovieRequestModal = ({
           requestId: editRequest?.id,
         });
       }
+      if (!editSession.isActive()) return;
+      if (isConflict) editSession.blockConflict();
       addToast(
         <span>
           {intl.formatMessage(
@@ -368,7 +384,7 @@ const MovieRequestModal = ({
         }
       );
     } finally {
-      setIsUpdating(false);
+      if (editSession.isActive()) setIsUpdating(false);
     }
   };
 
@@ -475,6 +491,7 @@ const MovieRequestModal = ({
             { type: 'or' }
           ) && (
             <AdvancedRequester
+              disabled={editSession.blocked || isUpdating}
               key={`${editRequest.id}:${editRequest.editRevision}`}
               type="movie"
               tmdbId={tmdbId}

@@ -78,6 +78,7 @@ interface RequestModalProps extends React.HTMLAttributes<HTMLDivElement> {
   onCancel?: () => void;
   onComplete?: (newStatus?: MediaStatus) => void;
   onUpdating?: (isUpdating: boolean) => void;
+  isEditSessionActive?: () => boolean;
   is4k?: boolean;
   editRequest?: NonFunctionProperties<MediaRequest>;
 }
@@ -88,6 +89,7 @@ const TvRequestModal = ({
   tmdbId,
   onUpdating,
   editRequest: requestToEdit,
+  isEditSessionActive,
   is4k = false,
 }: RequestModalProps) => {
   const settings = useSettings();
@@ -110,7 +112,8 @@ const TvRequestModal = ({
       setEditingSeasons(seasons);
       setSelectedSeasons(seasons);
       setRequestOverrides(null);
-    }
+    },
+    isEditSessionActive
   );
   const editRequest = editSession.request;
   const intl = useIntl();
@@ -166,7 +169,12 @@ const TvRequestModal = ({
     (editRequest?.seasons ?? []).length;
 
   const updateRequest = async (alsoApproveRequest = false) => {
-    if (!editRequest || editSession.blocked || isUpdating) {
+    if (
+      !editSession.isActive() ||
+      !editRequest ||
+      editSession.blocked ||
+      isUpdating
+    ) {
       return;
     }
     if (selectedSeasons.length > 0 && editConfigurationBlocked) return;
@@ -235,6 +243,7 @@ const TvRequestModal = ({
         requestId: editRequest.id,
       });
 
+      if (!editSession.isActive()) return;
       addToast(
         <span>
           {selectedSeasons.length > 0
@@ -271,12 +280,6 @@ const TvRequestModal = ({
         axios.isAxiosError(error) && error.response?.status === 409;
       const noSeasonsAvailable =
         axios.isAxiosError(error) && error.response?.status === 202;
-      if (noSeasonsAvailable) {
-        // The edit was not applied. Restore the held seasons rather than leave
-        // an unavailable selection or turn a retry into cancellation.
-        setSelectedSeasons(editingSeasons);
-      }
-      if (isConflict) editSession.blockConflict();
       if (isConflict || noSeasonsAvailable || editSaved) {
         revalidateRequestData({
           mediaType: 'tv',
@@ -284,6 +287,13 @@ const TvRequestModal = ({
           requestId: editRequest.id,
         });
       }
+      if (!editSession.isActive()) return;
+      if (noSeasonsAvailable) {
+        // The edit was not applied. Restore the held seasons rather than leave
+        // an unavailable selection or turn a retry into cancellation.
+        setSelectedSeasons(editingSeasons);
+      }
+      if (isConflict) editSession.blockConflict();
       addToast(
         <span>
           {noSeasonsAvailable
@@ -303,9 +313,9 @@ const TvRequestModal = ({
         }
       );
     } finally {
-      setIsUpdating(false);
-      if (onUpdating) {
-        onUpdating(false);
+      if (editSession.isActive()) {
+        setIsUpdating(false);
+        onUpdating?.(false);
       }
     }
   };
@@ -924,6 +934,7 @@ const TvRequestModal = ({
           disabled={!!editRequest && (editSession.blocked || isUpdating)}
         >
           <AdvancedRequester
+            disabled={!!requestToEdit && (editSession.blocked || isUpdating)}
             key={
               editRequest
                 ? `${editRequest.id}:${editRequest.editRevision}`
