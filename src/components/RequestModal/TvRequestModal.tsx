@@ -148,8 +148,9 @@ const TvRequestModal = ({
   const isAdvancedConfigurationReady =
     !canUseAdvancedRequester || requestOverrides?.isReady === true;
   const editConfigurationBlocked =
-    requestOverrides?.hasConfigurationChanges === true &&
-    requestOverrides.isReady !== true;
+    requestOverrides?.hasInvalidConfiguration === true ||
+    (requestOverrides?.hasConfigurationChanges === true &&
+      requestOverrides.isReady !== true);
   const [searchModal, setSearchModal] = useState<{
     show: boolean;
   }>({
