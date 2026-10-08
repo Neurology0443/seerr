@@ -6,6 +6,7 @@ import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
 import { getEditedDestinationValues } from '@app/components/RequestModal/AdvancedRequester/state';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import SearchByNameModal from '@app/components/RequestModal/SearchByNameModal';
+import { useRequestEditSession } from '@app/components/RequestModal/useRequestEditSession';
 import {
   revalidateRequestData,
   useRequestTargets,
@@ -27,6 +28,7 @@ import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type SeasonRequest from '@server/entity/SeasonRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
+import type { RequestDetailResponse } from '@server/interfaces/api/requestInterfaces';
 import type { QuotaResponse } from '@server/interfaces/api/userInterfaces';
 import { Permission } from '@server/lib/permissions';
 import type { TvDetails } from '@server/models/Tv';
@@ -63,6 +65,11 @@ const messages = defineMessages('components.RequestModal', {
   requesterror: 'Something went wrong while submitting the request.',
   requestconflict:
     'This destination is no longer requestable. Refresh your selection and try again.',
+  editconflict:
+    'This request changed while you were editing. Close and reopen the editor to load the latest request.',
+  editunavailable:
+    'This request cannot be edited. Close and reopen the editor.',
+  approvalfailed: 'The request was edited successfully, but approval failed.',
   pendingapproval: 'Your request is pending approval.',
 });
 
@@ -80,20 +87,32 @@ const TvRequestModal = ({
   onComplete,
   tmdbId,
   onUpdating,
-  editRequest,
+  editRequest: requestToEdit,
   is4k = false,
 }: RequestModalProps) => {
   const settings = useSettings();
   const { addToast } = useToasts();
-  const editingSeasons: number[] = (editRequest?.seasons ?? []).map(
-    (season) => season.seasonNumber
-  );
+  const [editingSeasons, setEditingSeasons] = useState<number[]>([]);
   const { data, error } = useSWR<TvDetails>(`/api/v1/tv/${tmdbId}`);
   const [requestOverrides, setRequestOverrides] =
     useState<RequestOverrides | null>(null);
-  const [selectedSeasons, setSelectedSeasons] = useState<number[]>(
-    editRequest ? editingSeasons : []
+  const [selectedSeasons, setSelectedSeasons] = useState<number[]>([]);
+  const [isUpdating, setIsUpdating] = useState(false);
+  const editSession = useRequestEditSession(
+    requestToEdit?.id,
+    requestOverrides?.hasLocalChanges === true ||
+      JSON.stringify(
+        [...new Set(selectedSeasons)].toSorted((a, b) => a - b)
+      ) !==
+        JSON.stringify([...new Set(editingSeasons)].toSorted((a, b) => a - b)),
+    (request) => {
+      const seasons = request.seasons.map((season) => season.seasonNumber);
+      setEditingSeasons(seasons);
+      setSelectedSeasons(seasons);
+      setRequestOverrides(null);
+    }
   );
+  const editRequest = editSession.request;
   const intl = useIntl();
   const { user, hasPermission } = useUser();
   const { targets } = useRequestTargets('tv', tmdbId);
@@ -147,10 +166,12 @@ const TvRequestModal = ({
     (editRequest?.seasons ?? []).length;
 
   const updateRequest = async (alsoApproveRequest = false) => {
-    if (!editRequest) {
+    if (!editRequest || editSession.blocked || isUpdating) {
       return;
     }
     if (selectedSeasons.length > 0 && editConfigurationBlocked) return;
+    setIsUpdating(true);
+    let editSaved = false;
 
     if (onUpdating) {
       onUpdating(true);
@@ -168,7 +189,7 @@ const TvRequestModal = ({
           requestOverrides?.manualValues,
           requestOverrides ?? undefined
         );
-        await axios.put(
+        const { data: updatedRequest } = await axios.put<RequestDetailResponse>(
           `/api/v1/request/${editRequest.id}`,
           {
             mediaType: 'tv',
@@ -187,14 +208,26 @@ const TvRequestModal = ({
           {
             // A refused edit returns 202; approval must only follow a successful PUT.
             validateStatus: (status) => status === 200,
+            headers: { 'If-Match': `"${editRequest.editRevision}"` },
           }
         );
+        editSaved = true;
 
         if (alsoApproveRequest) {
-          await axios.post(`/api/v1/request/${editRequest.id}/approve`);
+          if (!updatedRequest.editRevision)
+            throw new Error('Missing edit revision.');
+          await axios.post(
+            `/api/v1/request/${editRequest.id}/approve`,
+            undefined,
+            {
+              headers: { 'If-Match': `"${updatedRequest.editRevision}"` },
+            }
+          );
         }
       } else {
-        await axios.delete(`/api/v1/request/${editRequest.id}`);
+        await axios.delete(`/api/v1/request/${editRequest.id}`, {
+          headers: { 'If-Match': `"${editRequest.editRevision}"` },
+        });
       }
       revalidateRequestData({
         mediaType: 'tv',
@@ -243,7 +276,8 @@ const TvRequestModal = ({
         // an unavailable selection or turn a retry into cancellation.
         setSelectedSeasons(editingSeasons);
       }
-      if (isConflict || noSeasonsAvailable) {
+      if (isConflict) editSession.blockConflict();
+      if (isConflict || noSeasonsAvailable || editSaved) {
         revalidateRequestData({
           mediaType: 'tv',
           tmdbId,
@@ -256,7 +290,11 @@ const TvRequestModal = ({
             ? (error.response?.data?.message ??
               intl.formatMessage(messages.errorediting))
             : intl.formatMessage(
-                isConflict ? messages.requestconflict : messages.errorediting
+                editSaved
+                  ? messages.approvalfailed
+                  : isConflict
+                    ? messages.editconflict
+                    : messages.errorediting
               )}
         </span>,
         {
@@ -265,6 +303,7 @@ const TvRequestModal = ({
         }
       );
     } finally {
+      setIsUpdating(false);
       if (onUpdating) {
         onUpdating(false);
       }
@@ -380,6 +419,7 @@ const TvRequestModal = ({
     selectedSeasons.includes(seasonNumber);
 
   const toggleSeason = (seasonNumber: number): void => {
+    if (requestToEdit && (editSession.blocked || isUpdating)) return;
     const canSelectSeason = editRequest
       ? editingSeasons.includes(seasonNumber) ||
         requestableSeasons.includes(seasonNumber)
@@ -416,6 +456,7 @@ const TvRequestModal = ({
     : requestableSeasons;
 
   const toggleAllSeasons = (): void => {
+    if (requestToEdit && (editSession.blocked || isUpdating)) return;
     // If the user has a quota and not enough requests for all seasons, block toggleAllSeasons
     if (
       quota?.tv.limit &&
@@ -487,6 +528,24 @@ const TvRequestModal = ({
     requestableSeasons.includes(season)
   ).length;
 
+  if (requestToEdit && !editRequest) {
+    return (
+      <Modal
+        loading={!editSession.error}
+        onCancel={onCancel}
+        title={intl.formatMessage(messages.edit)}
+        cancelText={intl.formatMessage(globalMessages.close)}
+      >
+        {!!editSession.error && (
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.editunavailable)}
+          />
+        )}
+      </Modal>
+    );
+  }
+
   return data && !error && !data.externalIds.tvdbId && searchModal.show ? (
     <SearchByNameModal
       tvdbId={tvdbId}
@@ -546,7 +605,9 @@ const TvRequestModal = ({
       }
       okDisabled={
         editRequest
-          ? selectedSeasons.length > 0 && editConfigurationBlocked
+          ? isUpdating ||
+            editSession.blocked ||
+            (selectedSeasons.length > 0 && editConfigurationBlocked)
           : !settings.currentSettings.partialRequestsEnabled &&
               quota?.tv.limit &&
               unrequestedSeasons.length > (quota.tv.remaining ?? 0) &&
@@ -577,6 +638,20 @@ const TvRequestModal = ({
       }
       backdrop={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data?.backdropPath}`}
     >
+      {editRequest &&
+        (editSession.conflicted ? (
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.editconflict)}
+          />
+        ) : (
+          editSession.blocked && (
+            <Alert
+              type="error"
+              title={intl.formatMessage(messages.editunavailable)}
+            />
+          )
+        ))}
       {editRequest
         ? isOwner
           ? intl.formatMessage(messages.pendingapproval)
@@ -845,50 +920,60 @@ const TvRequestModal = ({
         [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
         { type: 'or' }
       ) && (
-        <AdvancedRequester
-          type="tv"
-          tmdbId={tmdbId}
-          is4k={is4k}
-          isAnime={data?.keywords.some(
-            (keyword) => keyword.id === ANIME_KEYWORD_ID
-          )}
-          quota={quota}
-          onChange={(overrides) => setRequestOverrides(overrides)}
-          onServerChange={(serverId) => {
-            if (!editRequest) {
-              setSelectedSeasons([]);
+        <fieldset
+          disabled={!!editRequest && (editSession.blocked || isUpdating)}
+        >
+          <AdvancedRequester
+            key={
+              editRequest
+                ? `${editRequest.id}:${editRequest.editRevision}`
+                : 'new'
             }
-            setRequestOverrides((overrides) => ({
-              server: serverId,
-              user: overrides?.user,
-              ignoreQuota: overrides?.ignoreQuota,
-              isReady: false,
-              hasConfigurationChanges: true,
-            }));
-          }}
-          requestUser={editRequest?.requestedBy}
-          requestId={editRequest?.id}
-          initialServerId={
-            editRequest ? editRequest.serverId : defaultTarget?.serverId
-          }
-          hideDestinationSelector={!editRequest && !canSelectDestination}
-          destinationReadOnly={
-            editRequest
-              ? isEditDestinationReadOnly(editRequest.serverId, editTarget)
-              : false
-          }
-          defaultOverrides={
-            editRequest
-              ? {
-                  folder: editRequest.rootFolder,
-                  profile: editRequest.profileId,
-                  server: editRequest.serverId,
-                  language: editRequest.languageProfileId,
-                  tags: editRequest.tags,
-                }
-              : undefined
-          }
-        />
+            type="tv"
+            tmdbId={tmdbId}
+            is4k={is4k}
+            isAnime={data?.keywords.some(
+              (keyword) => keyword.id === ANIME_KEYWORD_ID
+            )}
+            quota={quota}
+            onChange={(overrides) => setRequestOverrides(overrides)}
+            onServerChange={(serverId) => {
+              if (!editRequest) {
+                setSelectedSeasons([]);
+              }
+              setRequestOverrides((overrides) => ({
+                server: serverId,
+                user: overrides?.user,
+                ignoreQuota: overrides?.ignoreQuota,
+                isReady: false,
+                hasConfigurationChanges: true,
+                hasLocalChanges: true,
+              }));
+            }}
+            requestUser={editRequest?.requestedBy}
+            requestId={editRequest?.id}
+            initialServerId={
+              editRequest ? editRequest.serverId : defaultTarget?.serverId
+            }
+            hideDestinationSelector={!editRequest && !canSelectDestination}
+            destinationReadOnly={
+              editRequest
+                ? isEditDestinationReadOnly(editRequest.serverId, editTarget)
+                : false
+            }
+            defaultOverrides={
+              editRequest
+                ? {
+                    folder: editRequest.rootFolder,
+                    profile: editRequest.profileId,
+                    server: editRequest.serverId,
+                    language: editRequest.languageProfileId,
+                    tags: editRequest.tags,
+                  }
+                : undefined
+            }
+          />
+        </fieldset>
       )}
     </Modal>
   );

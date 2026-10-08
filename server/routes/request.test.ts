@@ -22,6 +22,7 @@ import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import { Permission } from '@server/lib/permissions';
+import { getRequestEditRevision } from '@server/lib/requestEditRevision';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { checkUser } from '@server/middleware/auth';
@@ -31,6 +32,7 @@ import {
   assertNoCredentials,
   seedUserSettings,
 } from '@server/test/userSettings';
+import requestLock, { requestKey } from '@server/utils/requestLock';
 import type { AxiosInstance } from 'axios';
 import axios from 'axios';
 import type { Express } from 'express';
@@ -273,6 +275,295 @@ const pauseRequestBeforeUpdate = (t: TestContext) => {
 
   return { reached, resume };
 };
+
+describe('Conditional request editing', () => {
+  const moviePayload = (profileId: number, serverId = 1, userId?: number) => ({
+    mediaType: MediaType.MOVIE,
+    serverId,
+    profileId,
+    rootFolder: `/movies/${profileId}`,
+    tags: [profileId],
+    userId,
+  });
+
+  async function movieSession() {
+    configureRadarr([{ id: 1 }, { id: 2 }]);
+    const pending = await seedRequest();
+    pending.serverId = 1;
+    pending.profileId = 10;
+    pending.rootFolder = '/movies/10';
+    pending.tags = [10];
+    await getRepository(MediaRequest).save(pending);
+    const a = await loginAs('admin@seerr.dev', 'test1234');
+    const b = await loginAs('admin@seerr.dev', 'test1234');
+    const baseline = await a.get(`/request/${pending.id}`);
+    assert.equal(baseline.status, 200);
+    assert.equal(
+      baseline.body.editRevision,
+      getRequestEditRevision(
+        await getRepository(MediaRequest).findOneByOrFail({ id: pending.id })
+      )
+    );
+    return { a, b, pending, revision: baseline.body.editRevision as string };
+  }
+
+  for (const ownerOnly of [false, true]) {
+    it(`rejects a stale movie edit after ${ownerOnly ? 'owner-only' : 'destination/configuration/owner'} changes`, async () => {
+      const { a, b, pending, revision } = await movieSession();
+      const owner = await seedUser('admin@seerr.dev');
+      const newer = await b
+        .put(`/request/${pending.id}`)
+        .set('If-Match', `"${revision}"`)
+        .send(moviePayload(ownerOnly ? 10 : 20, ownerOnly ? 1 : 2, owner.id));
+      assert.equal(newer.status, 200);
+      assert.notEqual(newer.body.editRevision, revision);
+      const saved = await getRepository(MediaRequest).findOneByOrFail({
+        id: pending.id,
+      });
+      assert.equal(newer.body.editRevision, getRequestEditRevision(saved));
+      const stale = await a
+        .put(`/request/${pending.id}`)
+        .set('If-Match', `"${revision}"`)
+        .send(moviePayload(30, 1, pending.requestedBy.id));
+      assert.equal(stale.status, 409);
+      const after = await getRepository(MediaRequest).findOneByOrFail({
+        id: pending.id,
+      });
+      assert.equal(getRequestEditRevision(after), newer.body.editRevision);
+      assert.equal(after.serverId, ownerOnly ? 1 : 2);
+      assert.equal(after.profileId, ownerOnly ? 10 : 20);
+      assert.equal(after.rootFolder, ownerOnly ? '/movies/10' : '/movies/20');
+      assert.equal(after.requestedBy.id, owner.id);
+    });
+  }
+
+  it('serializes two edits with the same revision and rejects the queued stale edit', async (t) => {
+    const { a, b, pending, revision } = await movieSession();
+    const pause = pauseRequestBeforeUpdate(t);
+    let signalQueued!: () => void;
+    const queued = new Promise<void>((resolve) => {
+      signalQueued = resolve;
+    });
+    const dispatch = requestLock.dispatch.bind(requestLock);
+    let count = 0;
+    t.mock.method(
+      requestLock,
+      'dispatch',
+      (...args: Parameters<typeof dispatch>) => {
+        if (args[0] === requestKey(pending.id) && ++count === 2) signalQueued();
+        return dispatch(...args);
+      }
+    );
+    const first = a
+      .put(`/request/${pending.id}`)
+      .set('If-Match', `"${revision}"`)
+      .send(moviePayload(20, 2))
+      .then((res) => res);
+    await pause.reached;
+    const second = b
+      .put(`/request/${pending.id}`)
+      .set('If-Match', `"${revision}"`)
+      .send(moviePayload(30, 1))
+      .then((res) => res);
+    try {
+      await queued;
+    } finally {
+      pause.resume();
+    }
+    const [winner, loser] = await Promise.all([first, second]);
+    assert.equal(winner.status, 200);
+    assert.equal(loser.status, 409);
+    const saved = await getRepository(MediaRequest).findOneByOrFail({
+      id: pending.id,
+    });
+    assert.equal(saved.serverId, 2);
+    assert.equal(saved.profileId, 20);
+    assert.equal(saved.rootFolder, '/movies/20');
+    assert.deepEqual(saved.tags, [20]);
+    assert.equal(getRequestEditRevision(saved), winner.body.editRevision);
+  });
+
+  for (const independent of [false, true]) {
+    it(`preserves ${independent ? 'independent' : 'native'} TV seasons on stale edit and cancellation`, async (t) => {
+      configureSonarr([
+        { id: 1, independentRequestDestination: independent },
+        { id: 2, independentRequestDestination: true },
+      ]);
+      const owner = await seedUser('demo@seerr.dev');
+      const media = await seedMediaSeasons(67890, [
+        { seasonNumber: 1, status: MediaStatus.PENDING },
+        { seasonNumber: 2, status: MediaStatus.UNKNOWN },
+      ]);
+      const repo = getRepository(MediaRequest);
+      const make = (serverId: number, seasons: number[]) =>
+        repo.save(
+          new MediaRequest({
+            type: MediaType.TV,
+            status: MediaRequestStatus.PENDING,
+            media,
+            requestedBy: owner,
+            serverId,
+            profileId: 10,
+            rootFolder: '/tv',
+            tags: [],
+            is4k: false,
+            ignoreQuota: false,
+            seasons: seasons.map(
+              (seasonNumber) =>
+                new SeasonRequest({
+                  seasonNumber,
+                  status: MediaRequestStatus.PENDING,
+                })
+            ),
+          })
+        );
+      const pending = await make(1, [1]);
+      const other = await make(2, [1, 2]);
+      const a = await loginAs('admin@seerr.dev', 'test1234');
+      const b = await loginAs('admin@seerr.dev', 'test1234');
+      const baseline = await a.get(`/request/${pending.id}`);
+      const body = {
+        mediaType: MediaType.TV,
+        serverId: 1,
+        profileId: 10,
+        rootFolder: '/tv',
+        tags: [],
+        seasons: [1, 2],
+      };
+      const newer = await b
+        .put(`/request/${pending.id}`)
+        .set('If-Match', `"${baseline.body.editRevision}"`)
+        .send(body);
+      assert.equal(newer.status, 200);
+      const saved = await repo.findOneByOrFail({ id: pending.id });
+      assert.deepEqual(saved.seasons.map((s) => s.seasonNumber).sort(), [1, 2]);
+      const release = t.mock.method(
+        MediaRequestSubscriber.prototype,
+        'beforeUpdate'
+      );
+      const remove = t.mock.method(
+        MediaRequestSubscriber.prototype,
+        'afterRemove'
+      );
+      const destinationBefore = await getRepository(
+        MediaDestinationSeasonStatus
+      ).find({ order: { id: 'ASC' } });
+      const nativeBefore = await getRepository(Media).findOneByOrFail({
+        id: media.id,
+      });
+      const stale = await a
+        .put(`/request/${pending.id}`)
+        .set('If-Match', `"${baseline.body.editRevision}"`)
+        .send({ ...body, seasons: [1], profileId: 99 });
+      assert.equal(stale.status, 409);
+      const deletion = await a
+        .delete(`/request/${pending.id}`)
+        .set('If-Match', `"${baseline.body.editRevision}"`);
+      assert.equal(deletion.status, 409);
+      assert.equal(release.mock.callCount(), 0);
+      assert.equal(remove.mock.callCount(), 0);
+      const after = await repo.findOneByOrFail({ id: pending.id });
+      assert.equal(after.status, MediaRequestStatus.PENDING);
+      assert.equal(getRequestEditRevision(after), newer.body.editRevision);
+      assert.equal(after.requestedBy.id, owner.id);
+      assert.equal(after.profileId, 10);
+      assert.deepEqual(
+        (await repo.findOneByOrFail({ id: other.id })).seasons
+          .map((s) => s.seasonNumber)
+          .sort(),
+        [1, 2]
+      );
+      assert.deepEqual(
+        await getRepository(MediaDestinationSeasonStatus).find({
+          order: { id: 'ASC' },
+        }),
+        destinationBefore
+      );
+      assert.deepEqual(
+        await getRepository(Media).findOneByOrFail({ id: media.id }),
+        nativeBefore
+      );
+      const currentDelete = await a
+        .delete(`/request/${pending.id}`)
+        .set('If-Match', `"${newer.body.editRevision}"`);
+      assert.equal(currentDelete.status, 204);
+      assert.equal(await repo.findOneBy({ id: pending.id }), null);
+    });
+  }
+
+  it('rejects approval superseded after PUT without invoking approval subscribers', async (t) => {
+    const { a, b, pending, revision } = await movieSession();
+    const first = await a
+      .put(`/request/${pending.id}`)
+      .set('If-Match', `"${revision}"`)
+      .send(moviePayload(20));
+    assert.equal(first.status, 200);
+    const newer = await b
+      .put(`/request/${pending.id}`)
+      .set('If-Match', `"${first.body.editRevision}"`)
+      .send(moviePayload(30, 2));
+    assert.equal(newer.status, 200);
+    const update = t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'beforeUpdate'
+    );
+    const send = t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+    const stale = await a
+      .post(`/request/${pending.id}/approve`)
+      .set('If-Match', `"${first.body.editRevision}"`);
+    assert.equal(stale.status, 409);
+    assert.equal(update.mock.callCount(), 0);
+    assert.equal(send.mock.callCount(), 0);
+    const after = await getRepository(MediaRequest).findOneByOrFail({
+      id: pending.id,
+    });
+    assert.equal(after.status, MediaRequestStatus.PENDING);
+    assert.equal(after.profileId, 30);
+    assert.equal(getRequestEditRevision(after), newer.body.editRevision);
+    const approved = await a
+      .post(`/request/${pending.id}/approve`)
+      .set('If-Match', `"${newer.body.editRevision}"`);
+    assert.equal(approved.status, 200);
+    assert.equal(approved.body.status, MediaRequestStatus.APPROVED);
+    assert.equal(send.mock.callCount(), 1);
+  });
+
+  it('approves the revision returned by a single conditional edit', async (t) => {
+    const { a, pending, revision } = await movieSession();
+    const edited = await a
+      .put(`/request/${pending.id}`)
+      .set('If-Match', `"${revision}"`)
+      .send(moviePayload(20));
+    assert.equal(edited.status, 200);
+    assert.notEqual(edited.body.editRevision, revision);
+    const send = t.mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+    const approved = await a
+      .post(`/request/${pending.id}/approve`)
+      .set('If-Match', `"${edited.body.editRevision}"`);
+    assert.equal(approved.status, 200);
+    assert.equal(approved.body.status, MediaRequestStatus.APPROVED);
+    assert.equal(send.mock.callCount(), 1);
+  });
+
+  it('returns a revision of persisted values when PUT omits nullable fields', async () => {
+    const { a, pending, revision } = await movieSession();
+    const edited = await a
+      .put(`/request/${pending.id}`)
+      .set('If-Match', `"${revision}"`)
+      .send({ mediaType: MediaType.MOVIE });
+    assert.equal(edited.status, 200);
+    assert.equal(edited.body.editRevision, revision);
+    assert.equal(edited.body.profileId, 10);
+  });
+});
 
 describe('DELETE /request/:requestId', () => {
   it('allows the owner to delete their own pending request', async () => {

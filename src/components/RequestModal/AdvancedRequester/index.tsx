@@ -74,6 +74,7 @@ export type RequestOverrides = {
   ignoreQuota?: boolean;
   isReady?: boolean;
   hasConfigurationChanges?: boolean;
+  hasLocalChanges?: boolean;
   manualValues?: DestinationValues;
   destinationChanged?: boolean;
 };
@@ -149,6 +150,7 @@ const AdvancedRequester = ({
   const [overrideRulesError, setOverrideRulesError] = useState(false);
   const [rulesRetry, setRulesRetry] = useState(0);
   const [destinationChanged, setDestinationChanged] = useState(false);
+  const [hasLocalActions, setHasLocalActions] = useState(false);
   const originalServer = useRef(selectedServer);
   const [manualValues, setManualValues] = useState<DestinationValues>({});
   const manualValuesRef = useRef<DestinationValues>({});
@@ -292,6 +294,7 @@ const AdvancedRequester = ({
       ignoreQuota: isIgnoreQuotaVisible && ignoreQuota ? true : undefined,
       isReady: isConfigurationReady,
       hasConfigurationChanges,
+      hasLocalChanges: hasLocalActions || hasConfigurationChanges,
       manualValues,
       destinationChanged,
     });
@@ -306,6 +309,7 @@ const AdvancedRequester = ({
     isIgnoreQuotaVisible,
     isConfigurationReady,
     hasConfigurationChanges,
+    hasLocalActions,
     manualValues,
     destinationChanged,
   ]);
@@ -432,6 +436,7 @@ const AdvancedRequester = ({
 
     formRevision.current += 1;
     initializedServer.current = null;
+    setHasLocalActions(true);
     setDestinationChanged(serverId !== originalServer.current);
     manualValuesRef.current = {};
     setManualValues({});
@@ -455,6 +460,7 @@ const AdvancedRequester = ({
     // Profile, folder and language are local overrides, not rule inputs.
     // Keep them authoritative even if an evaluation is already in flight.
     manualValuesRef.current = nextManualValues;
+    setHasLocalActions(true);
     setManualValues(manualValuesRef.current);
     if (values.tags !== undefined && !isEqual(values.tags, ruleTags)) {
       formRevision.current += 1;
@@ -782,7 +788,10 @@ const AdvancedRequester = ({
               </p>
               <SlideCheckbox
                 checked={ignoreQuota}
-                onClick={() => setIgnoreQuota(!ignoreQuota)}
+                onClick={() => {
+                  setHasLocalActions(true);
+                  setIgnoreQuota(!ignoreQuota);
+                }}
               />
             </div>
           </div>
@@ -798,6 +807,7 @@ const AdvancedRequester = ({
               value={selectedUser}
               onChange={(value) => {
                 if (value.id === selectedUserId) return;
+                setHasLocalActions(true);
                 formRevision.current += 1;
                 setConfiguredServerId(null);
                 setOverrideRulesError(false);

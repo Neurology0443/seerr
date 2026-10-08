@@ -5,6 +5,7 @@ import { Transition } from '@headlessui/react';
 import type { MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
+import { useState } from 'react';
 
 interface RequestModalProps {
   show: boolean;
@@ -27,6 +28,13 @@ const RequestModal = ({
   onUpdating,
   onCancel,
 }: RequestModalProps) => {
+  // A rapid reopen can precede Transition's delayed unmount. Give every edit
+  // opening a fresh session even in that case, without changing creation flows.
+  const [session, setSession] = useState({ open: show, number: 0 });
+  if (session.open !== show) {
+    setSession({ open: show, number: session.number + (show ? 1 : 0) });
+  }
+  const editorKey = editRequest ? `${editRequest.id}:${session.number}` : 'new';
   return (
     <Transition
       as="div"
@@ -40,6 +48,7 @@ const RequestModal = ({
     >
       {type === 'movie' ? (
         <MovieRequestModal
+          key={editorKey}
           onComplete={onComplete}
           onCancel={onCancel}
           tmdbId={tmdbId}
@@ -49,6 +58,7 @@ const RequestModal = ({
         />
       ) : type === 'tv' ? (
         <TvRequestModal
+          key={editorKey}
           onComplete={onComplete}
           onCancel={onCancel}
           tmdbId={tmdbId}

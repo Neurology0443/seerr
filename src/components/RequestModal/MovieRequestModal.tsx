@@ -4,6 +4,7 @@ import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequ
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
 import { getEditedDestinationValues } from '@app/components/RequestModal/AdvancedRequester/state';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
+import { useRequestEditSession } from '@app/components/RequestModal/useRequestEditSession';
 import {
   revalidateRequestData,
   useRequestTargets,
@@ -20,6 +21,7 @@ import {
 import { MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
+import type { RequestDetailResponse } from '@server/interfaces/api/requestInterfaces';
 import type { QuotaResponse } from '@server/interfaces/api/userInterfaces';
 import { Permission } from '@server/lib/permissions';
 import type { MovieDetails } from '@server/models/Movie';
@@ -46,6 +48,11 @@ const messages = defineMessages('components.RequestModal', {
   requesterror: 'Something went wrong while submitting the request.',
   requestconflict:
     'This destination is no longer requestable. Refresh your selection and try again.',
+  editconflict:
+    'This request changed while you were editing. Close and reopen the editor to load the latest request.',
+  editunavailable:
+    'This request cannot be edited. Close and reopen the editor.',
+  approvalfailed: 'The request was edited successfully, but approval failed.',
   pendingapproval: 'Your request is pending approval.',
 });
 
@@ -63,12 +70,18 @@ const MovieRequestModal = ({
   onComplete,
   tmdbId,
   onUpdating,
-  editRequest,
+  editRequest: requestToEdit,
   is4k = false,
 }: RequestModalProps) => {
   const [isUpdating, setIsUpdating] = useState(false);
   const [requestOverrides, setRequestOverrides] =
     useState<RequestOverrides | null>(null);
+  const editSession = useRequestEditSession(
+    requestToEdit?.id,
+    requestOverrides?.hasLocalChanges === true,
+    () => setRequestOverrides(null)
+  );
+  const editRequest = editSession.request;
   const { addToast } = useToasts();
   const { data, error } = useSWR<MovieDetails>(`/api/v1/movie/${tmdbId}`, {
     revalidateOnMount: true,
@@ -202,11 +215,13 @@ const MovieRequestModal = ({
   ]);
 
   const cancelRequest = async () => {
+    if (!editRequest || editSession.blocked || isUpdating) return;
     setIsUpdating(true);
 
     try {
       const response = await axios.delete<MediaRequest>(
-        `/api/v1/request/${editRequest?.id}`
+        `/api/v1/request/${editRequest.id}`,
+        { headers: { 'If-Match': `"${editRequest.editRevision}"` } }
       );
       revalidateRequestData({
         mediaType: 'movie',
@@ -228,14 +243,34 @@ const MovieRequestModal = ({
           { appearance: 'success', autoDismiss: true }
         );
       }
-    } catch {
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 409) {
+        editSession.blockConflict();
+        revalidateRequestData({
+          mediaType: 'movie',
+          tmdbId,
+          requestId: editRequest.id,
+        });
+        addToast(intl.formatMessage(messages.editconflict), {
+          appearance: 'error',
+          autoDismiss: true,
+        });
+      }
+    } finally {
       setIsUpdating(false);
     }
   };
 
   const updateRequest = async (alsoApproveRequest = false) => {
-    if (editConfigurationBlocked) return;
+    if (
+      !editRequest ||
+      editSession.blocked ||
+      editConfigurationBlocked ||
+      isUpdating
+    )
+      return;
     setIsUpdating(true);
+    let editSaved = false;
 
     try {
       const editedValues = getEditedDestinationValues(
@@ -247,21 +282,37 @@ const MovieRequestModal = ({
         requestOverrides?.manualValues,
         requestOverrides ?? undefined
       );
-      await axios.put(`/api/v1/request/${editRequest?.id}`, {
-        mediaType: 'movie',
-        serverId: getEditServerId(
-          editRequest?.serverId,
-          editTarget,
-          requestOverrides?.server
-        ),
-        profileId: editedValues.profile,
-        rootFolder: editedValues.folder,
-        userId: requestOverrides?.user?.id,
-        tags: editedValues.tags,
-      });
+      const { data: updatedRequest } = await axios.put<RequestDetailResponse>(
+        `/api/v1/request/${editRequest.id}`,
+        {
+          mediaType: 'movie',
+          serverId: getEditServerId(
+            editRequest?.serverId,
+            editTarget,
+            requestOverrides?.server
+          ),
+          profileId: editedValues.profile,
+          rootFolder: editedValues.folder,
+          userId: requestOverrides?.user?.id,
+          tags: editedValues.tags,
+        },
+        {
+          headers: { 'If-Match': `"${editRequest.editRevision}"` },
+          validateStatus: (status) => status === 200,
+        }
+      );
+      editSaved = true;
 
       if (alsoApproveRequest) {
-        await axios.post(`/api/v1/request/${editRequest?.id}/approve`);
+        if (!updatedRequest.editRevision)
+          throw new Error('Missing edit revision.');
+        await axios.post(
+          `/api/v1/request/${editRequest.id}/approve`,
+          undefined,
+          {
+            headers: { 'If-Match': `"${updatedRequest.editRevision}"` },
+          }
+        );
       }
       revalidateRequestData({
         mediaType: 'movie',
@@ -293,7 +344,8 @@ const MovieRequestModal = ({
     } catch (error) {
       const isConflict =
         axios.isAxiosError(error) && error.response?.status === 409;
-      if (isConflict) {
+      if (isConflict) editSession.blockConflict();
+      if (isConflict || editSaved) {
         revalidateRequestData({
           mediaType: 'movie',
           tmdbId,
@@ -303,7 +355,11 @@ const MovieRequestModal = ({
       addToast(
         <span>
           {intl.formatMessage(
-            isConflict ? messages.requestconflict : messages.errorediting
+            editSaved
+              ? messages.approvalfailed
+              : isConflict
+                ? messages.editconflict
+                : messages.errorediting
           )}
         </span>,
         {
@@ -315,6 +371,24 @@ const MovieRequestModal = ({
       setIsUpdating(false);
     }
   };
+
+  if (requestToEdit && !editRequest) {
+    return (
+      <Modal
+        loading={!editSession.error}
+        onCancel={onCancel}
+        title={intl.formatMessage(messages.edit)}
+        cancelText={intl.formatMessage(globalMessages.close)}
+      >
+        {!!editSession.error && (
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.editunavailable)}
+          />
+        )}
+      </Modal>
+    );
+  }
 
   if (editRequest) {
     const isOwner = editRequest.requestedBy.id === user?.id;
@@ -336,7 +410,9 @@ const MovieRequestModal = ({
               : cancelRequest()
         }
         okDisabled={
-          isUpdating || (canUseAdvancedRequester && editConfigurationBlocked)
+          isUpdating ||
+          editSession.blocked ||
+          (canUseAdvancedRequester && editConfigurationBlocked)
         }
         okText={
           hasPermission(Permission.MANAGE_REQUESTS)
@@ -361,7 +437,7 @@ const MovieRequestModal = ({
             ? () => cancelRequest()
             : undefined
         }
-        secondaryDisabled={isUpdating}
+        secondaryDisabled={isUpdating || editSession.blocked}
         secondaryText={
           isOwner &&
           hasPermission(
@@ -375,37 +451,53 @@ const MovieRequestModal = ({
         cancelText={intl.formatMessage(globalMessages.close)}
         backdrop={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data?.backdropPath}`}
       >
-        {isOwner
-          ? intl.formatMessage(messages.pendingapproval)
-          : intl.formatMessage(messages.requestfrom, {
-              username: editRequest.requestedBy.displayName,
-            })}
-        {hasPermission(
-          [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
-          { type: 'or' }
-        ) && (
-          <AdvancedRequester
-            type="movie"
-            tmdbId={tmdbId}
-            is4k={is4k}
-            requestUser={editRequest.requestedBy}
-            requestId={editRequest.id}
-            initialServerId={editRequest.serverId}
-            destinationReadOnly={isEditDestinationReadOnly(
-              editRequest.serverId,
-              editTarget
-            )}
-            defaultOverrides={{
-              folder: editRequest.rootFolder,
-              profile: editRequest.profileId,
-              server: editRequest.serverId,
-              tags: editRequest.tags,
-            }}
-            onChange={(overrides) => {
-              setRequestOverrides(overrides);
-            }}
+        {editSession.conflicted ? (
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.editconflict)}
           />
+        ) : (
+          editSession.blocked && (
+            <Alert
+              type="error"
+              title={intl.formatMessage(messages.editunavailable)}
+            />
+          )
         )}
+        <fieldset disabled={editSession.blocked || isUpdating}>
+          {isOwner
+            ? intl.formatMessage(messages.pendingapproval)
+            : intl.formatMessage(messages.requestfrom, {
+                username: editRequest.requestedBy.displayName,
+              })}
+          {hasPermission(
+            [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
+            { type: 'or' }
+          ) && (
+            <AdvancedRequester
+              key={`${editRequest.id}:${editRequest.editRevision}`}
+              type="movie"
+              tmdbId={tmdbId}
+              is4k={is4k}
+              requestUser={editRequest.requestedBy}
+              requestId={editRequest.id}
+              initialServerId={editRequest.serverId}
+              destinationReadOnly={isEditDestinationReadOnly(
+                editRequest.serverId,
+                editTarget
+              )}
+              defaultOverrides={{
+                folder: editRequest.rootFolder,
+                profile: editRequest.profileId,
+                server: editRequest.serverId,
+                tags: editRequest.tags,
+              }}
+              onChange={(overrides) => {
+                setRequestOverrides(overrides);
+              }}
+            />
+          )}
+        </fieldset>
       </Modal>
     );
   }

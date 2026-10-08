@@ -442,7 +442,7 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
         tmdbId={request.media.tmdbId}
         type={request.type}
         is4k={request.is4k}
-        editRequest={request}
+        editRequest={requestData}
         onCancel={() => setShowEditModal(false)}
         onComplete={() => {
           revalidateList();
