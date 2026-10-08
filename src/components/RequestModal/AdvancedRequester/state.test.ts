@@ -1,7 +1,11 @@
 import type { ServiceCommonServer } from '@server/interfaces/api/serviceInterfaces';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { applyDestinationRules, getDestinationDefaults } from './state';
+import {
+  applyDestinationRules,
+  getDestinationDefaults,
+  getEditedDestinationValues,
+} from './state';
 
 const server: ServiceCommonServer = {
   id: 1,
@@ -121,5 +125,60 @@ describe('AdvancedRequester value precedence', () => {
     );
     manual = { ...manual, profile: 50, folder: '/new-manual', language: 51 };
     assert.deepEqual(await result, manual);
+  });
+});
+
+describe('partial request edit configuration', () => {
+  it('preserves nullable historical fields when only the folder changes', () => {
+    assert.deepEqual(
+      getEditedDestinationValues(
+        { profile: null, folder: null, language: null, tags: null },
+        { folder: '/custom' }
+      ),
+      { profile: null, folder: '/custom', language: null, tags: null }
+    );
+  });
+
+  it('preserves explicit values and empty tags when only the profile changes', () => {
+    assert.deepEqual(
+      getEditedDestinationValues(
+        { profile: 30, folder: '/custom', language: 31, tags: [] },
+        { profile: 10 }
+      ),
+      { profile: 10, folder: '/custom', language: 31, tags: [] }
+    );
+  });
+
+  it('persists explicit selections even when they match displayed defaults', () => {
+    const defaults = getDestinationDefaults(server, false);
+    assert.deepEqual(
+      getEditedDestinationValues(
+        { profile: null, folder: null, language: null, tags: null },
+        defaults
+      ),
+      defaults
+    );
+  });
+
+  it('keeps untouched persisted values instead of displayed rule results', () => {
+    const persisted = {
+      profile: null,
+      folder: '/custom',
+      language: null,
+      tags: [9],
+    };
+    assert.deepEqual(getEditedDestinationValues(persisted), persisted);
+    assert.deepEqual(
+      applyDestinationRules(
+        getDestinationDefaults(server, false),
+        { profileId: 40, rootFolder: '/rule', tags: [4] },
+        { folder: '/custom', tags: [9] }
+      ),
+      { profile: 40, folder: '/custom', language: 11, tags: [9] }
+    );
+    assert.deepEqual(getEditedDestinationValues(persisted, { tags: [] }), {
+      ...persisted,
+      tags: [],
+    });
   });
 });

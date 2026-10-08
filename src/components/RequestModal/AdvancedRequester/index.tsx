@@ -74,6 +74,7 @@ export type RequestOverrides = {
   ignoreQuota?: boolean;
   isReady?: boolean;
   hasConfigurationChanges?: boolean;
+  manualValues?: DestinationValues;
 };
 
 interface AdvancedRequesterProps {
@@ -288,6 +289,7 @@ const AdvancedRequester = ({
       ignoreQuota: isIgnoreQuotaVisible && ignoreQuota ? true : undefined,
       isReady: isConfigurationReady,
       hasConfigurationChanges,
+      manualValues,
     });
   }, [
     selectedFolder,
@@ -300,6 +302,7 @@ const AdvancedRequester = ({
     isIgnoreQuotaVisible,
     isConfigurationReady,
     hasConfigurationChanges,
+    manualValues,
     destinationChanged,
   ]);
 
@@ -438,18 +441,16 @@ const AdvancedRequester = ({
     onServerChange?.(serverId);
   };
   const changeValue = (values: DestinationValues) => {
-    if (
-      (values.profile === undefined || values.profile === selectedProfile) &&
-      (values.folder === undefined || values.folder === selectedFolder) &&
-      (values.language === undefined || values.language === selectedLanguage) &&
-      (values.tags === undefined || isEqual(values.tags, selectedTags))
-    ) {
+    const nextManualValues = { ...manualValuesRef.current, ...values };
+    // An explicit selection can match a displayed default while still changing
+    // a persisted null. Only an already-recorded selection is a no-op.
+    if (isEqual(nextManualValues, manualValuesRef.current)) {
       return;
     }
 
     // Profile, folder and language are local overrides, not rule inputs.
     // Keep them authoritative even if an evaluation is already in flight.
-    manualValuesRef.current = { ...manualValuesRef.current, ...values };
+    manualValuesRef.current = nextManualValues;
     setManualValues(manualValuesRef.current);
     if (values.tags !== undefined && !isEqual(values.tags, ruleTags)) {
       formRevision.current += 1;

@@ -50,10 +50,10 @@ const pending = (id: number, serverId: number | null) => ({
   is4k: false,
   status: 1,
   requestedBy: admin,
-  profileId: 11,
-  rootFolder: '/custom',
-  languageProfileId: 31,
-  tags: [],
+  profileId: 11 as number | null,
+  rootFolder: '/custom' as string | null,
+  languageProfileId: 31 as number | null,
+  tags: [] as number[] | null,
   createdAt: '2020-01-01T00:00:00Z',
   updatedAt: '2020-01-01T00:00:00Z',
   seasonCount: 1,
@@ -297,6 +297,80 @@ describe('Request destinations', () => {
       cy.wait('@edit').its('request.body.serverId').should('eq', 2);
     });
 
+    it(`preserves nullable historical ${type} fields when only the folder is edited`, () => {
+      cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+        profileId: 10,
+        rootFolder: '/1',
+        tags: [1],
+      });
+      visitMedia(type, [
+        {
+          ...pending(101, null),
+          profileId: null,
+          rootFolder: null,
+          languageProfileId: null,
+          tags: null,
+        },
+      ]);
+      clickAction(/^View Request — Request #101$/);
+      cy.get('#profile').should('not.be.disabled').and('have.value', '10');
+      cy.get('#folder').should('have.value', '/1').select('/custom');
+      cy.contains('[role="dialog"] button', /^Approve Request$/)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@edit').then(({ request }) => {
+        expect(request.body).not.to.have.property('serverId');
+        expect(request.body.profileId).to.eq(null);
+        expect(request.body.rootFolder).to.eq('/custom');
+        expect(request.body.tags).to.eq(null);
+        if (type === 'tv') expect(request.body.languageProfileId).to.eq(null);
+      });
+      cy.wait('@approve');
+    });
+
+    it(`persists an explicit ${type} profile matching the displayed default without saving unrelated defaults`, () => {
+      visitMedia(type, [
+        { ...pending(101, 1), profileId: null, rootFolder: null },
+      ]);
+      clickAction(/^View Request — FR$/);
+      cy.get('#profile').should('not.be.disabled').and('have.value', '10');
+      // Move away and back: selecting an already-selected native option emits
+      // no React change event. The final explicit override still matches default.
+      cy.get('#profile').select('11').should('have.value', '11');
+      cy.get('#profile').select('10').should('have.value', '10');
+      cy.contains('[role="dialog"] button', /^Approve Request$/)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@edit').then(({ request }) => {
+        expect(request.body.profileId).to.eq(10);
+        expect(request.body.rootFolder).to.eq(null);
+        expect(request.body.tags).to.deep.eq([]);
+        if (type === 'tv') expect(request.body.languageProfileId).to.eq(31);
+      });
+      cy.wait('@approve');
+    });
+
+    it(`preserves explicit ${type} settings during an independent profile edit`, () => {
+      cy.intercept('GET', '/api/v1/auth/me', {
+        ...admin,
+        permissions: 32 | 8192 | 16384, // REQUEST, REQUEST_ADVANCED, REQUEST_VIEW
+      });
+      visitMedia(type, [pending(101, 1)], false, true);
+      clickAction(/^View Request — FR$/);
+      cy.get('#server').should('be.disabled');
+      cy.get('#profile').should('not.be.disabled').select('10');
+      cy.contains('[role="dialog"] button', /^Edit Request$/).click();
+      cy.wait('@edit').then(({ request }) => {
+        expect(request.body.serverId).to.eq(1);
+        expect(request.body.profileId).to.eq(10);
+        expect(request.body.rootFolder).to.eq('/custom');
+        expect(request.body.tags).to.deep.eq([]);
+        if (type === 'tv') expect(request.body.languageProfileId).to.eq(31);
+      });
+      cy.get('[role="dialog"]').should('not.exist');
+      cy.get('@approve.all').should('have.length', 0);
+    });
+
     it(`preserves an explicit native ${type} destination`, () => {
       visitMedia(type, [pending(101, 1)]);
       clickAction(/^View Request — FR$/);
@@ -478,6 +552,92 @@ describe('Request destinations', () => {
       cy.contains(
         `${type === 'movie' ? 'Correction Movie' : 'Correction Series'} requested successfully!`
       ).should('be.visible');
+    });
+  }
+
+  for (const independent of [false, true]) {
+    it(`keeps the ${independent ? 'independent' : 'native'} TV modal open after 202, refreshes availability and retries valid seasons`, () => {
+      visitMedia('tv', [], false, independent);
+      clickAction(/^Request$/);
+      cy.contains('[role="dialog"] tbody tr', 'Season 1')
+        .find('[role="checkbox"]')
+        .click();
+      cy.contains('[role="dialog"] button', /^Request 1 Season$/).should(
+        'not.be.disabled'
+      );
+      // The backend wins a race for Season 1, but Season 2 remains requestable.
+      cy.intercept(
+        'GET',
+        `/api/v1/tv/${tvId}/request-targets`,
+        servers.map((server) => ({
+          serverId: server.id,
+          name: server.name,
+          is4k: false,
+          isDefault: server.isDefault,
+          isIndependent: independent,
+          status: server.id === 1 ? 4 : 1,
+          requestable: true,
+          seasons: [1, 2].map((seasonNumber) => ({
+            seasonNumber,
+            status: server.id === 1 && seasonNumber === 1 ? 5 : 1,
+            requestable: server.id !== 1 || seasonNumber !== 1,
+          })),
+        }))
+      ).as('refreshedTargets');
+      cy.intercept('POST', '/api/v1/request', {
+        statusCode: 202,
+        body: { message: 'No seasons available to request' },
+      }).as('notCreated');
+      cy.get('@title.all').then((calls) => {
+        const count = (calls as unknown as unknown[]).length;
+        cy.contains('[role="dialog"] button', /^Request 1 Season$/).click();
+        cy.wait('@notCreated').then(({ request }) => {
+          expect(request.body.serverId).to.eq(1);
+          expect(request.body.seasons).to.deep.eq([1]);
+        });
+        cy.wait('@refreshedTargets');
+        cy.get('@title.all').should((requests) => {
+          expect((requests as unknown as unknown[]).length).to.be.greaterThan(
+            count
+          );
+        });
+      });
+      cy.contains('No seasons available to request').should('be.visible');
+      cy.contains('Correction Series requested successfully!').should(
+        'not.exist'
+      );
+      // RequestButton's successful completion callback closes the modal.
+      cy.get('[role="dialog"]').should('be.visible');
+      cy.contains('[role="dialog"] tbody tr', 'Season 1').should(
+        'contain.text',
+        'Available'
+      );
+      cy.contains('[role="dialog"] button', /^Select Season\(s\)$/).should(
+        'be.disabled'
+      );
+      cy.contains('[role="dialog"] tbody tr', 'Season 2')
+        .find('[role="checkbox"]')
+        .click();
+      const response = createdRequest('tv', 1, [2]);
+      cy.intercept('POST', '/api/v1/request', {
+        statusCode: 201,
+        body: {
+          ...response,
+          target: { ...response.target, isIndependent: independent },
+          media: { ...response.media, status: independent ? 1 : 3 },
+        },
+      }).as('retriedCreate');
+      cy.contains('[role="dialog"] button', /^Request 1 Season$/)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@retriedCreate').then(({ request }) => {
+        expect(request.body.serverId).to.eq(1);
+        expect(request.body.seasons).to.deep.eq([2]);
+      });
+      cy.contains('Correction Series requested successfully!').should(
+        'be.visible'
+      );
+      cy.get('[role="dialog"]').should('not.exist');
     });
   }
 
@@ -871,7 +1031,9 @@ describe('Request destinations', () => {
       .click();
     cy.wait('@edit').then(({ request }) => {
       expect(request.body.serverId).to.eq(2);
-      expect(request.body.profileId).to.eq(20);
+      expect(request.body.profileId).to.eq(11);
+      expect(request.body.rootFolder).to.eq('/custom');
+      expect(request.body.tags).to.deep.eq([]);
     });
   });
 

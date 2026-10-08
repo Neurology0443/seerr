@@ -2,6 +2,7 @@ import Alert from '@app/components/Common/Alert';
 import Modal from '@app/components/Common/Modal';
 import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequester';
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
+import { getEditedDestinationValues } from '@app/components/RequestModal/AdvancedRequester/state';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import {
   revalidateRequestData,
@@ -237,6 +238,14 @@ const MovieRequestModal = ({
     setIsUpdating(true);
 
     try {
+      const editedValues = getEditedDestinationValues(
+        {
+          profile: editRequest?.profileId,
+          folder: editRequest?.rootFolder,
+          tags: editRequest?.tags,
+        },
+        requestOverrides?.manualValues
+      );
       await axios.put(`/api/v1/request/${editRequest?.id}`, {
         mediaType: 'movie',
         serverId: getEditServerId(
@@ -244,16 +253,10 @@ const MovieRequestModal = ({
           editTarget,
           requestOverrides?.server
         ),
-        profileId: requestOverrides?.hasConfigurationChanges
-          ? requestOverrides.profile
-          : editRequest?.profileId,
-        rootFolder: requestOverrides?.hasConfigurationChanges
-          ? requestOverrides.folder
-          : editRequest?.rootFolder,
+        profileId: editedValues.profile,
+        rootFolder: editedValues.folder,
         userId: requestOverrides?.user?.id,
-        tags: requestOverrides?.hasConfigurationChanges
-          ? requestOverrides.tags
-          : editRequest?.tags,
+        tags: editedValues.tags,
       });
 
       if (alsoApproveRequest) {

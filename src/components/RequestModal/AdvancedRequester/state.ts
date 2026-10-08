@@ -8,6 +8,17 @@ export type DestinationValues = {
   tags?: number[];
 };
 
+type PersistedDestinationValues = {
+  [Field in keyof DestinationValues]: DestinationValues[Field] | null;
+};
+
+// Display defaults and rule results are not persisted overrides. PUT assigns
+// every configuration field, so untouched fields must retain their exact value.
+export const getEditedDestinationValues = (
+  persisted: PersistedDestinationValues,
+  manual: DestinationValues = {}
+): PersistedDestinationValues => ({ ...persisted, ...manual });
+
 export const getDestinationDefaults = (
   server: ServiceCommonServer,
   isAnime: boolean

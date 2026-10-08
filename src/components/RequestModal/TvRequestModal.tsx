@@ -3,6 +3,7 @@ import Badge from '@app/components/Common/Badge';
 import Modal from '@app/components/Common/Modal';
 import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequester';
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
+import { getEditedDestinationValues } from '@app/components/RequestModal/AdvancedRequester/state';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import SearchByNameModal from '@app/components/RequestModal/SearchByNameModal';
 import {
@@ -157,6 +158,15 @@ const TvRequestModal = ({
 
     try {
       if (selectedSeasons.length > 0) {
+        const editedValues = getEditedDestinationValues(
+          {
+            profile: editRequest.profileId,
+            folder: editRequest.rootFolder,
+            language: editRequest.languageProfileId,
+            tags: editRequest.tags,
+          },
+          requestOverrides?.manualValues
+        );
         await axios.put(`/api/v1/request/${editRequest.id}`, {
           mediaType: 'tv',
           serverId: getEditServerId(
@@ -164,19 +174,11 @@ const TvRequestModal = ({
             editTarget,
             requestOverrides?.server
           ),
-          profileId: requestOverrides?.hasConfigurationChanges
-            ? requestOverrides.profile
-            : editRequest.profileId,
-          rootFolder: requestOverrides?.hasConfigurationChanges
-            ? requestOverrides.folder
-            : editRequest.rootFolder,
-          languageProfileId: requestOverrides?.hasConfigurationChanges
-            ? requestOverrides.language
-            : editRequest.languageProfileId,
+          profileId: editedValues.profile,
+          rootFolder: editedValues.folder,
+          languageProfileId: editedValues.language,
           userId: requestOverrides?.user?.id,
-          tags: requestOverrides?.hasConfigurationChanges
-            ? requestOverrides.tags
-            : editRequest.tags,
+          tags: editedValues.tags,
           seasons: selectedSeasons.toSorted((a, b) => a - b),
         });
 
@@ -282,45 +284,58 @@ const TvRequestModal = ({
           tags: requestOverrides.tags,
         };
       }
-      const response = await axios.post<MediaRequest>('/api/v1/request', {
-        mediaId: data?.id,
-        tvdbId: tvdbId ?? data?.externalIds.tvdbId,
-        mediaType: 'tv',
-        is4k,
-        ignoreQuota: requestOverrides?.ignoreQuota,
-        seasons,
-        ...overrideParams,
-      });
+      const response = await axios.post<MediaRequest>(
+        '/api/v1/request',
+        {
+          mediaId: data?.id,
+          tvdbId: tvdbId ?? data?.externalIds.tvdbId,
+          mediaType: 'tv',
+          is4k,
+          ignoreQuota: requestOverrides?.ignoreQuota,
+          seasons,
+          ...overrideParams,
+        },
+        {
+          // The API returns 202 when no seasons remain; only 201 creates a request.
+          validateStatus: (status) => status === 201,
+        }
+      );
       revalidateRequestData({ mediaType: 'tv', tmdbId });
 
-      if (response.data) {
-        if (onComplete) {
-          onComplete(
-            selectedTarget.isIndependent
-              ? undefined
-              : response.data.media[is4k ? 'status4k' : 'status']
-          );
-        }
-        addToast(
-          <span>
-            {intl.formatMessage(messages.requestSuccess, {
-              title: data?.name,
-              strong: (msg: React.ReactNode) => <strong>{msg}</strong>,
-            })}
-          </span>,
-          { appearance: 'success', autoDismiss: true }
+      if (onComplete) {
+        onComplete(
+          selectedTarget.isIndependent
+            ? undefined
+            : response.data.media[is4k ? 'status4k' : 'status']
         );
       }
+      addToast(
+        <span>
+          {intl.formatMessage(messages.requestSuccess, {
+            title: data?.name,
+            strong: (msg: React.ReactNode) => <strong>{msg}</strong>,
+          })}
+        </span>,
+        { appearance: 'success', autoDismiss: true }
+      );
     } catch (error) {
       const isConflict =
         axios.isAxiosError(error) && error.response?.status === 409;
-      if (isConflict) {
+      const noSeasonsAvailable =
+        axios.isAxiosError(error) && error.response?.status === 202;
+      if (noSeasonsAvailable) {
+        setSelectedSeasons([]);
+      }
+      if (isConflict || noSeasonsAvailable) {
         revalidateRequestData({ mediaType: 'tv', tmdbId });
       }
       addToast(
-        intl.formatMessage(
-          isConflict ? messages.requestconflict : messages.requesterror
-        ),
+        noSeasonsAvailable
+          ? (error.response?.data?.message ??
+              intl.formatMessage(messages.requestconflict))
+          : intl.formatMessage(
+              isConflict ? messages.requestconflict : messages.requesterror
+            ),
         {
           appearance: 'error',
           autoDismiss: true,
