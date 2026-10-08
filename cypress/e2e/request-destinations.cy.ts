@@ -387,6 +387,20 @@ describe('Request destinations', () => {
         language: 13,
         tags: sharedTags ? [1] : [2],
       });
+      const genericRules = { profileId: 11, rootFolder: '/custom' };
+      const normalWithRules = {
+        ...normal,
+        profile: genericRules.profileId,
+        folder: genericRules.rootFolder,
+      };
+      const interceptClassificationRules = (initiallyAnime = false) => {
+        let classification = initiallyAnime;
+        cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', (req) => {
+          // Generic rules stop applying when TMDB classifies the series as anime.
+          req.reply(classification ? {} : genericRules);
+          classification = !classification;
+        }).as('rules');
+      };
       const configureAnime = (sharedTags = true) => {
         const metadata = details(1);
         cy.intercept('GET', '/api/v1/service/sonarr/1', {
@@ -457,20 +471,24 @@ describe('Request destinations', () => {
           expect(request.body.seasons).to.deep.eq([1]);
         });
       };
-      const expectRuleCalls = (count: number) => {
+      const expectRuleCalls = (count: number, identicalInputs = false) => {
         cy.get('@rules.all').should((calls) => {
           const requests = calls as unknown as {
             request: { body: { tags: number[] } };
           }[];
           expect(requests.length).to.eq(count);
-          for (const call of requests)
+          for (const call of requests) {
             expect(call.request.body).not.to.have.property('isAnime');
+            if (identicalInputs)
+              expect(call.request.body).to.deep.eq(requests[0].request.body);
+          }
         });
       };
 
       for (const initiallyAnime of [false, true]) {
-        it(`resolves ${initiallyAnime ? 'anime to normal' : 'normal to anime'} defaults without duplicating identical HTTP inputs`, () => {
+        it(`reevaluates ${initiallyAnime ? 'anime to normal' : 'normal to anime'} rules despite identical HTTP inputs`, () => {
           configureAnime();
+          interceptClassificationRules(initiallyAnime);
           const title = visitMedia(
             'tv',
             [],
@@ -482,17 +500,21 @@ describe('Request destinations', () => {
           );
           clickAction(/^Request$/);
           cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
-          expectConfiguration(initiallyAnime ? anime(true) : normal);
+          expectConfiguration(initiallyAnime ? anime(true) : normalWithRules);
           expectRuleCalls(1);
           changeClassification(title, !initiallyAnime);
-          const expected = initiallyAnime ? normal : anime(true);
+          const expected = initiallyAnime ? normalWithRules : anime(true);
           expectConfiguration(expected);
-          expectRuleCalls(1);
+          expectRuleCalls(2, true);
+          // Revalidating metadata without another transition must not replay rules.
+          changeClassification(title, !initiallyAnime);
+          expectConfiguration(expected);
+          expectRuleCalls(2, true);
           expectCreation(expected);
         });
       }
 
-      it('resolves distinct anime tags in both directions and reevaluates only changed HTTP inputs', () => {
+      it('resolves distinct anime tags in both directions with fresh rule evaluations', () => {
         configureAnime(false);
         const title = visitMedia('tv');
         clickAction(/^Request$/);
@@ -508,22 +530,21 @@ describe('Request destinations', () => {
       });
 
       for (const sharedTags of [true, false]) {
-        it(`keeps the latest anime defaults after ${sharedTags ? 'a shared pending evaluation' : 'an obsolete normal evaluation'}`, () => {
+        it(`keeps the latest anime rules after an obsolete evaluation with ${sharedTags ? 'identical' : 'changed'} HTTP inputs`, () => {
           configureAnime(sharedTags);
           let release: (() => void) | undefined;
+          let evaluations = 0;
           cy.intercept(
             'POST',
             '/api/v1/overrideRule/advancedRequest',
             (req) => {
-              if (req.body.tags[0] === 2) {
-                req.reply({});
+              if (++evaluations > 1) {
+                req.reply({ rootFolder: '/custom' });
                 return;
               }
               return new Promise<void>((resolve) => {
                 release = () => {
-                  req.reply(
-                    sharedTags ? {} : { profileId: 10, rootFolder: '/1' }
-                  );
+                  req.reply(genericRules);
                   resolve();
                 };
               });
@@ -534,21 +555,26 @@ describe('Request destinations', () => {
           cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
           cy.wrap(null).should(() => expect(release).to.be.a('function'));
           changeClassification(title, true);
-          if (sharedTags)
-            cy.contains('[role="dialog"] button', creationButton).should(
-              'be.disabled'
-            );
-          else expectConfiguration(anime(false));
+          const expected = { ...anime(sharedTags), folder: '/custom' };
+          expectConfiguration(expected);
+          expectRuleCalls(2, sharedTags);
+          cy.contains('[role="dialog"] button', creationButton).should(
+            'not.be.disabled'
+          );
           cy.then(() => release?.());
-          cy.wait('@rules');
-          expectConfiguration(anime(sharedTags));
-          expectRuleCalls(sharedTags ? 1 : 2);
-          expectCreation(anime(sharedTags));
+          cy.wait(['@rules', '@rules']);
+          expectConfiguration(expected);
+          expectRuleCalls(2, sharedTags);
+          expectCreation(expected);
         });
       }
 
       it('preserves manual fields while resolving unprotected anime fields', () => {
         configureAnime(false);
+        cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+          profileId: 10,
+          rootFolder: '/1',
+        }).as('rules');
         const title = visitMedia('tv');
         clickAction(/^Request$/);
         cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
@@ -573,13 +599,14 @@ describe('Request destinations', () => {
         expectRuleCalls(3);
         changeClassification(title, false);
         expectConfiguration(protectedValues);
-        expectRuleCalls(3);
+        expectRuleCalls(4);
         expectCreation(protectedValues);
       });
 
       for (const nullable of [false, true]) {
         it(`preserves ${nullable ? 'nullable' : 'explicit'} independent edit overrides on anime classification changes`, () => {
           configureAnime(false);
+          interceptClassificationRules();
           const request = pending(101, 1);
           if (nullable) {
             request.profileId = null;
@@ -590,7 +617,7 @@ describe('Request destinations', () => {
           clickAction(/^View Request — FR$/);
           expectConfiguration(
             nullable
-              ? { ...normal, tags: [] }
+              ? { ...normalWithRules, tags: [] }
               : { profile: 11, folder: '/custom', language: 31, tags: [] }
           );
           changeClassification(title, true);
@@ -600,7 +627,7 @@ describe('Request destinations', () => {
               : { profile: 11, folder: '/custom', language: 31, tags: [] }
           );
           cy.get('#server').should('be.disabled');
-          expectRuleCalls(1);
+          expectRuleCalls(2, true);
           cy.contains('[role="dialog"] button', /^Approve Request$/)
             .should('not.be.disabled')
             .click();

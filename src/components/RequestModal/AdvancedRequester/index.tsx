@@ -261,7 +261,8 @@ const AdvancedRequester = ({
     serviceId: selectedServer,
     requestId,
   };
-  // Classification affects local defaults, not the Override Rules HTTP payload.
+  // Classification affects defaults and backend rule eligibility without
+  // changing the Override Rules HTTP payload.
   const resolutionInputKey = JSON.stringify([
     ruleParameters,
     rulesRetry,
@@ -423,9 +424,9 @@ const AdvancedRequester = ({
       }
       try {
         const parameters = { ...ruleParameters, tags: ruleTags };
-        const key = JSON.stringify([parameters, rulesRetry]);
+        const key = JSON.stringify([parameters, rulesRetry, isAnime]);
         // Reuse the current evaluation (including an in-flight response or
-        // failure) when API inputs are unchanged. Only Retry repeats failures.
+        // failure) while rule inputs and classification are unchanged.
         if (ruleEvaluationRef.current?.key !== key) {
           setConfiguredServerId(null);
           setOverrideRulesError(false);
