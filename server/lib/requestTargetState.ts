@@ -2,7 +2,11 @@ import { MediaStatus, MediaType } from '@server/constants/media';
 import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import type { MediaRequest } from '@server/entity/MediaRequest';
-import type { MediaRequestTarget } from '@server/interfaces/api/requestInterfaces';
+import type {
+  MediaRequestTarget,
+  RequestDetailResponse,
+} from '@server/interfaces/api/requestInterfaces';
+import { getRequestEditRevision } from '@server/lib/requestEditRevision';
 import {
   isActiveRequestStatus,
   isRequestableDestinationStatus,
@@ -156,6 +160,16 @@ export const serializeMediaRequest = async <
 ): Promise<T & { target: MediaRequestTarget | null }> => ({
   ...request,
   target: await getRequestTargetState(request, manager),
+});
+
+// Edit responses must describe persisted state: save() can leave undefined
+// properties on the in-memory entity even though the DB retained its values.
+export const serializeRequestEdit = async (
+  request: MediaRequest,
+  manager: EntityManager
+): Promise<RequestDetailResponse> => ({
+  ...(await serializeMediaRequest(request, manager)),
+  editRevision: getRequestEditRevision(request),
 });
 
 type EffectiveStatusAliases = {

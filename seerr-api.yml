@@ -47,6 +47,20 @@ servers:
         default: http://localhost:5055
 
 components:
+  parameters:
+    RequestEditIfMatch:
+      in: header
+      name: If-Match
+      required: false
+      description: |
+        Optional conditional mutation using the accepted `editRevision` from GET or PUT /request/{requestId}.
+        Send exactly one strong quoted token, for example `"<editRevision>"`; weak, unquoted, or wildcard tokens do not match.
+        A mismatch with the current persisted editable state returns 409. Omitting the header preserves unconditional behavior.
+        This token fingerprints current state, not write history: an identical A -> B -> A state has the original token.
+        On the status endpoint this condition applies only to `approve`; `decline` ignores the header.
+      schema:
+        type: string
+      example: '"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"'
   schemas:
     Blocklist:
       type: object
@@ -1317,6 +1331,11 @@ components:
     MediaRequest:
       type: object
       properties:
+        editRevision:
+          type: string
+          readOnly: true
+          description: Deterministic fingerprint of the current persisted editable state. Returned by GET and successful PUT /request/{requestId}; use it as a quoted If-Match token for conditional editing, cancellation, or approval. It is not a monotonic version or an audit of intermediate writes.
+          example: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
         id:
           type: number
           example: 123
@@ -6742,7 +6761,7 @@ paths:
   /request/{requestId}:
     get:
       summary: Get MediaRequest
-      description: Returns a specific MediaRequest in a JSON object.
+      description: Returns a specific MediaRequest in a JSON object, including its current editRevision.
       tags:
         - request
       parameters:
@@ -6762,10 +6781,11 @@ paths:
                 $ref: '#/components/schemas/MediaRequest'
     put:
       summary: Update MediaRequest
-      description: Updates a specific media request and returns the request in a JSON object. Requires the `MANAGE_REQUESTS` permission.
+      description: Updates a specific media request and returns the persisted request with its resulting editRevision. Requires the `MANAGE_REQUESTS` permission. If-Match is optional and protects against conflicting current editable state.
       tags:
         - request
       parameters:
+        - $ref: '#/components/parameters/RequestEditIfMatch'
         - in: path
           name: requestId
           description: Request ID
@@ -6812,13 +6832,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/MediaRequest'
         '409':
-          description: Only pending requests can be modified
+          description: Request is not pending, the destination conflicts, or the supplied If-Match does not match the current editable state
     delete:
       summary: Delete request
       description: Removes a request. If the user has the `MANAGE_REQUESTS` permission, any request can be removed. Otherwise, only pending requests can be removed.
       tags:
         - request
       parameters:
+        - $ref: '#/components/parameters/RequestEditIfMatch'
         - in: path
           name: requestId
           description: Request ID
@@ -6829,6 +6850,8 @@ paths:
       responses:
         '204':
           description: Succesfully removed request
+        '409':
+          description: The supplied If-Match does not match the current editable state
   /request/{requestId}/retry:
     post:
       summary: Retry failed request
@@ -6860,11 +6883,13 @@ paths:
       summary: Update a request's status
       description: |
         Updates a request's status to approved or declined. Also returns the request in a JSON object.
+        Optional If-Match protects approval only; decline remains unconditional. To obtain the latest editRevision, GET /request/{requestId}.
 
         Requires the `MANAGE_REQUESTS` permission or `ADMIN`.
       tags:
         - request
       parameters:
+        - $ref: '#/components/parameters/RequestEditIfMatch'
         - in: path
           name: requestId
           description: Request ID
@@ -6889,7 +6914,7 @@ paths:
         '400':
           description: Status must be approve or decline
         '409':
-          description: Only pending requests can be approved or declined
+          description: Request is not pending, or an approval supplied an If-Match that does not match the current editable state
   /movie/{movieId}:
     get:
       summary: Get movie details

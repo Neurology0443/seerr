@@ -2,6 +2,11 @@ import type { MediaStatus, MediaType } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties, PaginatedResponse } from './common';
 
+export type RequestDetailResponse = NonFunctionProperties<MediaRequest> & {
+  editRevision: string;
+  target: MediaRequestTarget | null;
+};
+
 export interface RequestResultsResponse extends PaginatedResponse {
   results: (NonFunctionProperties<MediaRequest> & {
     profileName?: string;

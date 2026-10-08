@@ -74,6 +74,7 @@ export type RequestOverrides = {
   ignoreQuota?: boolean;
   isReady?: boolean;
   hasConfigurationChanges?: boolean;
+  hasLocalChanges?: boolean;
   manualValues?: DestinationValues;
   destinationChanged?: boolean;
 };
@@ -86,6 +87,7 @@ interface AdvancedRequesterProps {
   defaultOverrides?: RequestOverrides;
   initialServerId?: number;
   destinationReadOnly?: boolean;
+  disabled?: boolean;
   hideDestinationSelector?: boolean;
   requestUser?: User;
   requestId?: number;
@@ -102,6 +104,7 @@ const AdvancedRequester = ({
   defaultOverrides,
   initialServerId,
   destinationReadOnly = false,
+  disabled = false,
   hideDestinationSelector = false,
   requestUser,
   requestId,
@@ -149,6 +152,7 @@ const AdvancedRequester = ({
   const [overrideRulesError, setOverrideRulesError] = useState(false);
   const [rulesRetry, setRulesRetry] = useState(0);
   const [destinationChanged, setDestinationChanged] = useState(false);
+  const [hasLocalActions, setHasLocalActions] = useState(false);
   const originalServer = useRef(selectedServer);
   const [manualValues, setManualValues] = useState<DestinationValues>({});
   const manualValuesRef = useRef<DestinationValues>({});
@@ -292,6 +296,7 @@ const AdvancedRequester = ({
       ignoreQuota: isIgnoreQuotaVisible && ignoreQuota ? true : undefined,
       isReady: isConfigurationReady,
       hasConfigurationChanges,
+      hasLocalChanges: hasLocalActions || hasConfigurationChanges,
       manualValues,
       destinationChanged,
     });
@@ -306,6 +311,7 @@ const AdvancedRequester = ({
     isIgnoreQuotaVisible,
     isConfigurationReady,
     hasConfigurationChanges,
+    hasLocalActions,
     manualValues,
     destinationChanged,
   ]);
@@ -423,6 +429,7 @@ const AdvancedRequester = ({
     (isValidating || !serverData || !isConfigurationReady);
   const changeServer = (serverId: number) => {
     if (
+      disabled ||
       destinationReadOnly ||
       serverId === selectedServer ||
       !tierServers.some((server) => server.id === serverId)
@@ -432,6 +439,7 @@ const AdvancedRequester = ({
 
     formRevision.current += 1;
     initializedServer.current = null;
+    setHasLocalActions(true);
     setDestinationChanged(serverId !== originalServer.current);
     manualValuesRef.current = {};
     setManualValues({});
@@ -445,6 +453,7 @@ const AdvancedRequester = ({
     onServerChange?.(serverId);
   };
   const changeValue = (values: DestinationValues) => {
+    if (disabled) return;
     const nextManualValues = { ...manualValuesRef.current, ...values };
     // An explicit selection can match a displayed default while still changing
     // a persisted null. Only an already-recorded selection is a no-op.
@@ -455,6 +464,7 @@ const AdvancedRequester = ({
     // Profile, folder and language are local overrides, not rule inputs.
     // Keep them authoritative even if an evaluation is already in flight.
     manualValuesRef.current = nextManualValues;
+    setHasLocalActions(true);
     setManualValues(manualValuesRef.current);
     if (values.tags !== undefined && !isEqual(values.tags, ruleTags)) {
       formRevision.current += 1;
@@ -467,7 +477,7 @@ const AdvancedRequester = ({
     if (values.tags !== undefined) setSelectedTags(values.tags);
   };
   const retryOverrideRules = () => {
-    if (!serverData || serverError || isValidating) return;
+    if (disabled || !serverData || serverError || isValidating) return;
 
     formRevision.current += 1;
     setOverrideRulesError(false);
@@ -513,7 +523,9 @@ const AdvancedRequester = ({
               type="button"
               buttonSize="sm"
               onClick={retryOverrideRules}
-              disabled={!serverData || !!serverError || isValidating}
+              disabled={
+                disabled || !serverData || !!serverError || isValidating
+              }
             >
               {intl.formatMessage(globalMessages.retry)}
             </Button>
@@ -537,7 +549,7 @@ const AdvancedRequester = ({
                     value={selectedServer ?? ''}
                     onChange={(e) => changeServer(Number(e.target.value))}
                     className="border-gray-700 bg-gray-800"
-                    disabled={destinationReadOnly}
+                    disabled={disabled || destinationReadOnly}
                   >
                     {selectedServer === null && (
                       <option value="" disabled>
@@ -584,7 +596,9 @@ const AdvancedRequester = ({
                     changeValue({ profile: Number(e.target.value) })
                   }
                   className="border-gray-700 bg-gray-800"
-                  disabled={isServerConfigurationLoading || !serverData}
+                  disabled={
+                    disabled || isServerConfigurationLoading || !serverData
+                  }
                 >
                   {(isServerConfigurationLoading || !serverData) && (
                     <option value="">
@@ -634,7 +648,9 @@ const AdvancedRequester = ({
                   value={selectedFolder}
                   onChange={(e) => changeValue({ folder: e.target.value })}
                   className="border-gray-700 bg-gray-800"
-                  disabled={isServerConfigurationLoading || !serverData}
+                  disabled={
+                    disabled || isServerConfigurationLoading || !serverData
+                  }
                 >
                   {(isServerConfigurationLoading || !serverData) && (
                     <option value="">
@@ -689,7 +705,9 @@ const AdvancedRequester = ({
                       changeValue({ language: Number(e.target.value) })
                     }
                     className="border-gray-700 bg-gray-800"
-                    disabled={isServerConfigurationLoading || !serverData}
+                    disabled={
+                      disabled || isServerConfigurationLoading || !serverData
+                    }
                   >
                     {(isServerConfigurationLoading || !serverData) && (
                       <option value="">
@@ -736,7 +754,9 @@ const AdvancedRequester = ({
                   value: tag.id,
                 }))}
                 isMulti
-                isDisabled={isServerConfigurationLoading || !serverData}
+                isDisabled={
+                  disabled || isServerConfigurationLoading || !serverData
+                }
                 placeholder={
                   isServerConfigurationLoading || !serverData
                     ? intl.formatMessage(globalMessages.loading)
@@ -782,7 +802,12 @@ const AdvancedRequester = ({
               </p>
               <SlideCheckbox
                 checked={ignoreQuota}
-                onClick={() => setIgnoreQuota(!ignoreQuota)}
+                disabled={disabled}
+                onClick={() => {
+                  if (disabled) return;
+                  setHasLocalActions(true);
+                  setIgnoreQuota(!ignoreQuota);
+                }}
               />
             </div>
           </div>
@@ -794,10 +819,12 @@ const AdvancedRequester = ({
           selectedUser &&
           (filteredUserData ?? []).length > 1 && (
             <Listbox
+              disabled={disabled}
               as="div"
               value={selectedUser}
               onChange={(value) => {
-                if (value.id === selectedUserId) return;
+                if (disabled || value.id === selectedUserId) return;
+                setHasLocalActions(true);
                 formRevision.current += 1;
                 setConfiguredServerId(null);
                 setOverrideRulesError(false);
@@ -853,7 +880,11 @@ const AdvancedRequester = ({
                         className="shadow-xs max-h-60 overflow-auto rounded-md py-1 text-base leading-6 focus:outline-none sm:text-sm sm:leading-5"
                       >
                         {filteredUserData?.map((user) => (
-                          <ListboxOption key={user.id} value={user}>
+                          <ListboxOption
+                            key={user.id}
+                            value={user}
+                            disabled={disabled}
+                          >
                             {({ selected, active }) => (
                               <div
                                 className={`${

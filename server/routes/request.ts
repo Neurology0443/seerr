@@ -24,6 +24,7 @@ import type {
   RequestResultsResponse,
 } from '@server/interfaces/api/requestInterfaces';
 import { Permission } from '@server/lib/permissions';
+import { matchesExpectedEditRevision } from '@server/lib/requestEditRevision';
 import {
   ACTIVE_REQUEST_STATUSES,
   isActiveRequestStatus,
@@ -38,6 +39,7 @@ import {
 import {
   addEffectiveTargetStatusJoin,
   serializeMediaRequest,
+  serializeRequestEdit,
 } from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -490,7 +492,7 @@ requestRoutes.get('/:requestId', async (req, res, next) => {
 
     return res
       .status(200)
-      .json(await serializeMediaRequest(request, requestRepository.manager));
+      .json(await serializeRequestEdit(request, requestRepository.manager));
   } catch (e) {
     logger.debug('Failed to retrieve request.', {
       label: 'API',
@@ -535,6 +537,13 @@ requestRoutes.put<{ requestId: string }>(
           return next({
             status: 409,
             message: 'Only pending requests can be modified.',
+          });
+        }
+
+        if (!matchesExpectedEditRevision(req.get('If-Match'), request)) {
+          return next({
+            status: 409,
+            message: 'This request was modified by another operation.',
           });
         }
 
@@ -814,23 +823,26 @@ requestRoutes.put<{ requestId: string }>(
                 }
                 await requestRepository.save(request);
 
-                return res
-                  .status(200)
-                  .json(
-                    await serializeMediaRequest(
-                      request,
-                      requestRepository.manager
-                    )
-                  );
+                return res.status(200).json(
+                  await serializeRequestEdit(
+                    await requestRepository.findOneOrFail({
+                      where: { id: requestId },
+                    }),
+                    requestRepository.manager
+                  )
+                );
               }
             );
           }
 
-          return res
-            .status(200)
-            .json(
-              await serializeMediaRequest(request, requestRepository.manager)
-            );
+          return res.status(200).json(
+            await serializeRequestEdit(
+              await requestRepository.findOneOrFail({
+                where: { id: requestId },
+              }),
+              requestRepository.manager
+            )
+          );
         });
       });
     } catch (e) {
@@ -858,6 +870,13 @@ requestRoutes.delete('/:requestId', async (req, res, next) => {
         return next({
           status: 401,
           message: 'You do not have permission to delete this request.',
+        });
+      }
+
+      if (!matchesExpectedEditRevision(req.get('If-Match'), request)) {
+        return next({
+          status: 409,
+          message: 'This request was modified by another operation.',
         });
       }
 
@@ -1137,6 +1156,16 @@ requestRoutes.post<{
           return next({
             status: 409,
             message: 'Only pending requests can be approved or declined.',
+          });
+        }
+
+        if (
+          req.params.status === 'approve' &&
+          !matchesExpectedEditRevision(req.get('If-Match'), request)
+        ) {
+          return next({
+            status: 409,
+            message: 'This request was modified by another operation.',
           });
         }
 

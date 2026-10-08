@@ -61,6 +61,9 @@ type MediaRequestOptions = {
 
 @Entity()
 export class MediaRequest {
+  /** Calculated API edit precondition; never persisted. */
+  public editRevision?: string;
+
   /** Transient target identity used only during the initial save lifecycle. */
   public creationTarget?: RequestCreationTarget;
 
