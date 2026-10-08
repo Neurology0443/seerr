@@ -11,7 +11,11 @@ import useToasts from '@app/hooks/useToasts';
 import { useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
-import { getDefaultRequestTarget } from '@app/utils/requestTargets';
+import {
+  getDefaultRequestTarget,
+  getEditServerId,
+  isEditDestinationReadOnly,
+} from '@app/utils/requestTargets';
 import { MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
@@ -88,8 +92,14 @@ const MovieRequestModal = ({
   const editTarget = editRequest
     ? targets?.find((target) => target.serverId === editRequest.serverId)
     : undefined;
+  const isNativeEdit =
+    editRequest &&
+    (editRequest.serverId == null || editTarget?.isIndependent === false);
   const isAdvancedConfigurationReady =
     !canUseAdvancedRequester || requestOverrides?.isReady === true;
+  const editConfigurationBlocked =
+    requestOverrides?.hasConfigurationChanges === true &&
+    requestOverrides.isReady !== true;
   const { data: quota } = useSWR<QuotaResponse>(
     user &&
       (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
@@ -205,11 +215,7 @@ const MovieRequestModal = ({
 
       if (response.status === 204) {
         if (onComplete) {
-          onComplete(
-            editTarget?.isIndependent !== false
-              ? undefined
-              : MediaStatus.UNKNOWN
-          );
+          onComplete(isNativeEdit ? MediaStatus.UNKNOWN : undefined);
         }
         addToast(
           <span>
@@ -227,19 +233,27 @@ const MovieRequestModal = ({
   };
 
   const updateRequest = async (alsoApproveRequest = false) => {
+    if (editConfigurationBlocked) return;
     setIsUpdating(true);
 
     try {
       await axios.put(`/api/v1/request/${editRequest?.id}`, {
         mediaType: 'movie',
-        serverId:
-          editTarget?.isIndependent !== false
-            ? editRequest?.serverId
-            : requestOverrides?.server,
-        profileId: requestOverrides?.profile,
-        rootFolder: requestOverrides?.folder,
+        serverId: getEditServerId(
+          editRequest?.serverId,
+          editTarget,
+          requestOverrides?.server
+        ),
+        profileId: requestOverrides?.hasConfigurationChanges
+          ? requestOverrides.profile
+          : editRequest?.profileId,
+        rootFolder: requestOverrides?.hasConfigurationChanges
+          ? requestOverrides.folder
+          : editRequest?.rootFolder,
         userId: requestOverrides?.user?.id,
-        tags: requestOverrides?.tags,
+        tags: requestOverrides?.hasConfigurationChanges
+          ? requestOverrides.tags
+          : editRequest?.tags,
       });
 
       if (alsoApproveRequest) {
@@ -270,9 +284,7 @@ const MovieRequestModal = ({
       );
 
       if (onComplete) {
-        onComplete(
-          editTarget?.isIndependent !== false ? undefined : MediaStatus.PENDING
-        );
+        onComplete(isNativeEdit ? MediaStatus.PENDING : undefined);
       }
     } catch (error) {
       const isConflict =
@@ -320,8 +332,7 @@ const MovieRequestModal = ({
               : cancelRequest()
         }
         okDisabled={
-          isUpdating ||
-          (canUseAdvancedRequester && requestOverrides?.isReady !== true)
+          isUpdating || (canUseAdvancedRequester && editConfigurationBlocked)
         }
         okText={
           hasPermission(Permission.MANAGE_REQUESTS)
@@ -376,7 +387,10 @@ const MovieRequestModal = ({
             requestUser={editRequest.requestedBy}
             requestId={editRequest.id}
             initialServerId={editRequest.serverId}
-            destinationReadOnly={editTarget?.isIndependent !== false}
+            destinationReadOnly={isEditDestinationReadOnly(
+              editRequest.serverId,
+              editTarget
+            )}
             defaultOverrides={{
               folder: editRequest.rootFolder,
               profile: editRequest.profileId,
@@ -463,6 +477,7 @@ const MovieRequestModal = ({
               user: overrides?.user,
               ignoreQuota: overrides?.ignoreQuota,
               isReady: false,
+              hasConfigurationChanges: true,
             }));
           }}
           onChange={(overrides) => {

@@ -8,9 +8,11 @@ import { describe, it } from 'node:test';
 import {
   canRequestTargetTier,
   getDefaultRequestTarget,
+  getEditServerId,
   getRequestableSeasonNumbers,
   getTvRequestSeasonPayload,
   groupPendingRequests,
+  isEditDestinationReadOnly,
 } from './requestTargets';
 
 const target = (
@@ -74,7 +76,7 @@ describe('request target selection', () => {
 });
 
 describe('pending request grouping', () => {
-  it('separates independent destinations while preserving native tier groups', () => {
+  it('separates every explicit destination and isolates historical requests', () => {
     const targets = [
       target(1, { name: 'FR' }),
       target(2, { name: 'EN' }),
@@ -99,9 +101,11 @@ describe('pending request grouping', () => {
         group.requests.map((request) => request.id),
       ]),
       [
-        ['independent:1', 'FR', [10]],
-        ['independent:2', 'EN', [11]],
-        ['native:false', undefined, [12, 13, 14]],
+        ['independent:1:false', 'FR', [10]],
+        ['independent:2:false', 'EN', [11]],
+        ['native:3:false', 'Server 3', [12]],
+        ['native:4:false', 'Server 4', [13]],
+        ['historical:14', undefined, [14]],
       ]
     );
   });
@@ -111,13 +115,55 @@ describe('pending request grouping', () => {
       [
         { id: 20, serverId: 8, is4k: false },
         { id: 21, serverId: 9, is4k: false },
+        { id: 22, serverId: 8, is4k: false },
+        { id: 23, serverId: null, is4k: false },
+        { id: 24, serverId: null, is4k: false },
       ],
       undefined
     );
 
     assert.deepEqual(
       groups.map((group) => group.requests.map((request) => request.id)),
-      [[20], [21]]
+      [[20], [21], [22], [23], [24]]
     );
+  });
+
+  it('batches only an identified destination within one tier', () => {
+    const groups = groupPendingRequests(
+      [
+        { id: 1, serverId: 3, is4k: false },
+        { id: 2, serverId: 3, is4k: false },
+        { id: 3, serverId: 3, is4k: true },
+        { id: 4, serverId: 4, is4k: false },
+      ],
+      [target(3, { isIndependent: false }), target(4)]
+    );
+    assert.deepEqual(
+      groups.map((group) => group.requests.map((r) => r.id)),
+      [[1, 2], [3], [4]]
+    );
+  });
+});
+
+describe('edit destination identity', () => {
+  it('does not classify an absent historical target as independent', () => {
+    assert.equal(isEditDestinationReadOnly(null, undefined), false);
+    assert.equal(getEditServerId(null, undefined, undefined), undefined);
+    assert.equal(getEditServerId(null, undefined, 3), 3);
+  });
+
+  it('allows native changes and keeps confirmed independent destinations fixed', () => {
+    assert.equal(
+      isEditDestinationReadOnly(3, target(3, { isIndependent: false })),
+      false
+    );
+    assert.equal(getEditServerId(3, target(3, { isIndependent: false }), 4), 4);
+    assert.equal(isEditDestinationReadOnly(1, target(1)), true);
+    assert.equal(getEditServerId(1, target(1), 2), 1);
+  });
+
+  it('does not retarget an unresolved explicit destination', () => {
+    assert.equal(isEditDestinationReadOnly(99, undefined), true);
+    assert.equal(getEditServerId(99, undefined, 3), undefined);
   });
 });

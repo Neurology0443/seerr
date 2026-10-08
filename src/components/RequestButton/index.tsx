@@ -44,6 +44,7 @@ const messages = defineMessages('components.RequestButton', {
   decline4krequests:
     'Decline {requestCount, plural, one {4K Request} other {{requestCount} 4K Requests}}',
   destinationAction: '{action} — {destination}',
+  requestIdentity: 'Request #{id}',
 });
 
 interface ButtonOption {
@@ -89,12 +90,12 @@ const RequestButton = ({
     [media?.requests, targets]
   );
   const canSelectDestination = hasPermission(Permission.REQUEST_ADVANCED);
-  const canRequest = canRequestTargetTier(targets, false, canSelectDestination);
-  const canRequest4k = canRequestTargetTier(
-    targets,
-    true,
-    canSelectDestination
-  );
+  const isBlocklisted = media?.status === MediaStatus.BLOCKLISTED;
+  const canRequest =
+    !isBlocklisted &&
+    canRequestTargetTier(targets, false, canSelectDestination);
+  const canRequest4k =
+    !isBlocklisted && canRequestTargetTier(targets, true, canSelectDestination);
   const hasNativeRequestMoreTarget = (tier4k: boolean) =>
     targets?.some(
       (target) =>
@@ -149,6 +150,11 @@ const RequestButton = ({
       : action;
 
   pendingRequestGroups.forEach((group) => {
+    const destinationName =
+      group.destinationName ??
+      intl.formatMessage(messages.requestIdentity, {
+        id: group.requests[0].id,
+      });
     const representative =
       group.requests.find((request) => request.requestedBy.id === user?.id) ??
       group.requests[0];
@@ -163,7 +169,7 @@ const RequestButton = ({
     ) {
       buttons.push({
         id: `active-${tierSuffix}-${group.key}-${representative.id}`,
-        text: withDestination(viewText, group.destinationName),
+        text: withDestination(viewText, destinationName),
         action: () => {
           setEditRequest(representative);
           if (group.is4k) {
@@ -190,13 +196,13 @@ const RequestButton = ({
       buttons.push(
         {
           id: `approve-${tierSuffix}-${group.key}-${representative.id}`,
-          text: withDestination(approveText, group.destinationName),
+          text: withDestination(approveText, destinationName),
           action: () => modifyRequest(representative, 'approve'),
           svg: <CheckIcon />,
         },
         {
           id: `decline-${tierSuffix}-${group.key}-${representative.id}`,
-          text: withDestination(declineText, group.destinationName),
+          text: withDestination(declineText, destinationName),
           action: () => modifyRequest(representative, 'decline'),
           svg: <XMarkIcon />,
         }
@@ -213,13 +219,13 @@ const RequestButton = ({
       buttons.push(
         {
           id: `approve-${tierSuffix}-batch-${group.key}`,
-          text: withDestination(approveText, group.destinationName),
+          text: withDestination(approveText, destinationName),
           action: () => modifyRequests(group.requests, 'approve'),
           svg: <CheckIcon />,
         },
         {
           id: `decline-${tierSuffix}-batch-${group.key}`,
-          text: withDestination(declineText, group.destinationName),
+          text: withDestination(declineText, destinationName),
           action: () => modifyRequests(group.requests, 'decline'),
           svg: <XMarkIcon />,
         }
@@ -331,6 +337,7 @@ const RequestButton = ({
         onCancel={() => setShowRequest4kModal(false)}
       />
       <ButtonWithDropdown
+        data-testid="request-button"
         text={
           <>
             {buttonOne.svg}

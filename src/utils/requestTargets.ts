@@ -9,6 +9,21 @@ export const getDefaultRequestTarget = <T extends MovieRequestTarget>(
 ): T | undefined =>
   targets?.find((target) => target.isDefault && target.is4k === is4k);
 
+export const isEditDestinationReadOnly = (
+  serverId: number | null | undefined,
+  target: MovieRequestTarget | undefined
+): boolean => serverId != null && (!target || target.isIndependent);
+
+export const getEditServerId = (
+  originalServerId: number | null | undefined,
+  target: MovieRequestTarget | undefined,
+  selectedServerId: number | undefined
+): number | undefined => {
+  if (target?.isIndependent) return originalServerId ?? undefined;
+  if (originalServerId != null && !target) return undefined;
+  return selectedServerId;
+};
+
 export const canRequestTargetTier = (
   targets: MovieRequestTarget[] | undefined,
   is4k: boolean,
@@ -68,11 +83,11 @@ export const groupPendingRequests = <T extends PendingRequest>(
     );
     const key =
       request.serverId == null
-        ? `native:${request.is4k}`
+        ? `historical:${request.id}`
         : target
           ? target.isIndependent
-            ? `independent:${target.serverId}`
-            : `native:${request.is4k}`
+            ? `independent:${target.serverId}:${request.is4k}`
+            : `native:${target.serverId}:${request.is4k}`
           : `unresolved:${request.id}`;
     const existing = groups.get(key);
 
@@ -85,7 +100,7 @@ export const groupPendingRequests = <T extends PendingRequest>(
       key,
       is4k: request.is4k,
       isIndependent: target?.isIndependent === true,
-      destinationName: target?.isIndependent ? target.name : undefined,
+      destinationName: target?.name,
       requests: [request],
     });
   });

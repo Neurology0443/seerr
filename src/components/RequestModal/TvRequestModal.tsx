@@ -16,8 +16,10 @@ import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import {
   getDefaultRequestTarget,
+  getEditServerId,
   getRequestableSeasonNumbers,
   getTvRequestSeasonPayload,
+  isEditDestinationReadOnly,
 } from '@app/utils/requestTargets';
 import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
@@ -101,7 +103,12 @@ const TvRequestModal = ({
   const canSelectDestination = hasPermission(Permission.REQUEST_ADVANCED);
   const defaultTarget = getDefaultRequestTarget(targets, is4k);
   const selectedServerId = editRequest
-    ? editRequest.serverId
+    ? (requestOverrides?.server ??
+      editRequest.serverId ??
+      targets?.find(
+        (target) =>
+          target.isDefault && !target.isIndependent && target.is4k === is4k
+      )?.serverId)
     : canSelectDestination
       ? (requestOverrides?.server ?? defaultTarget?.serverId)
       : defaultTarget?.serverId;
@@ -111,9 +118,15 @@ const TvRequestModal = ({
   const editTarget = editRequest
     ? targets?.find((target) => target.serverId === editRequest.serverId)
     : undefined;
+  const isNativeEdit =
+    editRequest &&
+    (editRequest.serverId == null || editTarget?.isIndependent === false);
   const requestableSeasons = getRequestableSeasonNumbers(selectedTarget);
   const isAdvancedConfigurationReady =
     !canUseAdvancedRequester || requestOverrides?.isReady === true;
+  const editConfigurationBlocked =
+    requestOverrides?.hasConfigurationChanges === true &&
+    requestOverrides.isReady !== true;
   const [searchModal, setSearchModal] = useState<{
     show: boolean;
   }>({
@@ -136,6 +149,7 @@ const TvRequestModal = ({
     if (!editRequest) {
       return;
     }
+    if (selectedSeasons.length > 0 && editConfigurationBlocked) return;
 
     if (onUpdating) {
       onUpdating(true);
@@ -145,15 +159,24 @@ const TvRequestModal = ({
       if (selectedSeasons.length > 0) {
         await axios.put(`/api/v1/request/${editRequest.id}`, {
           mediaType: 'tv',
-          serverId:
-            editTarget?.isIndependent !== false
-              ? editRequest.serverId
-              : requestOverrides?.server,
-          profileId: requestOverrides?.profile,
-          rootFolder: requestOverrides?.folder,
-          languageProfileId: requestOverrides?.language,
+          serverId: getEditServerId(
+            editRequest.serverId,
+            editTarget,
+            requestOverrides?.server
+          ),
+          profileId: requestOverrides?.hasConfigurationChanges
+            ? requestOverrides.profile
+            : editRequest.profileId,
+          rootFolder: requestOverrides?.hasConfigurationChanges
+            ? requestOverrides.folder
+            : editRequest.rootFolder,
+          languageProfileId: requestOverrides?.hasConfigurationChanges
+            ? requestOverrides.language
+            : editRequest.languageProfileId,
           userId: requestOverrides?.user?.id,
-          tags: requestOverrides?.tags,
+          tags: requestOverrides?.hasConfigurationChanges
+            ? requestOverrides.tags
+            : editRequest.tags,
           seasons: selectedSeasons.toSorted((a, b) => a - b),
         });
 
@@ -193,11 +216,11 @@ const TvRequestModal = ({
       );
       if (onComplete) {
         onComplete(
-          editTarget?.isIndependent !== false
-            ? undefined
-            : selectedSeasons.length > 0
+          isNativeEdit
+            ? selectedSeasons.length > 0
               ? MediaStatus.PENDING
               : MediaStatus.UNKNOWN
+            : undefined
         );
       }
     } catch (error) {
@@ -490,7 +513,7 @@ const TvRequestModal = ({
       }
       okDisabled={
         editRequest
-          ? canUseAdvancedRequester && requestOverrides?.isReady !== true
+          ? selectedSeasons.length > 0 && editConfigurationBlocked
           : !settings.currentSettings.partialRequestsEnabled &&
               quota?.tv.limit &&
               unrequestedSeasons.length > (quota.tv.remaining ?? 0) &&
@@ -807,14 +830,19 @@ const TvRequestModal = ({
               user: overrides?.user,
               ignoreQuota: overrides?.ignoreQuota,
               isReady: false,
+              hasConfigurationChanges: true,
             }));
           }}
           requestUser={editRequest?.requestedBy}
           requestId={editRequest?.id}
-          initialServerId={editRequest?.serverId ?? defaultTarget?.serverId}
+          initialServerId={
+            editRequest ? editRequest.serverId : defaultTarget?.serverId
+          }
           hideDestinationSelector={!editRequest && !canSelectDestination}
           destinationReadOnly={
-            editRequest ? editTarget?.isIndependent !== false : false
+            editRequest
+              ? isEditDestinationReadOnly(editRequest.serverId, editTarget)
+              : false
           }
           defaultOverrides={
             editRequest

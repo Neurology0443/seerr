@@ -1,0 +1,433 @@
+// Runs against the existing Cypress app/database, like movie-details.cy.ts.
+// Arr, request mutations and requestability are stubbed for these UI regressions.
+const movieId = 438148;
+const tvId = 66732;
+const admin = {
+  id: 1,
+  displayName: 'Admin',
+  email: 'admin@seerr.dev',
+  avatar: '/avatar.png',
+  permissions: 2,
+  warnings: [],
+  userType: 1,
+};
+const beneficiary = { ...admin, id: 2, displayName: 'Beneficiary' };
+const servers = [1, 2].map((id) => ({
+  id,
+  name: id === 1 ? 'FR' : 'EN',
+  is4k: false,
+  isDefault: id === 1,
+  independentRequestDestination: false,
+  activeProfileId: id * 10,
+  activeDirectory: `/${id}`,
+  activeLanguageProfileId: id * 10,
+  activeTags: [id],
+}));
+const details = (id: number) => ({
+  server: servers[id - 1],
+  profiles: [
+    { id: id * 10, name: 'Default' },
+    { id: id * 10 + 1, name: 'Custom' },
+  ],
+  rootFolders: [
+    { id: 1, path: `/${id}` },
+    { id: 2, path: '/custom' },
+  ],
+  languageProfiles: [
+    { id: id * 10, name: 'Default' },
+    { id: 31, name: 'Custom' },
+  ],
+  tags: [{ id, label: `Tag ${id}` }],
+});
+const pending = (id: number, serverId: number | null) => ({
+  id,
+  serverId,
+  is4k: false,
+  status: 1,
+  requestedBy: admin,
+  profileId: 11,
+  rootFolder: '/custom',
+  languageProfileId: 31,
+  tags: [],
+  createdAt: '2020-01-01T00:00:00Z',
+  updatedAt: '2020-01-01T00:00:00Z',
+  seasonCount: 1,
+  seasons: [{ id, seasonNumber: 1, status: 1 }],
+});
+
+const visitMedia = (
+  type: 'movie' | 'tv',
+  requests: ReturnType<typeof pending>[] = [],
+  blocklisted = false,
+  independent = false
+) => {
+  const id = type === 'movie' ? movieId : tvId;
+  const media = {
+    id: 100,
+    tmdbId: id,
+    mediaType: type,
+    requests: requests.map((request) => ({
+      ...request,
+      type,
+      media: { id: 100, tmdbId: id, status: 1, status4k: 1 },
+    })),
+    status: blocklisted ? 6 : 1,
+    status4k: blocklisted ? 6 : 1,
+    seasons: [],
+    issues: [],
+  };
+  const common = {
+    id,
+    genres: [],
+    keywords: [],
+    credits: { cast: [], crew: [] },
+    productionCompanies: [],
+    productionCountries: [],
+    externalIds: { tvdbId: 123 },
+    spokenLanguages: [],
+    relatedVideos: [],
+    watchProviders: [],
+    voteCount: 0,
+    voteAverage: 0,
+    popularity: 0,
+    overview: 'UI regression fixture',
+    mediaInfo: media,
+  };
+  const title =
+    type === 'movie'
+      ? {
+          ...common,
+          title: 'Correction Movie',
+          originalTitle: 'Correction Movie',
+          releaseDate: '2020-01-01',
+          releases: { results: [] },
+          status: 'Released',
+        }
+      : {
+          ...common,
+          name: 'Correction Series',
+          originalName: 'Correction Series',
+          firstAirDate: '2020-01-01',
+          contentRatings: { results: [] },
+          networks: [],
+          createdBy: [],
+          episodeRunTime: [],
+          languages: [],
+          originCountry: [],
+          numberOfSeasons: 2,
+          seasons: [1, 2].map((number) => ({
+            id: number,
+            seasonNumber: number,
+            episodeCount: 10,
+            name: `Season ${number}`,
+          })),
+        };
+  cy.intercept('GET', `/api/v1/${type}/${id}`, title).as('title');
+  cy.intercept('GET', `/api/v1/${type}/${id}/request-targets`, [
+    ...servers.map((server) => ({
+      serverId: server.id,
+      name: server.name,
+      is4k: false,
+      isDefault: server.isDefault,
+      isIndependent: independent,
+      status: 1,
+      requestable: true,
+      seasons: [1, 2].map((number) => ({
+        seasonNumber: number,
+        status: 1,
+        requestable: true,
+      })),
+    })),
+    {
+      serverId: 3,
+      name: '4K',
+      is4k: true,
+      isDefault: true,
+      isIndependent: independent,
+      status: 1,
+      requestable: true,
+      seasons: [],
+    },
+  ]).as('targets');
+  cy.visit(`/${type}/${id}`);
+  cy.wait(['@title', '@targets']);
+  if (requests.length > 0) {
+    // The initial SSR data does not contain this scenario's pending requests.
+    // Waiting for the response alone does not mean React has rendered it yet.
+    const firstRequest = requests[0];
+    const destination =
+      servers.find((server) => server.id === firstRequest.serverId)?.name ??
+      `Request #${firstRequest.id}`;
+    cy.get('[data-testid="request-button"]').should(
+      'have.text',
+      `View Request — ${destination}`
+    );
+  }
+};
+
+const clickAction = (label: RegExp) => {
+  cy.get('[data-testid="request-button"]').then(($button) => {
+    if (label.test($button.text())) {
+      cy.contains('[data-testid="request-button"]', label).click();
+    } else {
+      cy.wrap($button).parent().find('button[aria-label="Expand"]').click();
+      // Only menu items are actionable while Headless UI's modal menu is open.
+      cy.get('[role="menu"]').contains('[role="menuitem"]', label).click();
+    }
+  });
+};
+
+describe('PR 5 corrective request interactions', () => {
+  beforeEach(() => {
+    cy.loginAsAdmin();
+    cy.intercept('GET', '/api/v1/auth/me', admin);
+    cy.intercept('GET', '/api/v1/user?*', { results: [admin, beneficiary] });
+    cy.intercept('GET', '/api/v1/user/*/quota', {
+      movie: { limit: 0, restricted: false },
+      tv: { limit: 0, restricted: false },
+    });
+    cy.intercept('GET', '/api/v1/settings/public', (req) => {
+      req.continue((res) =>
+        Object.assign(res.body, {
+          movie4kEnabled: true,
+          series4kEnabled: true,
+          partialRequestsEnabled: true,
+        })
+      );
+    });
+    for (const kind of ['radarr', 'sonarr']) {
+      cy.intercept('GET', `/api/v1/service/${kind}`, servers);
+      cy.intercept('GET', `/api/v1/service/${kind}/1`, details(1)).as(
+        'server1'
+      );
+      cy.intercept('GET', `/api/v1/service/${kind}/2`, details(2)).as(
+        'server2'
+      );
+    }
+    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {}).as(
+      'rules'
+    );
+    cy.intercept('POST', '/api/v1/request', {
+      statusCode: 409,
+      body: { message: 'Conflict' },
+    }).as('create');
+    cy.intercept('PUT', '/api/v1/request/*', {}).as('edit');
+    cy.intercept('DELETE', '/api/v1/request/*', { statusCode: 204 }).as(
+      'delete'
+    );
+    cy.intercept('POST', '/api/v1/request/*/approve', {}).as('approve');
+    cy.intercept('POST', '/api/v1/request/*/decline', {}).as('decline');
+  });
+
+  for (const type of ['movie', 'tv'] as const) {
+    it(`hides all new ${type} request actions when globally blocklisted`, () => {
+      visitMedia(type, [], true, true);
+      cy.get('[data-testid="request-button"]').should('not.exist');
+    });
+
+    it(`retains historical ${type} overrides and omits an unchanged null destination`, () => {
+      visitMedia(type, [pending(101, null)]);
+      clickAction(/^View Request — Request #101$/);
+      cy.get('[role="dialog"] #profile').should('have.value', '11');
+      cy.get('[role="dialog"] #folder').should('have.value', '/custom');
+      cy.contains('[role="dialog"] button', /^Approve Request$/).click();
+      cy.wait('@edit').then(({ request }) => {
+        expect(request.body).not.to.have.property('serverId');
+        expect(request.body.profileId).to.eq(11);
+        expect(request.body.rootFolder).to.eq('/custom');
+        expect(request.body.tags).to.deep.eq([]);
+        if (type === 'tv') expect(request.body.languageProfileId).to.eq(31);
+      });
+    });
+
+    it(`allows a historical ${type} request to explicitly choose a native destination`, () => {
+      visitMedia(type, [pending(101, null)]);
+      clickAction(/^View Request — Request #101$/);
+      cy.get('[role="dialog"] #server').should('not.be.disabled').select('2');
+      cy.get('[role="dialog"] #profile').should('have.value', '20');
+      cy.contains('[role="dialog"] button', /^Approve Request$/)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@edit').its('request.body.serverId').should('eq', 2);
+    });
+
+    it(`preserves an explicit native ${type} destination`, () => {
+      visitMedia(type, [pending(101, 1)]);
+      clickAction(/^View Request — FR$/);
+      cy.get('[role="dialog"] #server').should('not.be.disabled');
+      cy.get('[role="dialog"] #profile').should('have.value', '11');
+      cy.contains('[role="dialog"] button', /^Approve Request$/).click();
+      cy.wait('@edit').its('request.body.serverId').should('eq', 1);
+    });
+
+    it(`allows an unchanged ${type} edit when Arr configuration is unavailable`, () => {
+      cy.intercept('GET', '/api/v1/service/*/1', { statusCode: 500 });
+      visitMedia(type, [pending(101, 1)]);
+      clickAction(/^View Request — FR$/);
+      cy.contains('[role="dialog"] button', /^Approve Request$/)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@edit').then(({ request }) => {
+        expect(request.body.profileId).to.eq(11);
+        expect(request.body.rootFolder).to.eq('/custom');
+        expect(request.body.tags).to.deep.eq([]);
+        if (type === 'tv') expect(request.body.languageProfileId).to.eq(31);
+      });
+    });
+
+    it(`locks a confirmed independent ${type} destination`, () => {
+      visitMedia(type, [pending(101, 1)], false, true);
+      clickAction(/^View Request — FR$/);
+      cy.get('[role="dialog"] #server')
+        .should('be.disabled')
+        .and('have.value', '1');
+      cy.contains('[role="dialog"] button', /^Approve Request$/).click();
+      cy.wait('@edit').its('request.body.serverId').should('eq', 1);
+    });
+
+    it(`does not retarget unresolved ${type} requests or require Arr for an unchanged edit`, () => {
+      visitMedia(type, [pending(101, 99)]);
+      clickAction(/^View Request — Request #101$/);
+      cy.contains('[role="dialog"] button', /^Approve Request$/)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@edit').then(({ request }) => {
+        expect(request.body).not.to.have.property('serverId');
+        expect(request.body.profileId).to.eq(11);
+      });
+    });
+  }
+
+  it('hides native TV Request More actions when globally blocklisted', () => {
+    visitMedia('tv', [], true);
+    cy.get('[data-testid="request-button"]').should('not.exist');
+  });
+
+  it('only approves/declines the selected native TV destination group', () => {
+    visitMedia('tv', [pending(101, 1), pending(102, 1), pending(103, 2)]);
+    clickAction(/^Approve Request — EN$/);
+    cy.wait('@approve')
+      .its('request.url')
+      .should('include', '/request/103/approve');
+    clickAction(/^Decline 2 Requests — FR$/);
+    cy.wait(['@decline', '@decline']).then((calls) => {
+      expect(
+        calls.map((call) => call.request.url.split('/').slice(-2)[0]).sort()
+      ).to.deep.eq(['101', '102']);
+    });
+    cy.get('@approve.all').should('have.length', 1);
+  });
+
+  it('cancels a movie and deletes an empty TV edit while Arr loading fails', () => {
+    cy.intercept('GET', '/api/v1/service/*/1', { statusCode: 500 });
+    visitMedia('movie', [pending(101, 1)]);
+    clickAction(/^View Request — FR$/);
+    cy.contains('[role="dialog"] button', /^Cancel Request$/)
+      .should('not.be.disabled')
+      .click();
+    cy.wait('@delete').its('request.url').should('include', '/request/101');
+    visitMedia('tv', [pending(102, 1)]);
+    clickAction(/^View Request — FR$/);
+    cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+    cy.contains('[role="dialog"] button', /^Cancel Request$/)
+      .should('not.be.disabled')
+      .click();
+    cy.wait('@delete').its('request.url').should('include', '/request/102');
+    cy.get('@edit.all').should('have.length', 0);
+  });
+
+  it('blocks creation while destination configuration fails', () => {
+    cy.intercept('GET', '/api/v1/service/*/1', { statusCode: 500 });
+    visitMedia('movie');
+    clickAction(/^Request$/);
+    cy.contains('[role="dialog"] button', /^Request$/).should('be.disabled');
+    cy.get('@create.all').should('have.length', 0);
+  });
+
+  it('waits for configuration when editing an override while cancellation stays available', () => {
+    visitMedia('movie', [pending(101, 1)]);
+    clickAction(/^View Request — FR$/);
+    cy.get('#profile').should('not.be.disabled');
+    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+      delay: 500,
+      body: {},
+    }).as('editingRules');
+    cy.get('#profile').select('10');
+    cy.contains('[role="dialog"] button', /^Approve Request$/).should(
+      'be.disabled'
+    );
+    cy.contains('[role="dialog"] button', /^Cancel Request$/).should(
+      'not.be.disabled'
+    );
+    cy.wait('@editingRules');
+    cy.contains('[role="dialog"] button', /^Approve Request$/)
+      .should('not.be.disabled')
+      .click();
+    cy.wait('@edit').its('request.body.profileId').should('eq', 10);
+  });
+
+  it('preserves manual settings during server revalidation and beneficiary changes', () => {
+    visitMedia('movie');
+    // Control SWR's documented 2000ms request-deduplication timer, not network
+    // latency. The reconnect must occur after the original request expires.
+    cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+    clickAction(/^Request$/);
+    cy.get('#profile').should('not.be.disabled').select('11');
+    cy.get('#folder').should('not.be.disabled').select('/custom');
+    const revalidatedDetails = details(1);
+    revalidatedDetails.profiles[0].name = 'Revalidated Default';
+    cy.intercept('GET', '/api/v1/service/radarr/1', revalidatedDetails).as(
+      'revalidated'
+    );
+    cy.tick(2000);
+    cy.window().then((win) => {
+      win.dispatchEvent(new win.Event('offline'));
+      win.dispatchEvent(new win.Event('online'));
+    });
+    cy.tick(0);
+    cy.clock().then((clock) => clock.restore());
+    cy.wait('@revalidated');
+    // A changed response exercises the component's revalidation effect; an
+    // identical response can be discarded by SWR's deep equality comparison.
+    cy.get('#profile option[value="10"]').should(
+      'have.text',
+      'Revalidated Default (Default)'
+    );
+    cy.get('#profile').should('not.be.disabled').and('have.value', '11');
+    cy.get('#folder').should('have.value', '/custom');
+    cy.contains('[role="dialog"] button', 'Admin').click();
+    cy.contains('[role="option"]', 'Beneficiary').click();
+    cy.get('@rules.all').should((calls) => {
+      const last = (
+        calls as unknown as {
+          request: { body: { serviceId: number; requestUser: number } };
+        }[]
+      ).slice(-1)[0];
+      expect(last?.request.body.serviceId).to.eq(1);
+      expect(last?.request.body.requestUser).to.eq(2);
+    });
+    cy.get('#profile').should('not.be.disabled').and('have.value', '11');
+    cy.get('#folder').should('have.value', '/custom');
+    cy.get('#server').select('2');
+    cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+    cy.get('#folder').should('have.value', '/2');
+  });
+
+  it('ignores delayed Override Rules from a previous destination', () => {
+    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', (req) => {
+      req.reply({
+        delay: req.body.serviceId === 1 ? 500 : 0,
+        body: { profileId: req.body.serviceId === 1 ? 11 : 20 },
+      });
+    }).as('delayedRules');
+    visitMedia('movie');
+    clickAction(/^Request$/);
+    cy.get('@delayedRules.all').should((calls) => {
+      expect((calls as unknown as unknown[]).length).to.be.greaterThan(0);
+    });
+    cy.get('#server').select('2');
+    cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+    cy.wait(['@delayedRules', '@delayedRules']);
+    cy.get('#profile').should('have.value', '20');
+  });
+});
