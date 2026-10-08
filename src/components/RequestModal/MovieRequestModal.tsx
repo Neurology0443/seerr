@@ -2,11 +2,21 @@ import Alert from '@app/components/Common/Alert';
 import Modal from '@app/components/Common/Modal';
 import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequester';
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
+import { getEditedDestinationValues } from '@app/components/RequestModal/AdvancedRequester/state';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
+import {
+  revalidateRequestData,
+  useRequestTargets,
+} from '@app/hooks/useRequestTargets';
 import useToasts from '@app/hooks/useToasts';
 import { useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import {
+  getDefaultRequestTarget,
+  getEditServerId,
+  isEditDestinationReadOnly,
+} from '@app/utils/requestTargets';
 import { MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
@@ -16,7 +26,7 @@ import type { MovieDetails } from '@server/models/Movie';
 import axios from 'axios';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import useSWR, { mutate } from 'swr';
+import useSWR from 'swr';
 
 const messages = defineMessages('components.RequestModal', {
   requestadmin: 'This request will be approved automatically.',
@@ -34,6 +44,8 @@ const messages = defineMessages('components.RequestModal', {
   requestedited: 'Request for <strong>{title}</strong> edited successfully!',
   requestApproved: 'Request for <strong>{title}</strong> approved!',
   requesterror: 'Something went wrong while submitting the request.',
+  requestconflict:
+    'This destination is no longer requestable. Refresh your selection and try again.',
   pendingapproval: 'Your request is pending approval.',
 });
 
@@ -42,7 +54,7 @@ interface RequestModalProps extends React.HTMLAttributes<HTMLDivElement> {
   is4k?: boolean;
   editRequest?: NonFunctionProperties<MediaRequest>;
   onCancel?: () => void;
-  onComplete?: (newStatus: MediaStatus) => void;
+  onComplete?: (newStatus?: MediaStatus) => void;
   onUpdating?: (isUpdating: boolean) => void;
 }
 
@@ -63,6 +75,32 @@ const MovieRequestModal = ({
   });
   const intl = useIntl();
   const { user, hasPermission } = useUser();
+  const { targets } = useRequestTargets('movie', tmdbId);
+  const canUseAdvancedRequester = hasPermission(
+    [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
+    { type: 'or' }
+  );
+  const canSelectDestination = hasPermission(Permission.REQUEST_ADVANCED);
+  const defaultTarget = getDefaultRequestTarget(targets, is4k);
+  const selectedServerId = editRequest
+    ? editRequest.serverId
+    : canSelectDestination
+      ? (requestOverrides?.server ?? defaultTarget?.serverId)
+      : defaultTarget?.serverId;
+  const selectedTarget = targets?.find(
+    (target) => target.serverId === selectedServerId
+  );
+  const editTarget = editRequest
+    ? targets?.find((target) => target.serverId === editRequest.serverId)
+    : undefined;
+  const isNativeEdit =
+    editRequest &&
+    (editRequest.serverId == null || editTarget?.isIndependent === false);
+  const isAdvancedConfigurationReady =
+    !canUseAdvancedRequester || requestOverrides?.isReady === true;
+  const editConfigurationBlocked =
+    requestOverrides?.hasConfigurationChanges === true &&
+    requestOverrides.isReady !== true;
   const { data: quota } = useSWR<QuotaResponse>(
     user &&
       (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
@@ -77,13 +115,17 @@ const MovieRequestModal = ({
   }, [isUpdating, onUpdating]);
 
   const sendRequest = useCallback(async () => {
+    if (!selectedTarget?.requestable || !isAdvancedConfigurationReady) {
+      return;
+    }
+
     setIsUpdating(true);
 
     try {
       let overrideParams = {};
       if (requestOverrides) {
         overrideParams = {
-          serverId: requestOverrides.server,
+          serverId: canSelectDestination ? requestOverrides.server : undefined,
           profileId: requestOverrides.profile,
           rootFolder: requestOverrides.folder,
           userId: requestOverrides.user?.id,
@@ -97,22 +139,23 @@ const MovieRequestModal = ({
         ignoreQuota: requestOverrides?.ignoreQuota,
         ...overrideParams,
       });
-      mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
-      mutate('/api/v1/request/count');
+      revalidateRequestData({ mediaType: 'movie', tmdbId });
 
       if (response.data) {
         if (onComplete) {
           onComplete(
-            hasPermission(
-              is4k ? Permission.AUTO_APPROVE_4K : Permission.AUTO_APPROVE
-            ) ||
-              hasPermission(
-                is4k
-                  ? Permission.AUTO_APPROVE_4K_MOVIE
-                  : Permission.AUTO_APPROVE_MOVIE
-              )
-              ? MediaStatus.PROCESSING
-              : MediaStatus.PENDING
+            selectedTarget?.isIndependent
+              ? undefined
+              : hasPermission(
+                    is4k ? Permission.AUTO_APPROVE_4K : Permission.AUTO_APPROVE
+                  ) ||
+                  hasPermission(
+                    is4k
+                      ? Permission.AUTO_APPROVE_4K_MOVIE
+                      : Permission.AUTO_APPROVE_MOVIE
+                  )
+                ? MediaStatus.PROCESSING
+                : MediaStatus.PENDING
           );
         }
         addToast(
@@ -125,11 +168,21 @@ const MovieRequestModal = ({
           { appearance: 'success', autoDismiss: true }
         );
       }
-    } catch {
-      addToast(intl.formatMessage(messages.requesterror), {
-        appearance: 'error',
-        autoDismiss: true,
-      });
+    } catch (error) {
+      const isConflict =
+        axios.isAxiosError(error) && error.response?.status === 409;
+      if (isConflict) {
+        revalidateRequestData({ mediaType: 'movie', tmdbId });
+      }
+      addToast(
+        intl.formatMessage(
+          isConflict ? messages.requestconflict : messages.requesterror
+        ),
+        {
+          appearance: 'error',
+          autoDismiss: true,
+        }
+      );
     } finally {
       setIsUpdating(false);
     }
@@ -142,6 +195,10 @@ const MovieRequestModal = ({
     addToast,
     intl,
     hasPermission,
+    canSelectDestination,
+    isAdvancedConfigurationReady,
+    selectedTarget,
+    tmdbId,
   ]);
 
   const cancelRequest = async () => {
@@ -151,12 +208,15 @@ const MovieRequestModal = ({
       const response = await axios.delete<MediaRequest>(
         `/api/v1/request/${editRequest?.id}`
       );
-      mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
-      mutate('/api/v1/request/count');
+      revalidateRequestData({
+        mediaType: 'movie',
+        tmdbId,
+        requestId: editRequest?.id,
+      });
 
       if (response.status === 204) {
         if (onComplete) {
-          onComplete(MediaStatus.UNKNOWN);
+          onComplete(isNativeEdit ? MediaStatus.UNKNOWN : undefined);
         }
         addToast(
           <span>
@@ -174,23 +234,40 @@ const MovieRequestModal = ({
   };
 
   const updateRequest = async (alsoApproveRequest = false) => {
+    if (editConfigurationBlocked) return;
     setIsUpdating(true);
 
     try {
+      const editedValues = getEditedDestinationValues(
+        {
+          profile: editRequest?.profileId,
+          folder: editRequest?.rootFolder,
+          tags: editRequest?.tags,
+        },
+        requestOverrides?.manualValues,
+        requestOverrides ?? undefined
+      );
       await axios.put(`/api/v1/request/${editRequest?.id}`, {
         mediaType: 'movie',
-        serverId: requestOverrides?.server,
-        profileId: requestOverrides?.profile,
-        rootFolder: requestOverrides?.folder,
+        serverId: getEditServerId(
+          editRequest?.serverId,
+          editTarget,
+          requestOverrides?.server
+        ),
+        profileId: editedValues.profile,
+        rootFolder: editedValues.folder,
         userId: requestOverrides?.user?.id,
-        tags: requestOverrides?.tags,
+        tags: editedValues.tags,
       });
 
       if (alsoApproveRequest) {
         await axios.post(`/api/v1/request/${editRequest?.id}/approve`);
       }
-      mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
-      mutate('/api/v1/request/count');
+      revalidateRequestData({
+        mediaType: 'movie',
+        tmdbId,
+        requestId: editRequest?.id,
+      });
 
       addToast(
         <span>
@@ -211,13 +288,29 @@ const MovieRequestModal = ({
       );
 
       if (onComplete) {
-        onComplete(MediaStatus.PENDING);
+        onComplete(isNativeEdit ? MediaStatus.PENDING : undefined);
       }
-    } catch {
-      addToast(<span>{intl.formatMessage(messages.errorediting)}</span>, {
-        appearance: 'error',
-        autoDismiss: true,
-      });
+    } catch (error) {
+      const isConflict =
+        axios.isAxiosError(error) && error.response?.status === 409;
+      if (isConflict) {
+        revalidateRequestData({
+          mediaType: 'movie',
+          tmdbId,
+          requestId: editRequest?.id,
+        });
+      }
+      addToast(
+        <span>
+          {intl.formatMessage(
+            isConflict ? messages.requestconflict : messages.errorediting
+          )}
+        </span>,
+        {
+          appearance: 'error',
+          autoDismiss: true,
+        }
+      );
     } finally {
       setIsUpdating(false);
     }
@@ -242,7 +335,9 @@ const MovieRequestModal = ({
               ? updateRequest()
               : cancelRequest()
         }
-        okDisabled={isUpdating}
+        okDisabled={
+          isUpdating || (canUseAdvancedRequester && editConfigurationBlocked)
+        }
         okText={
           hasPermission(Permission.MANAGE_REQUESTS)
             ? intl.formatMessage(messages.approve)
@@ -295,6 +390,11 @@ const MovieRequestModal = ({
             is4k={is4k}
             requestUser={editRequest.requestedBy}
             requestId={editRequest.id}
+            initialServerId={editRequest.serverId}
+            destinationReadOnly={isEditDestinationReadOnly(
+              editRequest.serverId,
+              editTarget
+            )}
             defaultOverrides={{
               folder: editRequest.rootFolder,
               profile: editRequest.profileId,
@@ -327,6 +427,8 @@ const MovieRequestModal = ({
       onOk={sendRequest}
       okDisabled={
         isUpdating ||
+        !selectedTarget?.requestable ||
+        !isAdvancedConfigurationReady ||
         (quota?.movie.restricted && !requestOverrides?.ignoreQuota)
       }
       title={intl.formatMessage(
@@ -370,7 +472,18 @@ const MovieRequestModal = ({
           tmdbId={tmdbId}
           type="movie"
           is4k={is4k}
+          initialServerId={defaultTarget?.serverId}
+          hideDestinationSelector={!canSelectDestination}
           quota={quota}
+          onServerChange={(serverId) => {
+            setRequestOverrides((overrides) => ({
+              server: serverId,
+              user: overrides?.user,
+              ignoreQuota: overrides?.ignoreQuota,
+              isReady: false,
+              hasConfigurationChanges: true,
+            }));
+          }}
           onChange={(overrides) => {
             setRequestOverrides(overrides);
           }}

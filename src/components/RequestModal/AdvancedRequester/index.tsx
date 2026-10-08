@@ -1,8 +1,14 @@
 /* eslint-disable react-hooks/exhaustive-deps */
+import Alert from '@app/components/Common/Alert';
+import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import { SmallLoadingSpinner } from '@app/components/Common/LoadingSpinner';
 import SlideCheckbox from '@app/components/Common/SlideCheckbox';
-import useToasts from '@app/hooks/useToasts';
+import {
+  applyDestinationRules,
+  getDestinationDefaults,
+  type DestinationValues,
+} from '@app/components/RequestModal/AdvancedRequester/state';
 import type { User } from '@app/hooks/useUser';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
@@ -43,6 +49,10 @@ const messages = defineMessages('components.RequestModal.AdvancedRequester', {
   rootfolder: 'Root Folder',
   animenote: '* This series is an anime.',
   default: '{name} (Default)',
+  selectserver: 'Select destination server',
+  unavailableserver: 'Unavailable destination (#{id})',
+  overrideruleserror:
+    'Unable to load Override Rules. Retry to finish configuring this request.',
   folder: '{path} ({space})',
   requestas: 'Request As',
   languageprofile: 'Language Profile',
@@ -62,6 +72,10 @@ export type RequestOverrides = {
   language?: number;
   user?: User;
   ignoreQuota?: boolean;
+  isReady?: boolean;
+  hasConfigurationChanges?: boolean;
+  manualValues?: DestinationValues;
+  destinationChanged?: boolean;
 };
 
 interface AdvancedRequesterProps {
@@ -70,9 +84,13 @@ interface AdvancedRequesterProps {
   is4k: boolean;
   isAnime?: boolean;
   defaultOverrides?: RequestOverrides;
+  initialServerId?: number;
+  destinationReadOnly?: boolean;
+  hideDestinationSelector?: boolean;
   requestUser?: User;
   requestId?: number;
   quota?: { movie: { limit?: number }; tv: { limit?: number } };
+  onServerChange?: (serverId: number) => void;
   onChange: (overrides: RequestOverrides) => void;
 }
 
@@ -82,13 +100,16 @@ const AdvancedRequester = ({
   is4k = false,
   isAnime = false,
   defaultOverrides,
+  initialServerId,
+  destinationReadOnly = false,
+  hideDestinationSelector = false,
   requestUser,
   requestId,
   quota,
+  onServerChange,
   onChange,
 }: AdvancedRequesterProps) => {
   const intl = useIntl();
-  const { addToast } = useToasts();
   const { user: currentUser, hasPermission: currentHasPermission } = useUser();
   const { data, error } = useSWR<ServiceCommonServer[]>(
     `/api/v1/service/${type === 'movie' ? 'radarr' : 'sonarr'}`,
@@ -102,7 +123,7 @@ const AdvancedRequester = ({
   const [selectedServer, setSelectedServer] = useState<number | null>(
     defaultOverrides?.server !== undefined && defaultOverrides?.server >= 0
       ? defaultOverrides?.server
-      : null
+      : (initialServerId ?? null)
   );
   const [selectedProfile, setSelectedProfile] = useState<number>(
     defaultOverrides?.profile ?? -1
@@ -122,23 +143,65 @@ const AdvancedRequester = ({
   const [ignoreQuota, setIgnoreQuota] = useState<boolean>(
     defaultOverrides?.ignoreQuota ?? false
   );
+  const [configuredServerId, setConfiguredServerId] = useState<number | null>(
+    null
+  );
+  const [overrideRulesError, setOverrideRulesError] = useState(false);
+  const [rulesRetry, setRulesRetry] = useState(0);
+  const [destinationChanged, setDestinationChanged] = useState(false);
+  const originalServer = useRef(selectedServer);
+  const [manualValues, setManualValues] = useState<DestinationValues>({});
+  const manualValuesRef = useRef<DestinationValues>({});
+  const ruleEvaluationRef = useRef<{
+    key: string;
+    result: Promise<Partial<OverrideRulesResult>>;
+  } | null>(null);
+  const initializedServer = useRef<number | null>(null);
+  const formRevision = useRef(0);
+  const persistedOverrides = useRef(defaultOverrides);
+  const hasConfigurationChanges =
+    destinationChanged || Object.keys(manualValues).length > 0;
   const isIgnoreQuotaVisible =
     currentHasPermission([Permission.MANAGE_REQUESTS]) &&
     ((type === 'movie' ? quota?.movie.limit : quota?.tv.limit) ?? 0) > 0;
 
-  const { data: serverData, isValidating } =
-    useSWR<ServiceCommonServerWithDetails>(
-      selectedServer !== null
-        ? `/api/v1/service/${
-            type === 'movie' ? 'radarr' : 'sonarr'
-          }/${selectedServer}`
-        : null,
-      {
-        refreshInterval: 0,
-        refreshWhenHidden: false,
-        revalidateOnFocus: false,
-      }
-    );
+  const {
+    data: loadedServerData,
+    isValidating,
+    error: serverError,
+  } = useSWR<ServiceCommonServerWithDetails>(
+    selectedServer !== null
+      ? `/api/v1/service/${
+          type === 'movie' ? 'radarr' : 'sonarr'
+        }/${selectedServer}`
+      : null,
+    {
+      refreshInterval: 0,
+      refreshWhenHidden: false,
+      revalidateOnFocus: false,
+    }
+  );
+  const serverData =
+    loadedServerData?.server.id === selectedServer
+      ? loadedServerData
+      : undefined;
+  const isConfigurationReady =
+    selectedServer !== null &&
+    configuredServerId === selectedServer &&
+    !isValidating &&
+    !serverError;
+  const original = persistedOverrides.current;
+  const usePersistedOverrides =
+    !destinationChanged &&
+    (original?.server == null || original.server === selectedServer);
+  const ruleTags =
+    manualValues.tags ??
+    (usePersistedOverrides ? original?.tags : undefined) ??
+    (serverData
+      ? getDestinationDefaults(serverData.server, isAnime).tags
+      : []) ??
+    [];
+  const ruleTagsKey = JSON.stringify(ruleTags);
 
   const [selectedUser, setSelectedUser] = useState<User | null>(
     requestUser ?? null
@@ -176,7 +239,7 @@ const AdvancedRequester = ({
   );
 
   useEffect(() => {
-    if (filteredUserData && !requestUser) {
+    if (filteredUserData && !requestUser && !selectedUser) {
       const nextSelectedUser =
         filteredUserData.find((u) => u.id === currentUser?.id) ?? null;
 
@@ -189,121 +252,20 @@ const AdvancedRequester = ({
   }, [filteredUserData]);
 
   useEffect(() => {
-    let defaultServer = data?.find(
-      (server) => server.isDefault && is4k === server.is4k
+    const requestedServer = defaultOverrides?.server ?? initialServerId;
+    const defaultServer = data?.find(
+      (server) =>
+        server.isDefault &&
+        is4k === server.is4k &&
+        (!requestId || !server.independentRequestDestination)
     );
+    const nextServer = requestedServer ?? defaultServer?.id;
 
-    if (!defaultServer && (data ?? []).length > 0) {
-      defaultServer = data?.[0];
+    if (selectedServer === null && nextServer !== undefined) {
+      originalServer.current ??= nextServer;
+      setSelectedServer(nextServer);
     }
-
-    if (
-      defaultServer &&
-      defaultServer.id !== selectedServer &&
-      (!defaultOverrides || defaultOverrides.server === null)
-    ) {
-      setSelectedServer(defaultServer.id);
-    }
-  }, [data]);
-
-  useEffect(() => {
-    if (serverData) {
-      const defaultProfile = serverData.profiles.find(
-        (profile) =>
-          profile.id ===
-          (isAnime && serverData.server.activeAnimeProfileId
-            ? serverData.server.activeAnimeProfileId
-            : serverData.server.activeProfileId)
-      );
-      const defaultFolder = serverData.rootFolders.find(
-        (folder) =>
-          folder.path ===
-          (isAnime && serverData.server.activeAnimeDirectory
-            ? serverData.server.activeAnimeDirectory
-            : serverData.server.activeDirectory)
-      );
-      const defaultLanguage = serverData.languageProfiles?.find(
-        (language) =>
-          language.id ===
-          (isAnime && serverData.server.activeAnimeLanguageProfileId
-            ? serverData.server.activeAnimeLanguageProfileId
-            : serverData.server.activeLanguageProfileId)
-      );
-      const defaultTags = isAnime
-        ? serverData.server.activeAnimeTags
-        : serverData.server.activeTags;
-
-      const applyOverrides =
-        defaultOverrides &&
-        ((defaultOverrides.server === null && serverData.server.isDefault) ||
-          defaultOverrides.server === serverData.server.id);
-
-      if (
-        defaultProfile &&
-        defaultProfile.id !== selectedProfile &&
-        (!applyOverrides || defaultOverrides.profile === null)
-      ) {
-        setSelectedProfile(defaultProfile.id);
-      }
-
-      if (
-        defaultFolder &&
-        defaultFolder.path !== selectedFolder &&
-        (!applyOverrides || !defaultOverrides.folder)
-      ) {
-        setSelectedFolder(defaultFolder.path ?? '');
-      }
-
-      if (
-        defaultLanguage &&
-        defaultLanguage.id !== selectedLanguage &&
-        (!applyOverrides || defaultOverrides.language === null)
-      ) {
-        setSelectedLanguage(defaultLanguage.id);
-      }
-
-      if (
-        defaultTags &&
-        !isEqual(defaultTags, selectedTags) &&
-        (!applyOverrides || defaultOverrides.tags === null)
-      ) {
-        setSelectedTags(defaultTags);
-      }
-    }
-  }, [serverData]);
-
-  useEffect(() => {
-    if (defaultOverrides && defaultOverrides.server != null) {
-      setSelectedServer(defaultOverrides.server);
-    }
-
-    if (defaultOverrides && defaultOverrides.profile != null) {
-      setSelectedProfile(defaultOverrides.profile);
-    }
-
-    if (defaultOverrides && defaultOverrides.folder) {
-      setSelectedFolder(defaultOverrides.folder);
-    }
-
-    if (defaultOverrides && defaultOverrides.language != null) {
-      setSelectedLanguage(defaultOverrides.language);
-    }
-
-    if (defaultOverrides && defaultOverrides.tags != null) {
-      setSelectedTags(defaultOverrides.tags);
-    }
-
-    if (defaultOverrides && defaultOverrides.ignoreQuota != null) {
-      setIgnoreQuota(defaultOverrides.ignoreQuota);
-    }
-  }, [
-    defaultOverrides?.server,
-    defaultOverrides?.folder,
-    defaultOverrides?.profile,
-    defaultOverrides?.language,
-    defaultOverrides?.tags,
-    defaultOverrides?.ignoreQuota,
-  ]);
+  }, [data, defaultOverrides?.server, initialServerId, is4k]);
 
   useEffect(() => {
     const selectedUserChanged =
@@ -316,17 +278,23 @@ const AdvancedRequester = ({
   }, [isIgnoreQuotaVisible, selectedUserId]);
 
   useEffect(() => {
-    if (selectedServer !== null || selectedUser) {
-      onChange({
-        folder: selectedFolder !== '' ? selectedFolder : undefined,
-        profile: selectedProfile !== -1 ? selectedProfile : undefined,
-        server: selectedServer ?? undefined,
-        user: selectedUser ?? undefined,
-        language: selectedLanguage !== -1 ? selectedLanguage : undefined,
-        tags: selectedTags,
-        ignoreQuota: isIgnoreQuotaVisible && ignoreQuota ? true : undefined,
-      });
-    }
+    const unchangedHistorical =
+      requestId &&
+      persistedOverrides.current?.server == null &&
+      !destinationChanged;
+    onChange({
+      folder: selectedFolder !== '' ? selectedFolder : undefined,
+      profile: selectedProfile !== -1 ? selectedProfile : undefined,
+      server: unchangedHistorical ? undefined : (selectedServer ?? undefined),
+      user: selectedUser ?? undefined,
+      language: selectedLanguage !== -1 ? selectedLanguage : undefined,
+      tags: selectedTags,
+      ignoreQuota: isIgnoreQuotaVisible && ignoreQuota ? true : undefined,
+      isReady: isConfigurationReady,
+      hasConfigurationChanges,
+      manualValues,
+      destinationChanged,
+    });
   }, [
     selectedFolder,
     selectedServer,
@@ -336,50 +304,90 @@ const AdvancedRequester = ({
     selectedTags,
     ignoreQuota,
     isIgnoreQuotaVisible,
+    isConfigurationReady,
+    hasConfigurationChanges,
+    manualValues,
+    destinationChanged,
   ]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      if (tmdbId && serverData?.server.id === selectedServer) {
-        try {
-          const { data: override } = await axios.post<OverrideRulesResult>(
-            '/api/v1/overrideRule/advancedRequest',
-            {
-              mediaType: type,
-              is4k,
-              requestUser:
-                selectedUser?.id ?? requestUser?.id ?? currentUser?.id,
-              tmdbId,
-              tags: selectedTags.length > 0 ? selectedTags : undefined,
-              serviceId: selectedServer ?? undefined,
-              requestId: requestId ?? undefined,
+      if (!serverData || serverData.server.id !== selectedServer) {
+        return;
+      }
+
+      const revision = formRevision.current;
+      const protectedValues: DestinationValues = {
+        ...(usePersistedOverrides
+          ? {
+              ...(original?.profile != null && { profile: original.profile }),
+              ...(original?.folder && { folder: original.folder }),
+              ...(original?.language != null && {
+                language: original.language,
+              }),
+              ...(original?.tags != null && { tags: original.tags }),
             }
-          );
-          if (cancelled) {
-            return;
-          }
-          if (!defaultOverrides?.folder && override.rootFolder) {
-            setSelectedFolder(override.rootFolder);
-          }
-          if (!defaultOverrides?.profile && override.profileId) {
-            setSelectedProfile(override.profileId);
-          }
-          if (
-            !defaultOverrides?.tags &&
-            override.tags &&
-            !isEqual(override.tags, selectedTags)
-          ) {
-            setSelectedTags(override.tags);
-          }
-        } catch {
-          if (cancelled) {
-            return;
-          }
-          addToast(intl.formatMessage(globalMessages.error), {
-            appearance: 'error',
-            autoDismiss: true,
-          });
+          : {}),
+        ...manualValuesRef.current,
+      };
+      const defaults = getDestinationDefaults(serverData.server, isAnime);
+      const applyValues = (values: DestinationValues) => {
+        setSelectedProfile(values.profile ?? -1);
+        setSelectedFolder(values.folder ?? '');
+        setSelectedLanguage(values.language ?? -1);
+        setSelectedTags(values.tags ?? []);
+      };
+
+      // Initialize once per destination; metadata refreshes and rule results
+      // must not reset protected manual selections.
+      if (initializedServer.current !== selectedServer) {
+        initializedServer.current = selectedServer;
+        applyValues(applyDestinationRules(defaults, {}, protectedValues));
+      }
+      try {
+        const parameters = {
+          mediaType: type,
+          is4k,
+          requestUser: selectedUserId ?? requestUser?.id ?? currentUser?.id,
+          tmdbId,
+          tags: ruleTags,
+          serviceId: serverData.server.id,
+          requestId,
+        };
+        const key = JSON.stringify([parameters, rulesRetry]);
+        // Reuse the current evaluation (including an in-flight response or
+        // failure) when API inputs are unchanged. Only Retry repeats failures.
+        if (ruleEvaluationRef.current?.key !== key) {
+          setConfiguredServerId(null);
+          setOverrideRulesError(false);
+          ruleEvaluationRef.current = {
+            key,
+            result: tmdbId
+              ? axios
+                  .post<OverrideRulesResult>(
+                    '/api/v1/overrideRule/advancedRequest',
+                    parameters
+                  )
+                  .then(({ data }) => data)
+              : Promise.resolve({}),
+          };
+        }
+        const override = await ruleEvaluationRef.current.result;
+        if (cancelled || revision !== formRevision.current) {
+          return;
+        }
+
+        applyValues(
+          applyDestinationRules(defaults, override, {
+            ...protectedValues,
+            ...manualValuesRef.current,
+          })
+        );
+        setConfiguredServerId(serverData.server.id);
+      } catch {
+        if (!cancelled && revision === formRevision.current) {
+          setOverrideRulesError(true);
         }
       }
     })();
@@ -390,15 +398,82 @@ const AdvancedRequester = ({
     tmdbId,
     type,
     is4k,
-    serverData?.server.id,
+    serverData,
     selectedServer,
     selectedUserId,
     requestUser?.id,
     currentUser?.id,
-    defaultOverrides?.folder,
-    defaultOverrides?.profile,
-    defaultOverrides?.tags,
+    isAnime,
+    requestId,
+    destinationChanged,
+    ruleTagsKey,
+    rulesRetry,
   ]);
+
+  const tierServers =
+    data?.filter(
+      (server) =>
+        server.is4k === is4k &&
+        (!requestId ||
+          destinationReadOnly ||
+          !server.independentRequestDestination)
+    ) ?? [];
+  const isServerConfigurationLoading =
+    selectedServer !== null &&
+    (isValidating || !serverData || !isConfigurationReady);
+  const changeServer = (serverId: number) => {
+    if (
+      destinationReadOnly ||
+      serverId === selectedServer ||
+      !tierServers.some((server) => server.id === serverId)
+    ) {
+      return;
+    }
+
+    formRevision.current += 1;
+    initializedServer.current = null;
+    setDestinationChanged(serverId !== originalServer.current);
+    manualValuesRef.current = {};
+    setManualValues({});
+    setConfiguredServerId(null);
+    setOverrideRulesError(false);
+    setSelectedProfile(-1);
+    setSelectedFolder('');
+    setSelectedLanguage(-1);
+    setSelectedTags([]);
+    setSelectedServer(serverId);
+    onServerChange?.(serverId);
+  };
+  const changeValue = (values: DestinationValues) => {
+    const nextManualValues = { ...manualValuesRef.current, ...values };
+    // An explicit selection can match a displayed default while still changing
+    // a persisted null. Only an already-recorded selection is a no-op.
+    if (isEqual(nextManualValues, manualValuesRef.current)) {
+      return;
+    }
+
+    // Profile, folder and language are local overrides, not rule inputs.
+    // Keep them authoritative even if an evaluation is already in flight.
+    manualValuesRef.current = nextManualValues;
+    setManualValues(manualValuesRef.current);
+    if (values.tags !== undefined && !isEqual(values.tags, ruleTags)) {
+      formRevision.current += 1;
+      setConfiguredServerId(null);
+      setOverrideRulesError(false);
+    }
+    if (values.profile !== undefined) setSelectedProfile(values.profile);
+    if (values.folder !== undefined) setSelectedFolder(values.folder);
+    if (values.language !== undefined) setSelectedLanguage(values.language);
+    if (values.tags !== undefined) setSelectedTags(values.tags);
+  };
+  const retryOverrideRules = () => {
+    if (!serverData || serverError || isValidating) return;
+
+    formRevision.current += 1;
+    setOverrideRulesError(false);
+    setConfiguredServerId(null);
+    setRulesRetry((previous) => previous + 1);
+  };
 
   if (!data && !error) {
     return (
@@ -409,9 +484,10 @@ const AdvancedRequester = ({
   }
 
   if (
+    !overrideRulesError &&
     (!data ||
-      selectedServer === null ||
-      (data.filter((server) => server.is4k === is4k).length < 2 &&
+      (selectedServer !== null &&
+        tierServers.length < 2 &&
         (!serverData ||
           (serverData.profiles.length < 2 &&
             serverData.rootFolders.length < 2 &&
@@ -427,25 +503,58 @@ const AdvancedRequester = ({
       <div className="mb-2 mt-4 flex items-center text-lg font-semibold">
         {intl.formatMessage(messages.advancedoptions)}
       </div>
+      {overrideRulesError && (
+        <div role="alert">
+          <Alert
+            type="error"
+            title={intl.formatMessage(messages.overrideruleserror)}
+          >
+            <Button
+              type="button"
+              buttonSize="sm"
+              onClick={retryOverrideRules}
+              disabled={!serverData || !!serverError || isValidating}
+            >
+              {intl.formatMessage(globalMessages.retry)}
+            </Button>
+          </Alert>
+        </div>
+      )}
       <div className="rounded-md">
-        {!!data && selectedServer !== null && (
+        {!!data && tierServers.length > 0 && (
           <div className="flex flex-col md:flex-row">
-            {data.filter((server) => server.is4k === is4k).length > 1 && (
-              <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
-                <label htmlFor="server">
-                  {intl.formatMessage(messages.destinationserver)}
-                </label>
-                <select
-                  id="server"
-                  name="server"
-                  value={selectedServer}
-                  onChange={(e) => setSelectedServer(Number(e.target.value))}
-                  onBlur={(e) => setSelectedServer(Number(e.target.value))}
-                  className="border-gray-700 bg-gray-800"
-                >
-                  {data
-                    .filter((server) => server.is4k === is4k)
-                    .map((server) => (
+            {!hideDestinationSelector &&
+              (tierServers.length > 1 ||
+                selectedServer === null ||
+                destinationReadOnly) && (
+                <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
+                  <label htmlFor="server">
+                    {intl.formatMessage(messages.destinationserver)}
+                  </label>
+                  <select
+                    id="server"
+                    name="server"
+                    value={selectedServer ?? ''}
+                    onChange={(e) => changeServer(Number(e.target.value))}
+                    className="border-gray-700 bg-gray-800"
+                    disabled={destinationReadOnly}
+                  >
+                    {selectedServer === null && (
+                      <option value="" disabled>
+                        {intl.formatMessage(messages.selectserver)}
+                      </option>
+                    )}
+                    {selectedServer !== null &&
+                      !tierServers.some(
+                        (server) => server.id === selectedServer
+                      ) && (
+                        <option value={selectedServer}>
+                          {intl.formatMessage(messages.unavailableserver, {
+                            id: selectedServer,
+                          })}
+                        </option>
+                      )}
+                    {tierServers.map((server) => (
                       <option
                         key={`server-list-${server.id}`}
                         value={server.id}
@@ -457,10 +566,10 @@ const AdvancedRequester = ({
                           : server.name}
                       </option>
                     ))}
-                </select>
-              </div>
-            )}
-            {(isValidating ||
+                  </select>
+                </div>
+              )}
+            {(isServerConfigurationLoading ||
               !serverData ||
               serverData.profiles.length > 1) && (
               <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
@@ -471,17 +580,18 @@ const AdvancedRequester = ({
                   id="profile"
                   name="profile"
                   value={selectedProfile}
-                  onChange={(e) => setSelectedProfile(Number(e.target.value))}
-                  onBlur={(e) => setSelectedProfile(Number(e.target.value))}
+                  onChange={(e) =>
+                    changeValue({ profile: Number(e.target.value) })
+                  }
                   className="border-gray-700 bg-gray-800"
-                  disabled={isValidating || !serverData}
+                  disabled={isServerConfigurationLoading || !serverData}
                 >
-                  {(isValidating || !serverData) && (
+                  {(isServerConfigurationLoading || !serverData) && (
                     <option value="">
                       {intl.formatMessage(globalMessages.loading)}
                     </option>
                   )}
-                  {!isValidating &&
+                  {!isServerConfigurationLoading &&
                     serverData &&
                     serverData.profiles
                       .toSorted((a, b) =>
@@ -511,7 +621,7 @@ const AdvancedRequester = ({
                 </select>
               </div>
             )}
-            {(isValidating ||
+            {(isServerConfigurationLoading ||
               !serverData ||
               serverData.rootFolders.length > 1) && (
               <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
@@ -522,17 +632,16 @@ const AdvancedRequester = ({
                   id="folder"
                   name="folder"
                   value={selectedFolder}
-                  onChange={(e) => setSelectedFolder(e.target.value)}
-                  onBlur={(e) => setSelectedFolder(e.target.value)}
+                  onChange={(e) => changeValue({ folder: e.target.value })}
                   className="border-gray-700 bg-gray-800"
-                  disabled={isValidating || !serverData}
+                  disabled={isServerConfigurationLoading || !serverData}
                 >
-                  {(isValidating || !serverData) && (
+                  {(isServerConfigurationLoading || !serverData) && (
                     <option value="">
                       {intl.formatMessage(globalMessages.loading)}
                     </option>
                   )}
-                  {!isValidating &&
+                  {!isServerConfigurationLoading &&
                     serverData &&
                     serverData.rootFolders.map((folder) => (
                       <option
@@ -565,7 +674,7 @@ const AdvancedRequester = ({
               </div>
             )}
             {type === 'tv' &&
-              (isValidating ||
+              (isServerConfigurationLoading ||
                 !serverData ||
                 (serverData.languageProfiles ?? []).length > 1) && (
                 <div className="mb-3 w-full flex-shrink-0 flex-grow last:pr-0 md:w-1/4 md:pr-4">
@@ -577,20 +686,17 @@ const AdvancedRequester = ({
                     name="language"
                     value={selectedLanguage}
                     onChange={(e) =>
-                      setSelectedLanguage(parseInt(e.target.value))
-                    }
-                    onBlur={(e) =>
-                      setSelectedLanguage(parseInt(e.target.value))
+                      changeValue({ language: Number(e.target.value) })
                     }
                     className="border-gray-700 bg-gray-800"
-                    disabled={isValidating || !serverData}
+                    disabled={isServerConfigurationLoading || !serverData}
                   >
-                    {(isValidating || !serverData) && (
+                    {(isServerConfigurationLoading || !serverData) && (
                       <option value="">
                         {intl.formatMessage(globalMessages.loading)}
                       </option>
                     )}
-                    {!isValidating &&
+                    {!isServerConfigurationLoading &&
                       serverData &&
                       serverData.languageProfiles?.map((language) => (
                         <option
@@ -618,7 +724,9 @@ const AdvancedRequester = ({
           </div>
         )}
         {selectedServer !== null &&
-          (isValidating || !serverData || !!serverData?.tags?.length) && (
+          (isServerConfigurationLoading ||
+            !serverData ||
+            !!serverData?.tags?.length) && (
             <div className="mb-2">
               <label htmlFor="tags">{intl.formatMessage(messages.tags)}</label>
               <Select<OptionType, true>
@@ -628,9 +736,9 @@ const AdvancedRequester = ({
                   value: tag.id,
                 }))}
                 isMulti
-                isDisabled={isValidating || !serverData}
+                isDisabled={isServerConfigurationLoading || !serverData}
                 placeholder={
-                  isValidating || !serverData
+                  isServerConfigurationLoading || !serverData
                     ? intl.formatMessage(globalMessages.loading)
                     : intl.formatMessage(messages.selecttags)
                 }
@@ -655,7 +763,7 @@ const AdvancedRequester = ({
                     .filter((option) => option !== undefined) as OptionType[]
                 }
                 onChange={(value) => {
-                  setSelectedTags(value.map((option) => option.value));
+                  changeValue({ tags: value.map((option) => option.value) });
                 }}
                 noOptionsMessage={() =>
                   intl.formatMessage(messages.notagoptions)
@@ -689,6 +797,10 @@ const AdvancedRequester = ({
               as="div"
               value={selectedUser}
               onChange={(value) => {
+                if (value.id === selectedUserId) return;
+                formRevision.current += 1;
+                setConfiguredServerId(null);
+                setOverrideRulesError(false);
                 setIgnoreQuota(false);
                 setSelectedUser(value);
               }}

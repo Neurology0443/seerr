@@ -10,6 +10,7 @@ import OverrideRuleModal from '@app/components/Settings/OverrideRule/OverrideRul
 import OverrideRuleTiles from '@app/components/Settings/OverrideRule/OverrideRuleTiles';
 import RadarrModal from '@app/components/Settings/RadarrModal';
 import SonarrModal from '@app/components/Settings/SonarrModal';
+import { revalidateRequestTargets } from '@app/hooks/useRequestTargets';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import { Transition } from '@headlessui/react';
@@ -248,6 +249,18 @@ const SettingsServices = () => {
     rule: null,
   });
 
+  const revalidateServiceCaches = (type?: 'radarr' | 'sonarr') => {
+    mutate(
+      (key) =>
+        typeof key === 'string' &&
+        (type
+          ? key.startsWith(`/api/v1/service/${type}`)
+          : key.startsWith('/api/v1/service/radarr') ||
+            key.startsWith('/api/v1/service/sonarr'))
+    );
+    revalidateRequestTargets();
+  };
+
   const deleteServer = async () => {
     await axios.delete(
       `/api/v1/settings/${deleteServerModal.type}/${deleteServerModal.serverId}`
@@ -256,6 +269,7 @@ const SettingsServices = () => {
     revalidateRadarr();
     revalidateSonarr();
     mutate('/api/v1/settings/public');
+    revalidateServiceCaches(deleteServerModal.type);
   };
 
   return (
@@ -286,6 +300,7 @@ const SettingsServices = () => {
           onSave={() => {
             revalidateRadarr();
             mutate('/api/v1/settings/public');
+            revalidateServiceCaches('radarr');
             setEditRadarrModal({ open: false, radarr: null });
           }}
         />
@@ -300,6 +315,7 @@ const SettingsServices = () => {
           onSave={() => {
             revalidateSonarr();
             mutate('/api/v1/settings/public');
+            revalidateServiceCaches('sonarr');
             setEditSonarrModal({ open: false, sonarr: null });
           }}
         />

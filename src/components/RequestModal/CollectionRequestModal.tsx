@@ -35,7 +35,7 @@ interface RequestModalProps extends React.HTMLAttributes<HTMLDivElement> {
   tmdbId: number;
   is4k?: boolean;
   onCancel?: () => void;
-  onComplete?: (newStatus: MediaStatus) => void;
+  onComplete?: (newStatus?: MediaStatus) => void;
   onUpdating?: (isUpdating: boolean) => void;
 }
 
