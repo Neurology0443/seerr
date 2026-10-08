@@ -170,7 +170,7 @@ const AdvancedRequester = ({
   const manualValuesRef = useRef<DestinationValues>({});
   const ruleEvaluationRef = useRef<{
     key: string;
-    inputKey: string;
+    resolutionInputKey: string;
     tags: number[];
     defaults: DestinationValues;
     applied: boolean;
@@ -261,14 +261,19 @@ const AdvancedRequester = ({
     serviceId: selectedServer,
     requestId,
   };
-  const ruleInputKey = JSON.stringify([ruleParameters, rulesRetry]);
+  // Classification affects local defaults, not the Override Rules HTTP payload.
+  const resolutionInputKey = JSON.stringify([
+    ruleParameters,
+    rulesRetry,
+    isAnime,
+  ]);
   // A default-tag metadata change is not a user/rule-input change. Retain the
   // evaluation's tags until another resolution event or explicit tag selection.
   const ruleTags =
     manualValues.tags ??
     (usePersistedOverrides ? original?.tags : undefined) ??
     (initializedServer.current === selectedServer &&
-    ruleEvaluationRef.current?.inputKey === ruleInputKey
+    ruleEvaluationRef.current?.resolutionInputKey === resolutionInputKey
       ? ruleEvaluationRef.current.tags
       : serverData
         ? getDestinationDefaults(serverData.server, isAnime).tags
@@ -426,7 +431,7 @@ const AdvancedRequester = ({
           setOverrideRulesError(false);
           ruleEvaluationRef.current = {
             key,
-            inputKey: ruleInputKey,
+            resolutionInputKey,
             tags: ruleTags,
             defaults,
             applied: false,
@@ -441,7 +446,13 @@ const AdvancedRequester = ({
           };
         }
         const evaluation = ruleEvaluationRef.current;
-        if (initializing) {
+        if (
+          initializing ||
+          evaluation.resolutionInputKey !== resolutionInputKey
+        ) {
+          setConfiguredServerId(null);
+          evaluation.resolutionInputKey = resolutionInputKey;
+          evaluation.tags = ruleTags;
           evaluation.defaults = defaults;
           evaluation.applied = false;
         }
@@ -449,7 +460,11 @@ const AdvancedRequester = ({
         // defaults or cached rules. A pending evaluation keeps its own defaults.
         if (evaluation.applied) return;
         const override = await evaluation.result;
-        if (cancelled || revision !== formRevision.current) {
+        if (
+          cancelled ||
+          revision !== formRevision.current ||
+          evaluation.resolutionInputKey !== resolutionInputKey
+        ) {
           return;
         }
 

@@ -7,6 +7,7 @@ import type {
 
 const movieId = 438148;
 const tvId = 66732;
+const animeKeywords = [{ id: 210024, name: 'Anime' }];
 const admin = {
   id: 1,
   displayName: 'Admin',
@@ -102,7 +103,8 @@ const visitMedia = (
   blocklisted = false,
   independent = false,
   targetOverrides?: (MovieRequestTarget | TvRequestTarget)[],
-  seasonNumbers = [1, 2]
+  seasonNumbers = [1, 2],
+  isAnime = false
 ) => {
   const id = type === 'movie' ? movieId : tvId;
   const media = {
@@ -122,7 +124,7 @@ const visitMedia = (
   const common = {
     id,
     genres: [],
-    keywords: [],
+    keywords: isAnime ? animeKeywords : [],
     credits: { cast: [], crew: [] },
     productionCompanies: [],
     productionCountries: [],
@@ -375,6 +377,246 @@ describe('Request destinations', () => {
     };
     beforeEach(() => {
       cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+    });
+
+    describe('anime classification resolution', () => {
+      const normal = { profile: 10, folder: '/1', language: 10, tags: [1] };
+      const anime = (sharedTags: boolean) => ({
+        profile: 12,
+        folder: '/anime',
+        language: 13,
+        tags: sharedTags ? [1] : [2],
+      });
+      const configureAnime = (sharedTags = true) => {
+        const metadata = details(1);
+        cy.intercept('GET', '/api/v1/service/sonarr/1', {
+          ...metadata,
+          server: {
+            ...metadata.server,
+            activeAnimeProfileId: 12,
+            activeAnimeDirectory: '/anime',
+            activeAnimeLanguageProfileId: 13,
+            activeAnimeTags: sharedTags ? [1] : [2],
+          },
+          profiles: [...metadata.profiles, { id: 12, name: 'Anime' }],
+          rootFolders: [...metadata.rootFolders, { id: 3, path: '/anime' }],
+          languageProfiles: [
+            ...metadata.languageProfiles,
+            { id: 13, name: 'Anime' },
+          ],
+          tags: [
+            { id: 1, label: 'Tag 1' },
+            { id: 2, label: 'Tag 2' },
+          ],
+        });
+      };
+      const changeClassification = (
+        title: ReturnType<typeof visitMedia>,
+        isAnime: boolean
+      ) => {
+        cy.intercept('GET', `/api/v1/tv/${tvId}`, {
+          ...title,
+          keywords: isAnime ? animeKeywords : [],
+        }).as('classification');
+        revalidateMetadata();
+        cy.wait('@classification');
+        cy.contains('[role="dialog"]', '* This series is an anime.').should(
+          isAnime ? 'be.visible' : 'not.exist'
+        );
+      };
+      const expectConfiguration = (values: typeof normal) => {
+        cy.get('#server').should('have.prop', 'value', '1');
+        cy.get('#profile')
+          .should('not.be.disabled')
+          .and('have.prop', 'value', String(values.profile));
+        cy.get('#folder').should('have.prop', 'value', values.folder);
+        cy.get('#language').should(
+          'have.prop',
+          'value',
+          String(values.language)
+        );
+        cy.get('.react-select__multi-value').should(
+          'have.length',
+          values.tags.length
+        );
+        for (const id of values.tags)
+          cy.get('.react-select__multi-value').should('contain', `Tag ${id}`);
+      };
+      const expectCreation = (values: typeof normal) => {
+        cy.contains('[role="dialog"] button', creationButton)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@create').then(({ request }) => {
+          expect(request.body).to.include({
+            serverId: 1,
+            profileId: values.profile,
+            rootFolder: values.folder,
+            languageProfileId: values.language,
+          });
+          expect(request.body.tags).to.deep.eq(values.tags);
+          expect(request.body.seasons).to.deep.eq([1]);
+        });
+      };
+      const expectRuleCalls = (count: number) => {
+        cy.get('@rules.all').should((calls) => {
+          const requests = calls as unknown as {
+            request: { body: { tags: number[] } };
+          }[];
+          expect(requests.length).to.eq(count);
+          for (const call of requests)
+            expect(call.request.body).not.to.have.property('isAnime');
+        });
+      };
+
+      for (const initiallyAnime of [false, true]) {
+        it(`resolves ${initiallyAnime ? 'anime to normal' : 'normal to anime'} defaults without duplicating identical HTTP inputs`, () => {
+          configureAnime();
+          const title = visitMedia(
+            'tv',
+            [],
+            false,
+            false,
+            undefined,
+            [1, 2],
+            initiallyAnime
+          );
+          clickAction(/^Request$/);
+          cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+          expectConfiguration(initiallyAnime ? anime(true) : normal);
+          expectRuleCalls(1);
+          changeClassification(title, !initiallyAnime);
+          const expected = initiallyAnime ? normal : anime(true);
+          expectConfiguration(expected);
+          expectRuleCalls(1);
+          expectCreation(expected);
+        });
+      }
+
+      it('resolves distinct anime tags in both directions and reevaluates only changed HTTP inputs', () => {
+        configureAnime(false);
+        const title = visitMedia('tv');
+        clickAction(/^Request$/);
+        cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+        expectConfiguration(normal);
+        changeClassification(title, true);
+        expectConfiguration(anime(false));
+        expectRuleCalls(2);
+        changeClassification(title, false);
+        expectConfiguration(normal);
+        expectRuleCalls(3);
+        expectCreation(normal);
+      });
+
+      for (const sharedTags of [true, false]) {
+        it(`keeps the latest anime defaults after ${sharedTags ? 'a shared pending evaluation' : 'an obsolete normal evaluation'}`, () => {
+          configureAnime(sharedTags);
+          let release: (() => void) | undefined;
+          cy.intercept(
+            'POST',
+            '/api/v1/overrideRule/advancedRequest',
+            (req) => {
+              if (req.body.tags[0] === 2) {
+                req.reply({});
+                return;
+              }
+              return new Promise<void>((resolve) => {
+                release = () => {
+                  req.reply(
+                    sharedTags ? {} : { profileId: 10, rootFolder: '/1' }
+                  );
+                  resolve();
+                };
+              });
+            }
+          ).as('rules');
+          const title = visitMedia('tv');
+          clickAction(/^Request$/);
+          cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+          cy.wrap(null).should(() => expect(release).to.be.a('function'));
+          changeClassification(title, true);
+          if (sharedTags)
+            cy.contains('[role="dialog"] button', creationButton).should(
+              'be.disabled'
+            );
+          else expectConfiguration(anime(false));
+          cy.then(() => release?.());
+          cy.wait('@rules');
+          expectConfiguration(anime(sharedTags));
+          expectRuleCalls(sharedTags ? 1 : 2);
+          expectCreation(anime(sharedTags));
+        });
+      }
+
+      it('preserves manual fields while resolving unprotected anime fields', () => {
+        configureAnime(false);
+        const title = visitMedia('tv');
+        clickAction(/^Request$/);
+        cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+        expectConfiguration(normal);
+        cy.get('#profile').select('11');
+        cy.get('#folder').select('/custom');
+        changeClassification(title, true);
+        expectConfiguration({
+          ...anime(false),
+          profile: 11,
+          folder: '/custom',
+        });
+        cy.get('#language').select('31');
+        cy.get('.react-select__multi-value__remove').click();
+        const protectedValues = {
+          profile: 11,
+          folder: '/custom',
+          language: 31,
+          tags: [],
+        };
+        expectConfiguration(protectedValues);
+        expectRuleCalls(3);
+        changeClassification(title, false);
+        expectConfiguration(protectedValues);
+        expectRuleCalls(3);
+        expectCreation(protectedValues);
+      });
+
+      for (const nullable of [false, true]) {
+        it(`preserves ${nullable ? 'nullable' : 'explicit'} independent edit overrides on anime classification changes`, () => {
+          configureAnime(false);
+          const request = pending(101, 1);
+          if (nullable) {
+            request.profileId = null;
+            request.rootFolder = null;
+            request.languageProfileId = null;
+          }
+          const title = visitMedia('tv', [request], false, true);
+          clickAction(/^View Request — FR$/);
+          expectConfiguration(
+            nullable
+              ? { ...normal, tags: [] }
+              : { profile: 11, folder: '/custom', language: 31, tags: [] }
+          );
+          changeClassification(title, true);
+          expectConfiguration(
+            nullable
+              ? { ...anime(false), tags: [] }
+              : { profile: 11, folder: '/custom', language: 31, tags: [] }
+          );
+          cy.get('#server').should('be.disabled');
+          expectRuleCalls(1);
+          cy.contains('[role="dialog"] button', /^Approve Request$/)
+            .should('not.be.disabled')
+            .click();
+          cy.wait('@edit').then(({ request: edit }) => {
+            expect(edit.headers['if-match']).to.eq('"revision-101"');
+            expect(edit.body).to.include({
+              serverId: 1,
+              profileId: request.profileId,
+              rootFolder: request.rootFolder,
+              languageProfileId: request.languageProfileId,
+            });
+            expect(edit.body.tags).to.deep.eq([]);
+            expect(edit.body.seasons).to.deep.eq([1]);
+          });
+        });
+      }
     });
 
     for (const type of ['movie', 'tv'] as const) {
