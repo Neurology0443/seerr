@@ -100,4 +100,26 @@ describe('AdvancedRequester value precedence', () => {
       { profile: 30, folder: '/recovered-rule', language: 11, tags: [] }
     );
   });
+
+  it('preserves newer manual fields when a pending rule result is applied', async () => {
+    let manual = {
+      profile: 30,
+      folder: '/manual',
+      language: 31,
+      tags: [] as number[],
+    };
+    const result = Promise.resolve({
+      profileId: 40,
+      rootFolder: '/rule',
+      tags: [4],
+    }).then((override) =>
+      applyDestinationRules(
+        getDestinationDefaults(server, false),
+        override,
+        manual
+      )
+    );
+    manual = { ...manual, profile: 50, folder: '/new-manual', language: 51 };
+    assert.deepEqual(await result, manual);
+  });
 });

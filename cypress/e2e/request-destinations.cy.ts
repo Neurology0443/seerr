@@ -410,7 +410,125 @@ describe('Request destinations', () => {
         if (type === 'tv') expect(request.body.languageProfileId).to.eq(31);
       });
     });
+
+    it(`submits manual ${type} settings without reevaluating rules or losing readiness`, () => {
+      const response = createdRequest(type, 1, type === 'tv' ? [1] : []);
+      cy.intercept('POST', '/api/v1/request', {
+        statusCode: 201,
+        body: {
+          ...response,
+          profileId: 11,
+          rootFolder: '/custom',
+          languageProfileId: type === 'tv' ? 31 : undefined,
+          target: { ...response.target, isIndependent: false },
+          media: { ...response.media, status: 3 },
+        },
+      }).as('manualCreate');
+      visitMedia(type);
+      clickAction(/^Request$/);
+      if (type === 'tv') {
+        cy.contains('[role="dialog"] tbody tr', 'Season 1')
+          .find('[role="checkbox"]')
+          .click();
+      }
+      const submit = type === 'movie' ? /^Request$/ : /^Request 1 Season$/;
+      cy.contains('[role="dialog"] button', submit).should('not.be.disabled');
+      cy.get('@rules.all').then((calls) => {
+        const count = (calls as unknown as unknown[]).length;
+        // Any unnecessary evaluation would now fail and leave the form blocked.
+        cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+          statusCode: 500,
+          body: { message: 'Unexpected local-field evaluation' },
+        }).as('unexpectedRules');
+        cy.get('#profile').select('11').should('not.be.disabled');
+        cy.contains('[role="dialog"] button', submit).should('not.be.disabled');
+        cy.get('#folder').select('/custom').should('not.be.disabled');
+        cy.contains('[role="dialog"] button', submit).should('not.be.disabled');
+        if (type === 'tv') {
+          cy.get('#language').select('31').should('not.be.disabled');
+          cy.contains('[role="dialog"] button', submit).should(
+            'not.be.disabled'
+          );
+          cy.get('#language').select('31');
+        }
+        cy.get('#profile').select('11');
+        cy.get('#folder').select('/custom');
+        cy.get('@unexpectedRules.all').should('have.length', 0);
+        cy.get('@rules.all').should('have.length', count);
+        cy.get('[role="dialog"] [role="alert"]').should('not.exist');
+        cy.contains('[role="dialog"] button', submit)
+          .should('not.be.disabled')
+          .click();
+      });
+      cy.wait('@manualCreate').then(({ request }) => {
+        expect(request.body).to.include({
+          mediaType: type,
+          mediaId: type === 'movie' ? movieId : tvId,
+          serverId: 1,
+          profileId: 11,
+          rootFolder: '/custom',
+          userId: 1,
+        });
+        if (type === 'tv') {
+          expect(request.body.languageProfileId).to.eq(31);
+          expect(request.body.seasons).to.deep.eq([1]);
+        }
+      });
+      cy.get('[role="dialog"]').should('not.exist');
+      cy.contains(
+        `${type === 'movie' ? 'Correction Movie' : 'Correction Series'} requested successfully!`
+      ).should('be.visible');
+    });
   }
+
+  it('reevaluates changed effective tags and keeps submission blocked until they resolve', () => {
+    cy.intercept('GET', '/api/v1/service/radarr/1', {
+      ...details(1),
+      tags: [
+        { id: 1, label: 'Tag 1' },
+        { id: 99, label: 'Extra' },
+      ],
+    });
+    visitMedia('movie');
+    clickAction(/^Request$/);
+    cy.contains('[role="dialog"] button', /^Request$/).should(
+      'not.be.disabled'
+    );
+    let releaseRules: (() => void) | undefined;
+    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', (req) => {
+      return new Promise<void>((resolve) => {
+        releaseRules = () => {
+          req.reply({
+            body: { profileId: 11, rootFolder: '/custom', tags: [1, 99] },
+          });
+          resolve();
+        };
+      });
+    }).as('tagRules');
+    cy.get('[role="dialog"] .react-select__input-container input').type(
+      'Extra'
+    );
+    cy.contains('[role="option"]', /^Extra$/).click();
+    cy.wrap(null).should(() => {
+      expect(releaseRules).to.be.a('function');
+    });
+    cy.contains('[role="dialog"] button', /^Request$/).should('be.disabled');
+    cy.then(() => {
+      releaseRules?.();
+    });
+    cy.wait('@tagRules').then(({ request }) => {
+      expect(request.body.serviceId).to.eq(1);
+      expect(request.body.requestUser).to.eq(1);
+      expect(request.body.tags).to.deep.eq([1, 99]);
+    });
+    cy.get('#profile').should('not.be.disabled').and('have.value', '11');
+    cy.get('#folder').should('have.value', '/custom');
+    cy.contains('[role="dialog"] button', /^Request$/).should(
+      'not.be.disabled'
+    );
+    cy.get('#profile').select('11');
+    cy.get('@tagRules.all').should('have.length', 1);
+  });
 
   it('creates a movie on an eligible independent destination when the default is unavailable', () => {
     const independentServers = servers.map((server) => ({
@@ -732,7 +850,7 @@ describe('Request destinations', () => {
     cy.get('@create.all').should('have.length', 0);
   });
 
-  it('waits for configuration when editing an override while cancellation stays available', () => {
+  it('waits for configuration when editing a destination while cancellation stays available', () => {
     visitMedia('movie', [pending(101, 1)]);
     clickAction(/^View Request — FR$/);
     cy.get('#profile').should('not.be.disabled');
@@ -740,7 +858,7 @@ describe('Request destinations', () => {
       delay: 500,
       body: {},
     }).as('editingRules');
-    cy.get('#profile').select('10');
+    cy.get('#server').select('2');
     cy.contains('[role="dialog"] button', /^Approve Request$/).should(
       'be.disabled'
     );
@@ -751,15 +869,23 @@ describe('Request destinations', () => {
     cy.contains('[role="dialog"] button', /^Approve Request$/)
       .should('not.be.disabled')
       .click();
-    cy.wait('@edit').its('request.body.profileId').should('eq', 10);
+    cy.wait('@edit').then(({ request }) => {
+      expect(request.body.serverId).to.eq(2);
+      expect(request.body.profileId).to.eq(20);
+    });
   });
 
   it('preserves manual settings during server revalidation and beneficiary changes', () => {
-    visitMedia('movie');
+    let initialRulesCount = 0;
     // Control SWR's documented 2000ms request-deduplication timer, not network
-    // latency. The reconnect must occur after the original request expires.
+    // latency. Install before page load so even prefetched Arr data uses it.
     cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+    visitMedia('movie');
     clickAction(/^Request$/);
+    cy.get('#profile').should('not.be.disabled');
+    cy.get('@rules.all').then((calls) => {
+      initialRulesCount = (calls as unknown as unknown[]).length;
+    });
     cy.get('#profile').should('not.be.disabled').select('11');
     cy.get('#folder').should('not.be.disabled').select('/custom');
     const revalidatedDetails = details(1);
@@ -783,6 +909,9 @@ describe('Request destinations', () => {
     );
     cy.get('#profile').should('not.be.disabled').and('have.value', '11');
     cy.get('#folder').should('have.value', '/custom');
+    cy.get('@rules.all').should((calls) => {
+      expect((calls as unknown as unknown[]).length).to.eq(initialRulesCount);
+    });
     cy.contains('[role="dialog"] button', 'Admin').click();
     cy.contains('[role="option"]', 'Beneficiary').click();
     cy.get('@rules.all').should((calls) => {
@@ -791,6 +920,9 @@ describe('Request destinations', () => {
           request: { body: { serviceId: number; requestUser: number } };
         }[]
       ).slice(-1)[0];
+      expect((calls as unknown as unknown[]).length).to.eq(
+        initialRulesCount + 1
+      );
       expect(last?.request.body.serviceId).to.eq(1);
       expect(last?.request.body.requestUser).to.eq(2);
     });
@@ -799,6 +931,25 @@ describe('Request destinations', () => {
     cy.get('#server').select('2');
     cy.get('#profile').should('not.be.disabled').and('have.value', '20');
     cy.get('#folder').should('have.value', '/2');
+    cy.get('@rules.all').should((calls) => {
+      const requests = calls as unknown as {
+        request: { body: { serviceId: number; requestUser: number } };
+      }[];
+      expect(requests.length).to.eq(initialRulesCount + 2);
+      expect(requests[requests.length - 1].request.body).to.include({
+        serviceId: 2,
+        requestUser: 2,
+      });
+    });
+    cy.get('#server').select('2');
+    cy.contains('[role="dialog"] button', 'Beneficiary').click();
+    cy.contains('[role="option"]', 'Beneficiary').click();
+    cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+    cy.get('@rules.all').should((calls) => {
+      expect((calls as unknown as unknown[]).length).to.eq(
+        initialRulesCount + 2
+      );
+    });
   });
 
   it('ignores delayed Override Rules from a previous destination', () => {

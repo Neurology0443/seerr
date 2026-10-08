@@ -31,6 +31,7 @@ import type { UserResultsResponse } from '@server/interfaces/api/userInterfaces'
 import type { OverrideRulesResult } from '@server/lib/overrideRules';
 import { hasPermission } from '@server/lib/permissions';
 import axios from 'axios';
+import { isEqual } from 'lodash';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import Select from 'react-select';
@@ -147,6 +148,11 @@ const AdvancedRequester = ({
   const [rulesRetry, setRulesRetry] = useState(0);
   const [destinationChanged, setDestinationChanged] = useState(false);
   const [manualValues, setManualValues] = useState<DestinationValues>({});
+  const manualValuesRef = useRef<DestinationValues>({});
+  const ruleEvaluationRef = useRef<{
+    key: string;
+    result: Promise<Partial<OverrideRulesResult>>;
+  } | null>(null);
   const initializedServer = useRef<number | null>(null);
   const formRevision = useRef(0);
   const persistedOverrides = useRef(defaultOverrides);
@@ -181,6 +187,18 @@ const AdvancedRequester = ({
     configuredServerId === selectedServer &&
     !isValidating &&
     !serverError;
+  const original = persistedOverrides.current;
+  const usePersistedOverrides =
+    !destinationChanged &&
+    (original?.server == null || original.server === selectedServer);
+  const ruleTags =
+    manualValues.tags ??
+    (usePersistedOverrides ? original?.tags : undefined) ??
+    (serverData
+      ? getDestinationDefaults(serverData.server, isAnime).tags
+      : []) ??
+    [];
+  const ruleTagsKey = JSON.stringify(ruleTags);
 
   const [selectedUser, setSelectedUser] = useState<User | null>(
     requestUser ?? null
@@ -293,10 +311,6 @@ const AdvancedRequester = ({
       }
 
       const revision = formRevision.current;
-      const original = persistedOverrides.current;
-      const usePersistedOverrides =
-        !destinationChanged &&
-        (original?.server == null || original.server === serverData.server.id);
       const protectedValues: DestinationValues = {
         ...(usePersistedOverrides
           ? {
@@ -308,7 +322,7 @@ const AdvancedRequester = ({
               ...(original?.tags != null && { tags: original.tags }),
             }
           : {}),
-        ...manualValues,
+        ...manualValuesRef.current,
       };
       const defaults = getDestinationDefaults(serverData.server, isAnime);
       const applyValues = (values: DestinationValues) => {
@@ -318,38 +332,51 @@ const AdvancedRequester = ({
         setSelectedTags(values.tags ?? []);
       };
 
-      // Initialize once per destination. Revalidations and beneficiary changes
-      // reevaluate rules without resetting protected manual selections.
+      // Initialize once per destination; metadata refreshes and rule results
+      // must not reset protected manual selections.
       if (initializedServer.current !== selectedServer) {
         initializedServer.current = selectedServer;
         applyValues(applyDestinationRules(defaults, {}, protectedValues));
       }
-      setConfiguredServerId(null);
-      setOverrideRulesError(false);
-
       try {
-        const override = tmdbId
-          ? (
-              await axios.post<OverrideRulesResult>(
-                '/api/v1/overrideRule/advancedRequest',
-                {
-                  mediaType: type,
-                  is4k,
-                  requestUser:
-                    selectedUserId ?? requestUser?.id ?? currentUser?.id,
-                  tmdbId,
-                  tags: protectedValues.tags ?? defaults.tags,
-                  serviceId: serverData.server.id,
-                  requestId,
-                }
-              )
-            ).data
-          : {};
+        const parameters = {
+          mediaType: type,
+          is4k,
+          requestUser: selectedUserId ?? requestUser?.id ?? currentUser?.id,
+          tmdbId,
+          tags: ruleTags,
+          serviceId: serverData.server.id,
+          requestId,
+        };
+        const key = JSON.stringify([parameters, rulesRetry]);
+        // Reuse the current evaluation (including an in-flight response or
+        // failure) when API inputs are unchanged. Only Retry repeats failures.
+        if (ruleEvaluationRef.current?.key !== key) {
+          setConfiguredServerId(null);
+          setOverrideRulesError(false);
+          ruleEvaluationRef.current = {
+            key,
+            result: tmdbId
+              ? axios
+                  .post<OverrideRulesResult>(
+                    '/api/v1/overrideRule/advancedRequest',
+                    parameters
+                  )
+                  .then(({ data }) => data)
+              : Promise.resolve({}),
+          };
+        }
+        const override = await ruleEvaluationRef.current.result;
         if (cancelled || revision !== formRevision.current) {
           return;
         }
 
-        applyValues(applyDestinationRules(defaults, override, protectedValues));
+        applyValues(
+          applyDestinationRules(defaults, override, {
+            ...protectedValues,
+            ...manualValuesRef.current,
+          })
+        );
         setConfiguredServerId(serverData.server.id);
       } catch {
         if (!cancelled && revision === formRevision.current) {
@@ -372,7 +399,7 @@ const AdvancedRequester = ({
     isAnime,
     requestId,
     destinationChanged,
-    manualValues,
+    ruleTagsKey,
     rulesRetry,
   ]);
 
@@ -399,6 +426,7 @@ const AdvancedRequester = ({
     formRevision.current += 1;
     initializedServer.current = null;
     setDestinationChanged(true);
+    manualValuesRef.current = {};
     setManualValues({});
     setConfiguredServerId(null);
     setOverrideRulesError(false);
@@ -410,10 +438,24 @@ const AdvancedRequester = ({
     onServerChange?.(serverId);
   };
   const changeValue = (values: DestinationValues) => {
-    formRevision.current += 1;
-    setConfiguredServerId(null);
-    setOverrideRulesError(false);
-    setManualValues((previous) => ({ ...previous, ...values }));
+    if (
+      (values.profile === undefined || values.profile === selectedProfile) &&
+      (values.folder === undefined || values.folder === selectedFolder) &&
+      (values.language === undefined || values.language === selectedLanguage) &&
+      (values.tags === undefined || isEqual(values.tags, selectedTags))
+    ) {
+      return;
+    }
+
+    // Profile, folder and language are local overrides, not rule inputs.
+    // Keep them authoritative even if an evaluation is already in flight.
+    manualValuesRef.current = { ...manualValuesRef.current, ...values };
+    setManualValues(manualValuesRef.current);
+    if (values.tags !== undefined && !isEqual(values.tags, ruleTags)) {
+      formRevision.current += 1;
+      setConfiguredServerId(null);
+      setOverrideRulesError(false);
+    }
     if (values.profile !== undefined) setSelectedProfile(values.profile);
     if (values.folder !== undefined) setSelectedFolder(values.folder);
     if (values.language !== undefined) setSelectedLanguage(values.language);
@@ -750,6 +792,7 @@ const AdvancedRequester = ({
               as="div"
               value={selectedUser}
               onChange={(value) => {
+                if (value.id === selectedUserId) return;
                 formRevision.current += 1;
                 setConfiguredServerId(null);
                 setOverrideRulesError(false);
