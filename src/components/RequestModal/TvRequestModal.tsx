@@ -162,7 +162,9 @@ const TvRequestModal = ({
   const [tvdbId, setTvdbId] = useState<number | undefined>(undefined);
   const { data: quota } = useSWR<QuotaResponse>(
     user &&
-      (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
+      (!requestOverrides?.user?.id ||
+        requestOverrides.user.id === user.id ||
+        hasPermission(Permission.MANAGE_USERS))
       ? `/api/v1/user/${requestOverrides?.user?.id ?? user.id}/quota`
       : null
   );
@@ -171,9 +173,13 @@ const TvRequestModal = ({
     (quota?.tv.remaining ?? 0) -
     selectedSeasons.length +
     (editRequest?.seasons ?? []).length;
+  const isCreationQuotaBypassed =
+    requestOverrides?.ignoreQuota === true &&
+    hasPermission(Permission.MANAGE_REQUESTS) &&
+    (quota?.tv.limit ?? 0) > 0;
   const isQuotaBypassed = editRequest
     ? editRequest.ignoreQuota === true
-    : requestOverrides?.ignoreQuota === true;
+    : isCreationQuotaBypassed;
   const creationSeasons = getTvRequestSeasonPayload(
     selectedTarget,
     selectedSeasons,
@@ -338,6 +344,7 @@ const TvRequestModal = ({
 
   const sendRequest = async () => {
     if (
+      !quota ||
       !selectedTarget ||
       !isAdvancedConfigurationReady ||
       creationSeasons.length === 0 ||
@@ -366,7 +373,7 @@ const TvRequestModal = ({
           tvdbId: tvdbId ?? data?.externalIds.tvdbId,
           mediaType: 'tv',
           is4k,
-          ignoreQuota: requestOverrides?.ignoreQuota,
+          ignoreQuota: isCreationQuotaBypassed ? true : undefined,
           seasons: creationSeasons,
           ...overrideParams,
         },
@@ -631,7 +638,8 @@ const TvRequestModal = ({
           ? isUpdating ||
             editSession.blocked ||
             (selectedSeasons.length > 0 && editConfigurationBlocked)
-          : isCreationQuotaExceeded ||
+          : !quota ||
+            isCreationQuotaExceeded ||
             !selectedTarget ||
             !isAdvancedConfigurationReady ||
             unrequestedSeasons.length === 0 ||

@@ -124,10 +124,18 @@ const MovieRequestModal = ({
       requestOverrides.isReady !== true);
   const { data: quota } = useSWR<QuotaResponse>(
     user &&
-      (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
+      (!requestOverrides?.user?.id ||
+        requestOverrides.user.id === user.id ||
+        hasPermission(Permission.MANAGE_USERS))
       ? `/api/v1/user/${requestOverrides?.user?.id ?? user.id}/quota`
       : null
   );
+  const isQuotaBypassed =
+    requestOverrides?.ignoreQuota === true &&
+    hasPermission(Permission.MANAGE_REQUESTS) &&
+    (quota?.movie.limit ?? 0) > 0;
+  const isCreationQuotaRestricted =
+    !!quota?.movie.restricted && !isQuotaBypassed;
 
   useEffect(() => {
     if (onUpdating && (!requestToEdit || isEditActive())) {
@@ -136,7 +144,12 @@ const MovieRequestModal = ({
   }, [isUpdating, onUpdating, requestToEdit, isEditActive]);
 
   const sendRequest = useCallback(async () => {
-    if (!selectedTarget?.requestable || !isAdvancedConfigurationReady) {
+    if (
+      !quota ||
+      !selectedTarget?.requestable ||
+      !isAdvancedConfigurationReady ||
+      isCreationQuotaRestricted
+    ) {
       return;
     }
 
@@ -155,7 +168,7 @@ const MovieRequestModal = ({
         mediaId: data?.id,
         mediaType: 'movie',
         is4k,
-        ignoreQuota: requestOverrides?.ignoreQuota,
+        ignoreQuota: isQuotaBypassed ? true : undefined,
         ...overrideParams,
       });
       revalidateRequestData({ mediaType: 'movie', tmdbId });
@@ -218,6 +231,9 @@ const MovieRequestModal = ({
     isAdvancedConfigurationReady,
     selectedTarget,
     tmdbId,
+    quota,
+    isQuotaBypassed,
+    isCreationQuotaRestricted,
   ]);
 
   const cancelRequest = async () => {
@@ -538,9 +554,10 @@ const MovieRequestModal = ({
       onOk={sendRequest}
       okDisabled={
         isUpdating ||
+        !quota ||
         !selectedTarget?.requestable ||
         !isAdvancedConfigurationReady ||
-        (quota?.movie.restricted && !requestOverrides?.ignoreQuota)
+        isCreationQuotaRestricted
       }
       title={intl.formatMessage(
         is4k ? messages.requestmovie4ktitle : messages.requestmovietitle
