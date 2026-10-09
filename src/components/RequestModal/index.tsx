@@ -28,14 +28,23 @@ const RequestModal = ({
   onUpdating,
   onCancel,
 }: RequestModalProps) => {
-  // A rapid reopen can precede Transition's delayed unmount. Give every edit
-  // opening a fresh session even in that case, without changing creation flows.
-  const [session, setSession] = useState({ open: show, number: 0 });
-  if (session.open !== show) {
-    setSession({ open: show, number: session.number + (show ? 1 : 0) });
+  const requestKey = editRequest ? `edit:${editRequest.id}` : 'new';
+  const contextKey = `${type}:${tmdbId}:${is4k ? '4k' : 'standard'}:${requestKey}`;
+  // A rapid reopen can precede Transition's delayed unmount. Give every
+  // opening or request context change a fresh session even in that case.
+  const [session, setSession] = useState({
+    open: show,
+    context: contextKey,
+    number: 0,
+  });
+  if (session.open !== show || session.context !== contextKey) {
+    setSession({
+      open: show,
+      context: contextKey,
+      number: session.number + (show ? 1 : 0),
+    });
   }
-  const editorKey = editRequest ? `${editRequest.id}:${session.number}` : 'new';
-  const sessionKey = `${type}:${tmdbId}:${editorKey}`;
+  const sessionKey = `${contextKey}:${session.number}`;
   const activeSession = useRef<string | undefined>(undefined);
   // Only a committed opening can activate a session. Conditional cleanup also
   // protects a newer session from invalidation by an older one.
@@ -48,18 +57,22 @@ const RequestModal = ({
       }
     };
   }, [show, sessionKey]);
-  const isEditSessionActive = () => activeSession.current === sessionKey;
-  const cancelEdit: typeof onCancel = () => {
-    if (!isEditSessionActive()) return;
+  const isSessionActive = () => activeSession.current === sessionKey;
+  const cancelSession: typeof onCancel = () => {
+    if (!isSessionActive()) return;
     // Close handlers invalidate before the parent's show change is committed.
     activeSession.current = undefined;
+    onUpdating?.(false);
     onCancel?.();
   };
-  const completeEdit: typeof onComplete = (status) => {
-    if (isEditSessionActive()) onComplete?.(status);
+  const completeSession: typeof onComplete = (status) => {
+    if (!isSessionActive()) return;
+    activeSession.current = undefined;
+    onUpdating?.(false);
+    onComplete?.(status);
   };
-  const updateEdit: typeof onUpdating = (updating) => {
-    if (isEditSessionActive()) onUpdating?.(updating);
+  const updateSession: typeof onUpdating = (updating) => {
+    if (isSessionActive()) onUpdating?.(updating);
   };
   return (
     <Transition
@@ -74,32 +87,33 @@ const RequestModal = ({
     >
       {type === 'movie' ? (
         <MovieRequestModal
-          key={editRequest ? sessionKey : editorKey}
-          onComplete={editRequest ? completeEdit : onComplete}
-          onCancel={editRequest && onCancel ? cancelEdit : onCancel}
+          key={sessionKey}
+          onComplete={onComplete ? completeSession : undefined}
+          onCancel={onCancel ? cancelSession : undefined}
           tmdbId={tmdbId}
-          onUpdating={editRequest ? updateEdit : onUpdating}
-          isEditSessionActive={isEditSessionActive}
+          onUpdating={onUpdating ? updateSession : undefined}
+          isEditSessionActive={isSessionActive}
           is4k={is4k}
           editRequest={editRequest}
         />
       ) : type === 'tv' ? (
         <TvRequestModal
-          key={editRequest ? sessionKey : editorKey}
-          onComplete={editRequest ? completeEdit : onComplete}
-          onCancel={editRequest && onCancel ? cancelEdit : onCancel}
+          key={sessionKey}
+          onComplete={onComplete ? completeSession : undefined}
+          onCancel={onCancel ? cancelSession : undefined}
           tmdbId={tmdbId}
-          onUpdating={editRequest ? updateEdit : onUpdating}
-          isEditSessionActive={isEditSessionActive}
+          onUpdating={onUpdating ? updateSession : undefined}
+          isEditSessionActive={isSessionActive}
           is4k={is4k}
           editRequest={editRequest}
         />
       ) : (
         <CollectionRequestModal
-          onComplete={onComplete}
-          onCancel={onCancel}
+          key={sessionKey}
+          onComplete={onComplete ? completeSession : undefined}
+          onCancel={onCancel ? cancelSession : undefined}
           tmdbId={tmdbId}
-          onUpdating={onUpdating}
+          onUpdating={onUpdating ? updateSession : undefined}
           is4k={is4k}
         />
       )}

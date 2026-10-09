@@ -1,5 +1,6 @@
 // Runs against the existing Cypress app/database, like movie-details.cy.ts.
-// Arr, request mutations and requestability are stubbed for these UI regressions.
+// Arr, requestability and most mutations are stubbed for these UI regressions.
+// The persistence case also verifies a real pending native request in this DB.
 import type {
   MovieRequestTarget,
   TvRequestTarget,
@@ -281,6 +282,63 @@ const delayRequestDetail = (
   };
 };
 
+// Keep the HTTP operation alive until the test explicitly releases its result.
+// Each call has its own gate, including the parallel POSTs from a collection.
+const holdCreations = (count = 1, statusCode = 201) => {
+  const releases: (() => void)[] = [];
+  cy.intercept('POST', '/api/v1/request', (req) => {
+    if (releases.length >= count) return;
+    req.alias = 'heldCreation';
+    return new Promise<void>((resolve) => {
+      releases.push(() => {
+        const body = req.body;
+        const response = createdRequest(
+          body.mediaType,
+          body.serverId === 3 ? 1 : (body.serverId ?? 1),
+          body.seasons
+        );
+        req.reply({
+          statusCode,
+          body:
+            statusCode === 201
+              ? {
+                  ...response,
+                  serverId: body.serverId ?? 1,
+                  is4k: body.is4k,
+                  media: { ...response.media, tmdbId: body.mediaId },
+                  target: {
+                    ...response.target,
+                    serverId: body.serverId ?? 1,
+                    is4k: body.is4k,
+                  },
+                }
+              : { message: 'Previous session failed' },
+        });
+        resolve();
+      });
+    });
+  });
+  return {
+    waitForSubmission: () =>
+      cy.wrap(null).should(() => expect(releases).to.have.length(count)),
+    release: () => cy.then(() => releases.forEach((release) => release())),
+  };
+};
+const selectSeason = (number: number) =>
+  cy
+    .contains('[role="dialog"] tbody tr', `Season ${number}`)
+    .find('[role="checkbox"]');
+
+const expectCreationResult = (type: 'movie' | 'tv', statusCode: number) => {
+  cy.wait('@heldCreation').its('response.statusCode').should('eq', statusCode);
+  // Waiting for the toast also waits for the originating async continuation.
+  cy.contains(
+    statusCode === 201
+      ? `Correction ${type === 'movie' ? 'Movie' : 'Series'} requested successfully!`
+      : 'Something went wrong while submitting the request.'
+  ).should('be.visible');
+};
+
 // Custom controls must reject activation themselves; fieldset disabling alone
 // does not protect their click and keyboard handlers.
 const expectLockedEditControls = (type: 'movie' | 'tv') => {
@@ -357,6 +415,360 @@ describe('Request destinations', () => {
     cy.intercept('POST', '/api/v1/request/*/approve', {}).as('approve');
     cy.intercept('POST', '/api/v1/request/*/decline', {}).as('decline');
   });
+
+  describe(
+    'creation session isolation',
+    { defaultCommandTimeout: 15000 },
+    () => {
+      describe('backend persistence', () => {
+        let serverId: number | undefined;
+        let requestId: number | undefined;
+        let previousDefault: Record<string, unknown> | undefined;
+        afterEach(() => {
+          cy.request('POST', '/api/v1/auth/local', {
+            email: Cypress.env('ADMIN_EMAIL'),
+            password: Cypress.env('ADMIN_PASSWORD'),
+          });
+          if (requestId !== undefined)
+            cy.request('DELETE', `/api/v1/request/${requestId}`);
+          if (serverId !== undefined)
+            cy.request('DELETE', `/api/v1/settings/radarr/${serverId}`);
+          if (previousDefault) {
+            const { id, ...settings } = previousDefault;
+            cy.request('PUT', `/api/v1/settings/radarr/${id}`, settings);
+          }
+        });
+        it('persists a real native movie request after closing its originating session', () => {
+          cy.request('/api/v1/settings/radarr').then(({ body }) => {
+            previousDefault = body.find(
+              (server: { isDefault: boolean; is4k: boolean }) =>
+                server.isDefault && !server.is4k
+            );
+          });
+          // A non-auto-approved user creates a pending native request. No Arr
+          // operation is needed, so this fixture never contacts an external DVR.
+          cy.request('POST', '/api/v1/settings/radarr', {
+            name: 'Modal lifecycle test',
+            hostname: '127.0.0.1',
+            port: 1,
+            apiKey: 'test',
+            useSsl: false,
+            is4k: false,
+            isDefault: true,
+            independentRequestDestination: false,
+            activeProfileId: 10,
+            activeDirectory: '/1',
+            activeProfileName: 'Default',
+            tags: [],
+            syncEnabled: false,
+            preventSearch: true,
+            tagRequests: false,
+            overrideRule: [],
+            minimumAvailability: 'released',
+          }).then(({ body }) => {
+            serverId = body.id;
+          });
+          // Authenticate through the API so the suite's mocked /auth/me cannot
+          // redirect the login UI before the real user's cookie is established.
+          cy.request('POST', '/api/v1/auth/local', {
+            email: Cypress.env('USER_EMAIL'),
+            password: Cypress.env('USER_PASSWORD'),
+          });
+          cy.intercept('GET', '/api/v1/auth/me', {
+            ...beneficiary,
+            permissions: 32,
+          });
+          let release: (() => void) | undefined;
+          cy.intercept('POST', '/api/v1/request', (req) => {
+            req.continue(
+              (res) =>
+                new Promise<void>((resolve) => {
+                  expect(res.statusCode).to.eq(201);
+                  requestId = res.body.id;
+                  release = resolve;
+                })
+            );
+          }).as('persistedCreation');
+          visitMedia('movie');
+          clickAction(/^Request$/);
+          cy.get('[data-testid="modal-ok-button"]')
+            .should('not.be.disabled')
+            .click();
+          cy.wrap(null).should(() => expect(release).to.be.a('function'));
+          cy.get('[data-testid="modal-cancel-button"]').click();
+          cy.get('[role="dialog"]').should('not.exist');
+          clickAction(/^Request$/);
+          cy.get('[data-testid="modal-ok-button"]').should('not.be.disabled');
+          cy.then(() => release?.());
+          cy.wait('@persistedCreation')
+            .its('response.statusCode')
+            .should('eq', 201);
+          cy.contains('Correction Movie requested successfully!').should(
+            'be.visible'
+          );
+          cy.get('[role="dialog"]').should('be.visible');
+          cy.then(() => cy.request(`/api/v1/request/${requestId}`)).then(
+            ({ body }) => {
+              expect(body).to.include({ id: requestId, serverId, status: 1 });
+              expect(body.media.tmdbId).to.eq(movieId);
+            }
+          );
+          cy.get('[data-testid="modal-cancel-button"]').click();
+          cy.get('[role="dialog"]').should('not.exist');
+        });
+      });
+      for (const type of ['movie', 'tv'] as const) {
+        for (const statusCode of [201, 500]) {
+          it(`isolates a stale ${type} ${statusCode === 201 ? 'completion' : 'failure'} from a reopened creation session`, () => {
+            const old = holdCreations(1, statusCode);
+            cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+            const title = visitMedia(type, [], false, true);
+            clickAction(/^Request$/);
+            cy.get('#profile').should('not.be.disabled').select('11');
+            if (type === 'tv') selectSeason(1).click();
+            const rerendered = {
+              ...title,
+              overview: 'Creation session parent rerender',
+            };
+            cy.intercept(
+              'GET',
+              `/api/v1/${type}/${type === 'movie' ? movieId : tvId}`,
+              rerendered
+            ).as('creationRerender');
+            refreshEditCaches();
+            cy.wait('@creationRerender');
+            cy.contains(rerendered.overview).should('be.visible');
+            cy.get('#profile').should('have.value', '11');
+            cy.get('[data-testid="modal-ok-button"]').click();
+            old.waitForSubmission();
+            cy.get('[data-testid="modal-cancel-button"]').click();
+            cy.get('[role="dialog"]').should('not.exist');
+            clickAction(/^Request$/);
+            cy.get('#profile')
+              .should('not.be.disabled')
+              .and('have.value', '10');
+            if (type === 'tv') {
+              selectSeason(1).should('have.attr', 'aria-checked', 'false');
+              selectSeason(2).click();
+            }
+            cy.get('#profile').select('11');
+            old.release();
+            expectCreationResult(type, statusCode);
+            cy.get('[role="dialog"]').should('be.visible');
+            cy.get('#profile').should('have.value', '11');
+            if (type === 'tv') {
+              selectSeason(1).should('have.attr', 'aria-checked', 'false');
+              selectSeason(2).should('have.attr', 'aria-checked', 'true');
+            }
+            const current = holdCreations();
+            cy.get('[data-testid="modal-ok-button"]')
+              .should('not.be.disabled')
+              .click();
+            current.waitForSubmission();
+            current.release();
+            cy.wait('@heldCreation').then(({ request, response }) => {
+              expect(response?.statusCode).to.eq(201);
+              expect(request.body.profileId).to.eq(11);
+              if (type === 'tv') expect(request.body.seasons).to.deep.eq([2]);
+            });
+            cy.get('[role="dialog"]').should('not.exist');
+          });
+        }
+
+        for (const [old4k, current4k] of [
+          [false, true],
+          [true, false],
+          [true, true],
+        ]) {
+          it(`isolates a stale ${type} ${old4k ? '4K' : 'standard'} completion from a ${current4k ? '4K' : 'standard'} session and reopening`, () => {
+            const kind = type === 'movie' ? 'radarr' : 'sonarr';
+            const fourK = { ...servers[0], id: 3, name: '4K', is4k: true };
+            cy.intercept('GET', `/api/v1/service/${kind}`, [...servers, fourK]);
+            cy.intercept('GET', `/api/v1/service/${kind}/3`, {
+              ...details(1),
+              server: fourK,
+            });
+            const targets = [...servers, fourK].map((server) => ({
+              serverId: server.id,
+              name: server.name,
+              is4k: server.is4k,
+              isDefault: server.isDefault,
+              isIndependent: true,
+              status: 1,
+              requestable: true,
+              seasons: [1, 2].map((seasonNumber) => ({
+                seasonNumber,
+                status: 1,
+                requestable: true,
+              })),
+            }));
+            const old = holdCreations();
+            cy.request('/api/v1/settings/public').then(({ body }) => {
+              cy.intercept('GET', '/api/v1/settings/public', {
+                ...body,
+                movie4kEnabled: true,
+                series4kEnabled: true,
+                partialRequestsEnabled: true,
+              }).as('creationTierSettings');
+            });
+            visitMedia(type, [], false, true, targets);
+            cy.wait('@creationTierSettings');
+            clickAction(old4k ? /^Request in 4K$/ : /^Request$/);
+            cy.get('#profile').should('not.be.disabled');
+            if (type === 'tv') selectSeason(1).click();
+            cy.get('[data-testid="modal-ok-button"]').click();
+            old.waitForSubmission();
+            cy.get('[data-testid="modal-cancel-button"]').click();
+            cy.get('[role="dialog"]').should('not.exist');
+            clickAction(current4k ? /^Request in 4K$/ : /^Request$/);
+            cy.get('#profile').should('not.be.disabled').select('11');
+            if (type === 'tv') selectSeason(2).click();
+            old.release();
+            expectCreationResult(type, 201);
+            cy.get('[role="dialog"]').should('be.visible');
+            cy.get('#profile').should('have.value', '11');
+            if (type === 'tv')
+              selectSeason(2).should('have.attr', 'aria-checked', 'true');
+            cy.get('[data-testid="modal-cancel-button"]').click();
+            cy.get('[role="dialog"]').should('not.exist');
+            clickAction(current4k ? /^Request in 4K$/ : /^Request$/);
+            cy.get('#profile')
+              .should('not.be.disabled')
+              .and('have.value', '10');
+            if (type === 'tv') {
+              selectSeason(2).should('have.attr', 'aria-checked', 'false');
+              selectSeason(1).click();
+            }
+            const current = holdCreations();
+            cy.get('[data-testid="modal-ok-button"]').click();
+            current.waitForSubmission();
+            current.release();
+            cy.wait('@heldCreation')
+              .its('request.body.is4k')
+              .should('eq', current4k);
+            cy.get('[role="dialog"]').should('not.exist');
+          });
+        }
+
+        it(`remounts ${type} creation during an unfinished exit transition`, () => {
+          const old = holdCreations();
+          visitMedia(type, [], false, true);
+          clickAction(/^Request$/);
+          cy.get('#profile').should('not.be.disabled').select('11');
+          if (type === 'tv') selectSeason(1).click();
+          cy.get('[data-testid="modal-ok-button"]').click();
+          old.waitForSubmission();
+          cy.get('[role="dialog"]').then(($dialog) => {
+            const dialog = $dialog[0];
+            // Extend CSS transitions, then prove the exiting form is still mounted
+            // when reopening. No elapsed-time assumption or arbitrary wait.
+            cy.document().then((doc) => {
+              const style = doc.createElement('style');
+              style.textContent =
+                '.duration-300 { transition-duration: 60s !important; }';
+              doc.head.appendChild(style);
+              cy.get('[data-testid="modal-cancel-button"]').click();
+              cy.then(() => expect(dialog.isConnected).to.eq(true));
+              cy.get('[data-testid="request-button"]').click({ force: true });
+              cy.get('#profile')
+                .should('not.be.disabled')
+                .and('have.value', '10');
+              cy.then(() => {
+                expect(dialog.isConnected).to.eq(false);
+                style.remove();
+              });
+            });
+          });
+          if (type === 'tv') {
+            selectSeason(1).should('have.attr', 'aria-checked', 'false');
+            selectSeason(2).click();
+          }
+          cy.get('[data-testid="modal-ok-button"]').should('not.be.disabled');
+          cy.get('#profile').select('11');
+          cy.get('#profile').should('have.value', '11');
+          old.release();
+          expectCreationResult(type, 201);
+          cy.get('[role="dialog"]').should('be.visible');
+          cy.get('#profile').should('have.value', '11');
+          cy.get('[data-testid="modal-ok-button"]').should('not.be.disabled');
+          cy.get('[data-testid="modal-cancel-button"]').click();
+          cy.get('[role="dialog"]').should('not.exist');
+        });
+
+        for (const statusCode of [201, 500]) {
+          it(`keeps the current ${type} parent updating after an obsolete ${statusCode === 201 ? 'completion' : 'failure'}`, () => {
+            const old = holdCreations(1, statusCode);
+            const id = type === 'movie' ? movieId : tvId;
+            cy.intercept('GET', `/api/v1/${type}/${id}/recommendations*`, {
+              page: 1,
+              totalPages: 1,
+              totalResults: 1,
+              results: [
+                {
+                  id,
+                  mediaType: type,
+                  title: 'Session Card',
+                  name: 'Session Card',
+                  releaseDate: '2020-01-01',
+                  firstAirDate: '2020-01-01',
+                  overview: '',
+                  voteAverage: 0,
+                  voteCount: 0,
+                },
+              ],
+            });
+            visitMedia(type, [], false, true);
+            const card = () =>
+              cy.contains('[data-testid="title-card"]', 'Session Card');
+            const openCard = () => {
+              card().find('[role="link"]').trigger('mouseenter');
+              card()
+                .contains('button', /^Request$/)
+                .click();
+              cy.get('#profile').should('not.be.disabled');
+            };
+            const spinner = () => card().find('.bg-gray-800\\/75');
+            openCard();
+            if (type === 'tv') selectSeason(1).click();
+            cy.get('[data-testid="modal-ok-button"]').click();
+            old.waitForSubmission();
+            spinner().should('be.visible');
+            cy.get('[data-testid="modal-cancel-button"]').click();
+            cy.get('[role="dialog"]').should('not.exist');
+            spinner().should('not.exist');
+            openCard();
+            if (type === 'tv') selectSeason(2).click();
+            // Hold the new operation too: the old finally must not clear its flag.
+            const current = holdCreations(1, 500);
+            cy.get('[data-testid="modal-ok-button"]').click();
+            current.waitForSubmission();
+            spinner().should('be.visible');
+            old.release();
+            expectCreationResult(type, statusCode);
+            cy.get('[role="dialog"]').should('be.visible');
+            spinner().should('be.visible').and('not.have.attr', 'data-closed');
+            if (type === 'tv')
+              selectSeason(2).should('have.attr', 'aria-checked', 'true');
+            current.release();
+            cy.wait('@heldCreation')
+              .its('response.statusCode')
+              .should('eq', 500);
+            spinner().should('not.exist');
+            // Active failures preserve the form and its existing retry behavior.
+            const retry = holdCreations();
+            cy.get('[data-testid="modal-ok-button"]')
+              .should('not.be.disabled')
+              .click();
+            retry.waitForSubmission();
+            retry.release();
+            cy.wait('@heldCreation');
+            cy.get('[role="dialog"]').should('not.exist');
+            spinner().should('not.exist');
+          });
+        }
+      }
+    }
+  );
 
   describe('quota bypass', () => {
     const setQuota = (type: 'movie' | 'tv', limit = 1, remaining = 0) => {
@@ -1321,6 +1733,57 @@ describe('Request destinations', () => {
         }
       });
     };
+    it(
+      'isolates both delayed collection POSTs and resets selections and Advanced Request on reopening',
+      { defaultCommandTimeout: 15000 },
+      () => {
+        const old = holdCreations(2);
+        openCollectionModal();
+        cy.get('#profile').should('not.be.disabled').select('11');
+        cy.contains('[role="dialog"] button', /^Request 2 Movies$/).click();
+        old.waitForSubmission();
+        cy.get('[data-testid="modal-cancel-button"]').click();
+        cy.get('[role="dialog"]').should('not.exist');
+        cy.contains('button', /^Request Collection$/).click();
+        cy.get('#profile').should('not.be.disabled').and('have.value', '10');
+        cy.get('[role="dialog"] tbody [role="checkbox"]').should(
+          'have.attr',
+          'aria-checked',
+          'false'
+        );
+        cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+        cy.get('#profile').select('11');
+        old.release();
+        cy.wait(['@heldCreation', '@heldCreation']).then((calls) => {
+          expect(
+            calls.map(({ request }) => request.body.mediaId).sort()
+          ).to.deep.eq(parts);
+          calls.forEach(({ response }) =>
+            expect(response?.statusCode).to.eq(201)
+          );
+        });
+        cy.contains('Correction Collection requested successfully!').should(
+          'be.visible'
+        );
+        cy.get('[role="dialog"]').should('be.visible');
+        cy.get('#profile').should('have.value', '11');
+        cy.get('[role="dialog"] tbody [role="checkbox"]')
+          .first()
+          .should('have.attr', 'aria-checked', 'true');
+        cy.get('[role="dialog"] tbody [role="checkbox"]')
+          .last()
+          .should('have.attr', 'aria-checked', 'false');
+        const current = holdCreations();
+        cy.contains('[role="dialog"] button', /^Request 1 Movie$/).click();
+        current.waitForSubmission();
+        current.release();
+        cy.wait('@heldCreation').then(({ request }) => {
+          expect(request.body.mediaId).to.eq(parts[0]);
+          expect(request.body.profileId).to.eq(11);
+        });
+        cy.get('[role="dialog"]').should('not.exist');
+      }
+    );
     it('omits displayed configuration on every selected collection movie', () => {
       openCollection();
       submitCollection();
