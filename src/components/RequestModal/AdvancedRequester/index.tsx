@@ -171,7 +171,7 @@ const AdvancedRequester = ({
   const ruleEvaluationRef = useRef<{
     key: string;
     resolutionInputKey: string;
-    tags: number[];
+    tags?: number[];
     defaults: DestinationValues;
     applied: boolean;
     result: Promise<Partial<OverrideRulesResult>>;
@@ -268,18 +268,19 @@ const AdvancedRequester = ({
     rulesRetry,
     isAnime,
   ]);
-  // A default-tag metadata change is not a user/rule-input change. Retain the
-  // evaluation's tags until another resolution event or explicit tag selection.
-  const ruleTags =
-    manualValues.tags ??
-    (usePersistedOverrides ? original?.tags : undefined) ??
-    (initializedServer.current === selectedServer &&
-    ruleEvaluationRef.current?.resolutionInputKey === resolutionInputKey
-      ? ruleEvaluationRef.current.tags
-      : serverData
-        ? getDestinationDefaults(serverData.server, isAnime).tags
-        : []) ??
-    [];
+  // Creation previews use only the tags that will be explicitly submitted.
+  // Edits retain their existing persisted/default-tag evaluation inputs.
+  const ruleTags = !requestId
+    ? manualValues.tags
+    : (manualValues.tags ??
+      (usePersistedOverrides ? original?.tags : undefined) ??
+      (initializedServer.current === selectedServer &&
+      ruleEvaluationRef.current?.resolutionInputKey === resolutionInputKey
+        ? ruleEvaluationRef.current.tags
+        : serverData
+          ? getDestinationDefaults(serverData.server, isAnime).tags
+          : []) ??
+      []);
   const ruleTagsKey = JSON.stringify(ruleTags);
 
   const { data: userData } = useSWR<UserResultsResponse>(

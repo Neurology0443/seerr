@@ -6,9 +6,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   applyDestinationRules,
+  getCreationDestinationOverrides,
   getDestinationDefaults,
   getEditedDestinationValues,
   validateDestinationSelection,
+  type DestinationValues,
 } from './state';
 
 const server: ServiceCommonServer = {
@@ -26,6 +28,63 @@ const server: ServiceCommonServer = {
   activeAnimeLanguageProfileId: 13,
   activeAnimeTags: [2],
 };
+
+describe('creation configuration overrides', () => {
+  it('omits untouched configuration', () => {
+    assert.deepEqual(getCreationDestinationOverrides(), {});
+    assert.deepEqual(getCreationDestinationOverrides({}), {});
+  });
+
+  for (const [manual, expected] of [
+    [{ profile: 30 }, { profileId: 30 }],
+    [{ folder: '/manual' }, { rootFolder: '/manual' }],
+    [{ language: 31 }, { languageProfileId: 31 }],
+    [{ tags: [3] }, { tags: [3] }],
+    [{ tags: [] }, { tags: [] }],
+  ] as [DestinationValues, Record<string, unknown>][]) {
+    it(`maps only explicit ${Object.keys(manual)[0]} (${JSON.stringify(manual)})`, () => {
+      assert.deepEqual(getCreationDestinationOverrides(manual), expected);
+    });
+  }
+
+  it('retains explicit values equal to defaults', () => {
+    const defaults = getDestinationDefaults(server, false);
+    assert.deepEqual(getCreationDestinationOverrides(defaults), {
+      profileId: 10,
+      rootFolder: '/fr',
+      languageProfileId: 11,
+      tags: [1],
+    });
+  });
+
+  it('excludes uninitialized placeholders while retaining empty tags', () => {
+    assert.deepEqual(
+      getCreationDestinationOverrides({
+        profile: -1,
+        folder: '',
+        language: -1,
+        tags: [],
+      }),
+      { tags: [] }
+    );
+  });
+
+  it('resolving defaults and rules does not create manual overrides', () => {
+    const manual = {};
+    const resolved = applyDestinationRules(
+      getDestinationDefaults(server, false),
+      { profileId: 40, rootFolder: '/rule', tags: [4] },
+      manual
+    );
+    assert.deepEqual(resolved, {
+      profile: 40,
+      folder: '/rule',
+      language: 11,
+      tags: [4],
+    });
+    assert.deepEqual(getCreationDestinationOverrides(manual), {});
+  });
+});
 
 describe('AdvancedRequester value precedence', () => {
   it('preserves historical custom overrides including explicitly empty tags', () => {

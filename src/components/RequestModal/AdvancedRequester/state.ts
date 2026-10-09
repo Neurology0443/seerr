@@ -15,6 +15,23 @@ type PersistedDestinationValues = {
   [Field in keyof DestinationValues]: DestinationValues[Field] | null;
 };
 
+// Creation sends intent only; displayed defaults and rule results stay local.
+export const getCreationDestinationOverrides = (
+  manual: DestinationValues = {}
+): {
+  profileId?: number;
+  rootFolder?: string;
+  languageProfileId?: number;
+  tags?: number[];
+} => ({
+  ...(manual.profile !== undefined &&
+    manual.profile >= 0 && { profileId: manual.profile }),
+  ...(manual.folder && { rootFolder: manual.folder }),
+  ...(manual.language !== undefined &&
+    manual.language >= 0 && { languageProfileId: manual.language }),
+  ...(manual.tags !== undefined && { tags: manual.tags }),
+});
+
 export type InvalidDestinationSelection = {
   server: boolean;
   profile: boolean;

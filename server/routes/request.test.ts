@@ -85,6 +85,7 @@ function fakeTmdbMovie(tmdbId: number): TmdbMovieDetails {
     original_language: 'en',
     keywords: { keywords: [] },
     external_ids: {},
+    release_date: '2020-01-01',
   } as unknown as TmdbMovieDetails;
 }
 
@@ -3228,6 +3229,240 @@ describe('POST /request (tv), override rules', () => {
 });
 
 describe('POST /request, override rules and requester choices', () => {
+  for (const mediaType of [MediaType.MOVIE, MediaType.TV]) {
+    for (const independent of [false, true]) {
+      const configure =
+        mediaType === MediaType.MOVIE ? configureRadarr : configureSonarr;
+      const serviceField =
+        mediaType === MediaType.MOVIE ? 'radarrServiceId' : 'sonarrServiceId';
+      const configurations = [
+        {
+          name: 'no manual configuration',
+          manual: {},
+          expected: { profileId: 7, rootFolder: '/rule', tags: [2] },
+        },
+        {
+          name: 'manual profile',
+          manual: { profileId: 9 },
+          expected: { profileId: 9, rootFolder: '/rule', tags: [2] },
+        },
+        {
+          name: 'manual folder',
+          manual: { rootFolder: '/chosen' },
+          expected: { profileId: 7, rootFolder: '/chosen', tags: [2] },
+        },
+        {
+          name: 'explicit empty tags',
+          manual: { tags: [] },
+          expected: { profileId: 7, rootFolder: '/rule', tags: [] },
+        },
+        {
+          name: 'manual tags',
+          manual: { tags: [3] },
+          expected: { profileId: 7, rootFolder: '/rule', tags: [3] },
+        },
+        {
+          name: 'explicit default profile',
+          manual: { profileId: 1 },
+          expected: { profileId: 1, rootFolder: '/rule', tags: [2] },
+        },
+        ...(mediaType === MediaType.TV
+          ? [
+              {
+                name: 'manual language',
+                manual: { languageProfileId: 9 },
+                expected: { profileId: 7, rootFolder: '/rule', tags: [2] },
+              },
+            ]
+          : []),
+      ];
+
+      for (const { name, manual, expected } of configurations) {
+        it(`preserves ${name} for an advanced ${mediaType} requester on a ${independent ? 'independent' : 'native'} destination`, async () => {
+          configure([
+            { id: 41, independentRequestDestination: independent, tags: [1] },
+          ]);
+          const requester = await getRepository(User).findOneOrFail({
+            where: { email: 'demo@seerr.dev' },
+          });
+          requester.permissions =
+            Permission.REQUEST | Permission.REQUEST_ADVANCED;
+          await getRepository(User).save(requester);
+          await getRepository(OverrideRule).save(
+            new OverrideRule({
+              [serviceField]: 41,
+              profileId: 7,
+              rootFolder: '/rule',
+              tags: '2',
+            })
+          );
+          const agent = await loginAs('demo@seerr.dev', 'test1234');
+          const res = await agent.post('/request').send({
+            mediaType,
+            mediaId: 88100,
+            serverId: 41,
+            ...(mediaType === MediaType.TV ? { seasons: [1] } : {}),
+            ...manual,
+          });
+          assert.equal(res.status, 201);
+          const persisted = await getRepository(MediaRequest).findOneOrFail({
+            where: { id: res.body.id },
+          });
+          assert.equal(persisted.serverId, 41);
+          assert.equal(persisted.profileId, expected.profileId);
+          assert.equal(persisted.rootFolder, expected.rootFolder);
+          assert.deepEqual(persisted.tags, expected.tags);
+          if (mediaType === MediaType.TV)
+            assert.equal(
+              persisted.languageProfileId,
+              'languageProfileId' in manual ? manual.languageProfileId : null
+            );
+        });
+      }
+
+      it(`uses only the second ${mediaType} destination's rules (${independent ? 'independent' : 'native'})`, async () => {
+        configure([
+          {
+            id: 41,
+            isDefault: true,
+            independentRequestDestination: independent,
+          },
+          {
+            id: 42,
+            isDefault: false,
+            independentRequestDestination: independent,
+          },
+        ]);
+        const requester = await getRepository(User).findOneOrFail({
+          where: { email: 'demo@seerr.dev' },
+        });
+        requester.permissions =
+          Permission.REQUEST | Permission.REQUEST_ADVANCED;
+        await getRepository(User).save(requester);
+        await getRepository(OverrideRule).save([
+          new OverrideRule({
+            [serviceField]: 41,
+            profileId: 7,
+            rootFolder: '/first',
+            tags: '1',
+          }),
+          new OverrideRule({
+            [serviceField]: 42,
+            profileId: 8,
+            rootFolder: '/second',
+            tags: '2',
+          }),
+        ]);
+        const agent = await loginAs('demo@seerr.dev', 'test1234');
+        const res = await agent.post('/request').send({
+          mediaType,
+          mediaId: 88101,
+          serverId: 42,
+          ...(mediaType === MediaType.TV ? { seasons: [1] } : {}),
+        });
+        assert.equal(res.status, 201);
+        const persisted = await getRepository(MediaRequest).findOneOrFail({
+          where: { id: res.body.id },
+        });
+        assert.equal(persisted.serverId, 42);
+        assert.equal(persisted.profileId, 8);
+        assert.equal(persisted.rootFolder, '/second');
+        assert.deepEqual(persisted.tags, [2]);
+      });
+
+      it(`leaves untouched ${mediaType} overrides null and sends the selected destination defaults (${independent ? 'independent' : 'native'})`, async (t) => {
+        configure([
+          {
+            id: 41,
+            isDefault: true,
+            independentRequestDestination: independent,
+          },
+          {
+            id: 42,
+            isDefault: false,
+            independentRequestDestination: independent,
+            activeProfileId: 8,
+            activeDirectory: '/second',
+            activeLanguageProfileId: 9,
+            tags: [2],
+          },
+        ]);
+        const requester = await getRepository(User).findOneOrFail({
+          where: { email: 'demo@seerr.dev' },
+        });
+        requester.permissions =
+          Permission.REQUEST | Permission.REQUEST_ADVANCED;
+        await getRepository(User).save(requester);
+        const agent = await loginAs('demo@seerr.dev', 'test1234');
+        const res = await agent.post('/request').send({
+          mediaType,
+          mediaId: 88102,
+          serverId: 42,
+          ...(mediaType === MediaType.TV ? { seasons: [1], tvdbId: 123 } : {}),
+        });
+        assert.equal(res.status, 201);
+        const persisted = await getRepository(MediaRequest).findOneOrFail({
+          where: { id: res.body.id },
+        });
+        for (const field of [
+          'profileId',
+          'rootFolder',
+          'languageProfileId',
+          'tags',
+        ] as const)
+          assert.equal(persisted[field], null);
+        const arrPayloads: {
+          qualityProfileId: number;
+          rootFolderPath: string;
+          languageProfileId?: number;
+          tags: number[];
+        }[] = [];
+        t.mock.method(
+          axios,
+          'create',
+          () =>
+            ({
+              interceptors: {
+                request: { use: () => 0 },
+                response: { use: () => 0 },
+              },
+              get: async () => ({ data: [{ id: 0, seasons: [] }] }),
+              post: async (
+                _url: string,
+                body: (typeof arrPayloads)[number]
+              ) => {
+                arrPayloads.push(body);
+                return { data: { id: 123 } };
+              },
+            }) as unknown as AxiosInstance
+        );
+        // Inspect dispatch without applying asynchronous Arr success state.
+        const subscriberInternals =
+          MediaRequestSubscriber.prototype as unknown as {
+            applyArrSuccessIfStillApproved: () => Promise<boolean>;
+          };
+        t.mock.method(
+          subscriberInternals,
+          'applyArrSuccessIfStillApproved',
+          async () => false
+        );
+        persisted.status = MediaRequestStatus.APPROVED;
+        const subscriber = new MediaRequestSubscriber();
+        const manager = getRepository(MediaRequest).manager;
+        if (mediaType === MediaType.MOVIE)
+          await subscriber.sendToRadarr(persisted, manager, independent);
+        else await subscriber.sendToSonarr(persisted, manager, independent);
+        await nextTurn();
+        assert.equal(arrPayloads.length, 1);
+        assert.equal(arrPayloads[0].qualityProfileId, 8);
+        assert.equal(arrPayloads[0].rootFolderPath, '/second');
+        assert.deepEqual(arrPayloads[0].tags, [2]);
+        if (mediaType === MediaType.TV)
+          assert.equal(arrPayloads[0].languageProfileId, 9);
+      });
+    }
+  }
+
   async function requestWithRule(permissions: number) {
     configureRadarr([{ id: 1, isDefault: true, is4k: false }]);
     getSettings().sonarr = [];
