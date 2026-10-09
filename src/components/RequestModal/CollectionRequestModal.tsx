@@ -57,6 +57,12 @@ const CollectionRequestModal = ({
   });
   const intl = useIntl();
   const { user, hasPermission } = useUser();
+  const canUseAdvancedRequester = hasPermission(
+    [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
+    { type: 'or' }
+  );
+  const isAdvancedConfigurationReady =
+    !canUseAdvancedRequester || requestOverrides?.isReady === true;
   const { data: quota } = useSWR<QuotaResponse>(
     user &&
       (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
@@ -185,6 +191,10 @@ const CollectionRequestModal = ({
   }, [isUpdating, onUpdating]);
 
   const sendRequest = useCallback(async () => {
+    if (!isAdvancedConfigurationReady) {
+      return;
+    }
+
     setIsUpdating(true);
 
     try {
@@ -237,6 +247,7 @@ const CollectionRequestModal = ({
       setIsUpdating(false);
     }
   }, [
+    isAdvancedConfigurationReady,
     requestOverrides,
     data?.parts,
     data?.name,
@@ -285,7 +296,7 @@ const CollectionRequestModal = ({
                 }
               )
       }
-      okDisabled={selectedParts.length === 0}
+      okDisabled={selectedParts.length === 0 || !isAdvancedConfigurationReady}
       okButtonType={'primary'}
       backdrop={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data?.backdropPath}`}
     >
@@ -516,10 +527,7 @@ const CollectionRequestModal = ({
           </div>
         </div>
       </div>
-      {hasPermission(
-        [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
-        { type: 'or' }
-      ) && (
+      {canUseAdvancedRequester && (
         <AdvancedRequester
           type="movie"
           is4k={is4k}
