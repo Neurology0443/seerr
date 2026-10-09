@@ -162,7 +162,9 @@ const TvRequestModal = ({
   const [tvdbId, setTvdbId] = useState<number | undefined>(undefined);
   const { data: quota } = useSWR<QuotaResponse>(
     user &&
-      (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
+      (!requestOverrides?.user?.id ||
+        requestOverrides.user.id === user.id ||
+        hasPermission(Permission.MANAGE_USERS))
       ? `/api/v1/user/${requestOverrides?.user?.id ?? user.id}/quota`
       : null
   );
@@ -171,6 +173,22 @@ const TvRequestModal = ({
     (quota?.tv.remaining ?? 0) -
     selectedSeasons.length +
     (editRequest?.seasons ?? []).length;
+  const isCreationQuotaBypassed =
+    requestOverrides?.ignoreQuota === true &&
+    hasPermission(Permission.MANAGE_REQUESTS) &&
+    (quota?.tv.limit ?? 0) > 0;
+  const isQuotaBypassed = editRequest
+    ? editRequest.ignoreQuota === true
+    : isCreationQuotaBypassed;
+  const creationSeasons = getTvRequestSeasonPayload(
+    selectedTarget,
+    selectedSeasons,
+    settings.currentSettings.partialRequestsEnabled
+  );
+  const isCreationQuotaExceeded =
+    !isQuotaBypassed &&
+    !!quota?.tv.limit &&
+    creationSeasons.length > (quota.tv.remaining ?? 0);
 
   const updateRequest = async (alsoApproveRequest = false) => {
     if (
@@ -325,16 +343,12 @@ const TvRequestModal = ({
   };
 
   const sendRequest = async () => {
-    const seasons = getTvRequestSeasonPayload(
-      selectedTarget,
-      selectedSeasons,
-      settings.currentSettings.partialRequestsEnabled
-    );
-
     if (
+      !quota ||
       !selectedTarget ||
       !isAdvancedConfigurationReady ||
-      seasons.length === 0
+      creationSeasons.length === 0 ||
+      isCreationQuotaExceeded
     ) {
       return;
     }
@@ -359,8 +373,8 @@ const TvRequestModal = ({
           tvdbId: tvdbId ?? data?.externalIds.tvdbId,
           mediaType: 'tv',
           is4k,
-          ignoreQuota: requestOverrides?.ignoreQuota,
-          seasons,
+          ignoreQuota: isCreationQuotaBypassed ? true : undefined,
+          seasons: creationSeasons,
           ...overrideParams,
         },
         {
@@ -442,6 +456,7 @@ const TvRequestModal = ({
 
     // If there are no more remaining requests available, block toggle
     if (
+      !isQuotaBypassed &&
       quota?.tv.limit &&
       currentlyRemaining <= 0 &&
       !isSelectedSeason(seasonNumber)
@@ -465,15 +480,19 @@ const TvRequestModal = ({
           editingSeasons.includes(season) || requestableSeasons.includes(season)
       )
     : requestableSeasons;
+  const isSelectAllQuotaRestricted =
+    !isQuotaBypassed &&
+    !!quota?.tv.limit &&
+    (quota.tv.remaining ?? 0) <
+      selectableSeasons.filter((season) => !editingSeasons.includes(season))
+        .length;
 
   const toggleAllSeasons = (): void => {
     if (requestToEdit && (editSession.blocked || isUpdating)) return;
     // If the user has a quota and not enough requests for all seasons, block toggleAllSeasons
     if (
-      quota?.tv.limit &&
-      (quota?.tv.remaining ?? 0) <
-        selectableSeasons.filter((season) => !editingSeasons.includes(season))
-          .length
+      isSelectAllQuotaRestricted &&
+      selectedSeasons.length < selectableSeasons.length
     ) {
       return;
     }
@@ -619,16 +638,13 @@ const TvRequestModal = ({
           ? isUpdating ||
             editSession.blocked ||
             (selectedSeasons.length > 0 && editConfigurationBlocked)
-          : !settings.currentSettings.partialRequestsEnabled &&
-              quota?.tv.limit &&
-              unrequestedSeasons.length > (quota.tv.remaining ?? 0) &&
-              !requestOverrides?.ignoreQuota
-            ? true
-            : !selectedTarget ||
-              !isAdvancedConfigurationReady ||
-              unrequestedSeasons.length === 0 ||
-              (settings.currentSettings.partialRequestsEnabled &&
-                selectedRequestableSeasonCount === 0)
+          : !quota ||
+            isCreationQuotaExceeded ||
+            !selectedTarget ||
+            !isAdvancedConfigurationReady ||
+            unrequestedSeasons.length === 0 ||
+            (settings.currentSettings.partialRequestsEnabled &&
+              selectedRequestableSeasonCount === 0)
       }
       okButtonType={
         editRequest
@@ -739,9 +755,8 @@ const TvRequestModal = ({
                           }
                         }}
                         className={`relative inline-flex h-5 w-10 flex-shrink-0 cursor-pointer items-center justify-center pt-2 focus:outline-none ${
-                          quota?.tv.remaining &&
-                          quota.tv.limit &&
-                          quota.tv.remaining < unrequestedSeasons.length
+                          isSelectAllQuotaRestricted &&
+                          selectedSeasons.length < selectableSeasons.length
                             ? 'opacity-50'
                             : ''
                         }`}
@@ -815,7 +830,8 @@ const TvRequestModal = ({
                               }}
                               className={`relative inline-flex h-5 w-10 flex-shrink-0 cursor-pointer items-center justify-center pt-2 focus:outline-none ${
                                 seasonOccupied ||
-                                (quota?.tv.limit &&
+                                (!isQuotaBypassed &&
+                                  quota?.tv.limit &&
                                   currentlyRemaining <= 0 &&
                                   !isSelectedSeason(season.seasonNumber))
                                   ? 'opacity-50'
