@@ -174,6 +174,15 @@ const TvRequestModal = ({
   const isQuotaBypassed = editRequest
     ? editRequest.ignoreQuota === true
     : requestOverrides?.ignoreQuota === true;
+  const creationSeasons = getTvRequestSeasonPayload(
+    selectedTarget,
+    selectedSeasons,
+    settings.currentSettings.partialRequestsEnabled
+  );
+  const isCreationQuotaExceeded =
+    !isQuotaBypassed &&
+    !!quota?.tv.limit &&
+    creationSeasons.length > (quota.tv.remaining ?? 0);
 
   const updateRequest = async (alsoApproveRequest = false) => {
     if (
@@ -328,16 +337,11 @@ const TvRequestModal = ({
   };
 
   const sendRequest = async () => {
-    const seasons = getTvRequestSeasonPayload(
-      selectedTarget,
-      selectedSeasons,
-      settings.currentSettings.partialRequestsEnabled
-    );
-
     if (
       !selectedTarget ||
       !isAdvancedConfigurationReady ||
-      seasons.length === 0
+      creationSeasons.length === 0 ||
+      isCreationQuotaExceeded
     ) {
       return;
     }
@@ -363,7 +367,7 @@ const TvRequestModal = ({
           mediaType: 'tv',
           is4k,
           ignoreQuota: requestOverrides?.ignoreQuota,
-          seasons,
+          seasons: creationSeasons,
           ...overrideParams,
         },
         {
@@ -627,16 +631,12 @@ const TvRequestModal = ({
           ? isUpdating ||
             editSession.blocked ||
             (selectedSeasons.length > 0 && editConfigurationBlocked)
-          : !settings.currentSettings.partialRequestsEnabled &&
-              quota?.tv.limit &&
-              unrequestedSeasons.length > (quota.tv.remaining ?? 0) &&
-              !isQuotaBypassed
-            ? true
-            : !selectedTarget ||
-              !isAdvancedConfigurationReady ||
-              unrequestedSeasons.length === 0 ||
-              (settings.currentSettings.partialRequestsEnabled &&
-                selectedRequestableSeasonCount === 0)
+          : isCreationQuotaExceeded ||
+            !selectedTarget ||
+            !isAdvancedConfigurationReady ||
+            unrequestedSeasons.length === 0 ||
+            (settings.currentSettings.partialRequestsEnabled &&
+              selectedRequestableSeasonCount === 0)
       }
       okButtonType={
         editRequest

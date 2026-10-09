@@ -252,7 +252,6 @@ const AdvancedRequester = ({
     requestUser ?? null
   );
   const selectedUserId = selectedUser?.id;
-  const previousSelectedUserIdRef = useRef<number | undefined>(selectedUserId);
   const ruleParameters = {
     mediaType: type,
     is4k,
@@ -317,10 +316,7 @@ const AdvancedRequester = ({
       const nextSelectedUser =
         filteredUserData.find((u) => u.id === currentUser?.id) ?? null;
 
-      if (nextSelectedUser?.id !== selectedUserId) {
-        setIgnoreQuota(false);
-      }
-
+      // Initial hydration is not an explicit beneficiary change.
       setSelectedUser(nextSelectedUser);
     }
   }, [filteredUserData]);
@@ -342,14 +338,10 @@ const AdvancedRequester = ({
   }, [data, defaultOverrides?.server, initialServerId, is4k]);
 
   useEffect(() => {
-    const selectedUserChanged =
-      previousSelectedUserIdRef.current !== selectedUserId;
-    previousSelectedUserIdRef.current = selectedUserId;
-
-    if (!isIgnoreQuotaVisible || selectedUserChanged) {
+    if (!isIgnoreQuotaVisible) {
       setIgnoreQuota(false);
     }
-  }, [isIgnoreQuotaVisible, selectedUserId]);
+  }, [isIgnoreQuotaVisible]);
 
   useEffect(() => {
     const unchangedHistorical =
