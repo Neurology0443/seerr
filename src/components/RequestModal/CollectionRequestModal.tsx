@@ -4,6 +4,7 @@ import CachedImage from '@app/components/Common/CachedImage';
 import Modal from '@app/components/Common/Modal';
 import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequester';
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
+import { getCreationDestinationOverrides } from '@app/components/RequestModal/AdvancedRequester/state';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import useToasts from '@app/hooks/useToasts';
 import { useUser } from '@app/hooks/useUser';
@@ -191,10 +192,8 @@ const CollectionRequestModal = ({
       if (requestOverrides) {
         overrideParams = {
           serverId: requestOverrides.server,
-          profileId: requestOverrides.profile,
-          rootFolder: requestOverrides.folder,
           userId: requestOverrides.user?.id,
-          tags: requestOverrides.tags,
+          ...getCreationDestinationOverrides(requestOverrides.manualValues),
         };
       }
 

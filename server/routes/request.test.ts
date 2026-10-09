@@ -3229,6 +3229,60 @@ describe('POST /request (tv), override rules', () => {
 });
 
 describe('POST /request, override rules and requester choices', () => {
+  it('evaluates omitted collection configuration independently for each movie', async (t) => {
+    configureRadarr([{ id: 42, tags: [1] }]);
+    const requester = await getRepository(User).findOneOrFail({
+      where: { email: 'demo@seerr.dev' },
+    });
+    requester.permissions = Permission.REQUEST | Permission.REQUEST_ADVANCED;
+    await getRepository(User).save(requester);
+    t.mock.getter(
+      TheMovieDb.prototype,
+      'getMovie',
+      () =>
+        async ({ movieId }: { movieId: number }) => ({
+          ...fakeTmdbMovie(movieId),
+          genres: [{ id: movieId, name: 'Collection part genre' }],
+        })
+    );
+    await getRepository(OverrideRule).save([
+      new OverrideRule({
+        radarrServiceId: 42,
+        genre: '88400',
+        profileId: 7,
+        rootFolder: '/first',
+        tags: '2',
+      }),
+      new OverrideRule({
+        radarrServiceId: 42,
+        genre: '88401',
+        profileId: 8,
+        rootFolder: '/second',
+        tags: '3',
+      }),
+    ]);
+    const agent = await loginAs('demo@seerr.dev', 'test1234');
+    for (const [mediaId, profileId, rootFolder, tags] of [
+      [88400, 7, '/first', [2]],
+      [88401, 8, '/second', [3]],
+    ] as [number, number, string, number[]][]) {
+      const res = await agent.post('/request').send({
+        mediaType: MediaType.MOVIE,
+        mediaId,
+        serverId: 42,
+      });
+      assert.equal(res.status, 201);
+      const persisted = await getRepository(MediaRequest).findOneByOrFail({
+        id: res.body.id,
+      });
+      assert.equal(persisted.serverId, 42);
+      assert.equal(persisted.requestedBy.id, requester.id);
+      assert.equal(persisted.profileId, profileId);
+      assert.equal(persisted.rootFolder, rootFolder);
+      assert.deepEqual(persisted.tags, tags);
+    }
+  });
+
   for (const mediaType of [MediaType.MOVIE, MediaType.TV]) {
     for (const independent of [false, true]) {
       const configure =
