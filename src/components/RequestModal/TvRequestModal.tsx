@@ -171,6 +171,9 @@ const TvRequestModal = ({
     (quota?.tv.remaining ?? 0) -
     selectedSeasons.length +
     (editRequest?.seasons ?? []).length;
+  const isQuotaBypassed = editRequest
+    ? editRequest.ignoreQuota === true
+    : requestOverrides?.ignoreQuota === true;
 
   const updateRequest = async (alsoApproveRequest = false) => {
     if (
@@ -442,6 +445,7 @@ const TvRequestModal = ({
 
     // If there are no more remaining requests available, block toggle
     if (
+      !isQuotaBypassed &&
       quota?.tv.limit &&
       currentlyRemaining <= 0 &&
       !isSelectedSeason(seasonNumber)
@@ -465,15 +469,19 @@ const TvRequestModal = ({
           editingSeasons.includes(season) || requestableSeasons.includes(season)
       )
     : requestableSeasons;
+  const isSelectAllQuotaRestricted =
+    !isQuotaBypassed &&
+    !!quota?.tv.limit &&
+    (quota.tv.remaining ?? 0) <
+      selectableSeasons.filter((season) => !editingSeasons.includes(season))
+        .length;
 
   const toggleAllSeasons = (): void => {
     if (requestToEdit && (editSession.blocked || isUpdating)) return;
     // If the user has a quota and not enough requests for all seasons, block toggleAllSeasons
     if (
-      quota?.tv.limit &&
-      (quota?.tv.remaining ?? 0) <
-        selectableSeasons.filter((season) => !editingSeasons.includes(season))
-          .length
+      isSelectAllQuotaRestricted &&
+      selectedSeasons.length < selectableSeasons.length
     ) {
       return;
     }
@@ -622,7 +630,7 @@ const TvRequestModal = ({
           : !settings.currentSettings.partialRequestsEnabled &&
               quota?.tv.limit &&
               unrequestedSeasons.length > (quota.tv.remaining ?? 0) &&
-              !requestOverrides?.ignoreQuota
+              !isQuotaBypassed
             ? true
             : !selectedTarget ||
               !isAdvancedConfigurationReady ||
@@ -739,9 +747,8 @@ const TvRequestModal = ({
                           }
                         }}
                         className={`relative inline-flex h-5 w-10 flex-shrink-0 cursor-pointer items-center justify-center pt-2 focus:outline-none ${
-                          quota?.tv.remaining &&
-                          quota.tv.limit &&
-                          quota.tv.remaining < unrequestedSeasons.length
+                          isSelectAllQuotaRestricted &&
+                          selectedSeasons.length < selectableSeasons.length
                             ? 'opacity-50'
                             : ''
                         }`}
@@ -815,7 +822,8 @@ const TvRequestModal = ({
                               }}
                               className={`relative inline-flex h-5 w-10 flex-shrink-0 cursor-pointer items-center justify-center pt-2 focus:outline-none ${
                                 seasonOccupied ||
-                                (quota?.tv.limit &&
+                                (!isQuotaBypassed &&
+                                  quota?.tv.limit &&
                                   currentlyRemaining <= 0 &&
                                   !isSelectedSeason(season.seasonNumber))
                                   ? 'opacity-50'

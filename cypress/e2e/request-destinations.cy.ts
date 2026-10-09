@@ -66,6 +66,7 @@ const pending = (id: number, serverId: number | null) => ({
   serverId,
   is4k: false,
   status: 1,
+  ignoreQuota: false,
   requestedBy: admin,
   profileId: 11 as number | null,
   rootFolder: '/custom' as string | null,
@@ -304,17 +305,7 @@ const expectLockedEditControls = (type: 'movie' | 'tv') => {
     .click({ force: true })
     .trigger('keydown', { key: 'ArrowDown', force: true });
   cy.get('[role="option"]').should('not.exist');
-  if (type === 'tv') {
-    cy.contains('[role="dialog"] label', 'Bypass User Quota')
-      .parent()
-      .find('[role="checkbox"]')
-      .should('have.attr', 'aria-disabled', 'true')
-      .and('have.attr', 'aria-checked', 'false')
-      .click({ force: true })
-      .trigger('keydown', { key: 'Enter', force: true })
-      .trigger('keydown', { key: ' ', force: true })
-      .should('have.attr', 'aria-checked', 'false');
-  }
+  cy.contains('[role="dialog"] label', 'Bypass User Quota').should('not.exist');
   cy.get('#server').should('have.value', '1');
   cy.get('#profile').should('have.value', '10');
   cy.get('#folder').should('have.value', '/custom');
@@ -365,6 +356,304 @@ describe('Request destinations', () => {
     );
     cy.intercept('POST', '/api/v1/request/*/approve', {}).as('approve');
     cy.intercept('POST', '/api/v1/request/*/decline', {}).as('decline');
+  });
+
+  describe('quota bypass', () => {
+    const setQuota = (type: 'movie' | 'tv', limit = 1, remaining = 0) => {
+      cy.intercept('GET', '/api/v1/user/*/quota', {
+        movie: { limit: 1, remaining: 0, restricted: true },
+        tv: { limit: 1, remaining: 0, restricted: true },
+        [type]: { limit, remaining, restricted: limit > 0 && remaining === 0 },
+      });
+    };
+    const bypassControl = () =>
+      cy
+        .contains('[role="dialog"] label', 'Bypass User Quota')
+        .parent()
+        .find('[role="checkbox"]');
+    const seasonControl = (number: number) =>
+      cy
+        .contains('[role="dialog"] tbody tr', `Season ${number}`)
+        .find('[role="checkbox"]');
+    const allSeasonsControl = () =>
+      cy.get('[role="dialog"] thead [role="checkbox"]');
+    const configureSingleDestination = (
+      type: 'movie' | 'tv',
+      independent: boolean,
+      permissions = 16 + 32 + 8192
+    ) => {
+      const requestUser = { ...admin, permissions };
+      cy.intercept('GET', '/api/v1/auth/me', requestUser);
+      cy.intercept('GET', '/api/v1/user?*', { results: [requestUser] });
+      const server = {
+        ...servers[0],
+        independentRequestDestination: independent,
+        activeTags: [],
+        activeLanguageProfileId: undefined,
+      };
+      const kind = type === 'movie' ? 'radarr' : 'sonarr';
+      cy.intercept('GET', `/api/v1/service/${kind}`, [server]);
+      cy.intercept('GET', `/api/v1/service/${kind}/1`, {
+        server,
+        profiles: [{ id: 10, name: 'Default' }],
+        rootFolders: [{ id: 1, path: '/1' }],
+        languageProfiles: [],
+        tags: [],
+      });
+      return {
+        serverId: 1,
+        name: 'FR',
+        is4k: false,
+        isDefault: true,
+        isIndependent: independent,
+        status: 1,
+        requestable: true,
+        seasons: [1, 2, 3, 4].map((number) => ({
+          seasonNumber: number,
+          status: number === 3 ? 5 : 1,
+          requestable: number < 3,
+        })),
+      };
+    };
+    const openCreation = (type: 'movie' | 'tv', target: TvRequestTarget) => {
+      visitMedia(type, [], false, target.isIndependent, [target], [1, 2, 3, 4]);
+      clickAction(/^Request$/);
+      cy.wait('@rules');
+    };
+
+    for (const independent of [false, true]) {
+      const destination = independent ? 'independent' : 'native';
+      for (const type of ['movie', 'tv'] as const) {
+        it(`allows a manager without REQUEST_ADVANCED to use ${type} bypass on a ${destination} destination`, () => {
+          setQuota(type);
+          openCreation(
+            type,
+            configureSingleDestination(type, independent, 16 + 32)
+          );
+          bypassControl()
+            .should('be.visible')
+            .click()
+            .should('have.attr', 'aria-checked', 'true');
+          cy.get('[role="dialog"] #server').should('not.exist');
+        });
+
+        it(`shows an interactive ${type} bypass as the only Advanced control on a ${destination} destination`, () => {
+          setQuota(type);
+          openCreation(type, configureSingleDestination(type, independent));
+          bypassControl()
+            .should('be.visible')
+            .and('have.attr', 'aria-checked', 'false')
+            .click()
+            .should('have.attr', 'aria-checked', 'true')
+            .focus()
+            .trigger('keydown', { key: ' ' })
+            .should('have.attr', 'aria-checked', 'false');
+          cy.get(
+            '[role="dialog"] #server, #profile, #folder, #language'
+          ).should('not.exist');
+          cy.get('[role="dialog"] .react-select__control').should('not.exist');
+          cy.contains('[role="dialog"] label', 'Request As').should(
+            'not.exist'
+          );
+        });
+
+        for (const reason of ['permission', 'quota'] as const) {
+          it(`hides ${type} bypass without an applicable ${reason} on a ${destination} destination`, () => {
+            setQuota(type, reason === 'quota' ? 0 : 1);
+            openCreation(
+              type,
+              configureSingleDestination(
+                type,
+                independent,
+                reason === 'permission' ? 32 + 8192 : 16 + 32 + 8192
+              )
+            );
+            cy.contains('[role="dialog"] label', 'Bypass User Quota').should(
+              'not.exist'
+            );
+            cy.contains('[role="dialog"]', 'Advanced Request').should(
+              'not.exist'
+            );
+            if (type === 'tv' && reason === 'permission') {
+              seasonControl(1)
+                .click()
+                .should('have.attr', 'aria-checked', 'false');
+              allSeasonsControl()
+                .click()
+                .should('have.attr', 'aria-checked', 'false');
+              cy.get('@create.all').should('have.length', 0);
+            }
+          });
+        }
+      }
+
+      it(`selects and submits an individual TV season with exhausted quota and bypass on a ${destination} destination`, () => {
+        setQuota('tv');
+        openCreation('tv', configureSingleDestination('tv', independent));
+        seasonControl(1)
+          .should('have.class', 'opacity-50')
+          .click()
+          .should('have.attr', 'aria-checked', 'false');
+        bypassControl().click().should('have.attr', 'aria-checked', 'true');
+        seasonControl(1)
+          .should('not.have.class', 'opacity-50')
+          .click()
+          .should('have.attr', 'aria-checked', 'true')
+          .click()
+          .should('have.attr', 'aria-checked', 'false')
+          .click();
+        cy.contains('[role="dialog"] button', /^Request 1 Season$/)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@create').then(({ request }) => {
+          expect(request.body).to.include({
+            mediaType: 'tv',
+            ignoreQuota: true,
+            serverId: 1,
+          });
+          expect(request.body.seasons).to.deep.eq([1]);
+        });
+      });
+
+      for (const remaining of [0, 1]) {
+        it(`selects only requestable TV seasons with bypass and ${remaining} quota remaining on a ${destination} destination`, () => {
+          setQuota('tv', 1, remaining);
+          openCreation('tv', configureSingleDestination('tv', independent));
+          allSeasonsControl()
+            .should('have.class', 'opacity-50')
+            .click()
+            .should('have.attr', 'aria-checked', 'false');
+          for (const number of [1, 2])
+            seasonControl(number).should('have.attr', 'aria-checked', 'false');
+          bypassControl().click();
+          allSeasonsControl()
+            .should('not.have.class', 'opacity-50')
+            .click()
+            .should('have.attr', 'aria-checked', 'true');
+          for (const number of [1, 2])
+            seasonControl(number).should('have.attr', 'aria-checked', 'true');
+          for (const number of [3, 4])
+            seasonControl(number)
+              .should('have.class', 'opacity-50')
+              .click()
+              .should('have.attr', 'aria-checked', 'true');
+          cy.contains('[role="dialog"] button', /^Request 2 Seasons$/).should(
+            'not.be.disabled'
+          );
+          allSeasonsControl()
+            .click()
+            .should('have.attr', 'aria-checked', 'false');
+          for (const number of [1, 2])
+            seasonControl(number).should('have.attr', 'aria-checked', 'false');
+          allSeasonsControl().click();
+          // Turning bypass off still allows deselection at exhausted quota.
+          bypassControl().click();
+          allSeasonsControl()
+            .should('not.have.class', 'opacity-50')
+            .click()
+            .should('have.attr', 'aria-checked', 'false');
+          bypassControl().click();
+          allSeasonsControl().click();
+          cy.contains('[role="dialog"] button', /^Request 2 Seasons$/).click();
+          cy.wait('@create').then(({ request }) => {
+            expect(request.body).to.include({ ignoreQuota: true, serverId: 1 });
+            expect(request.body.seasons).to.deep.eq([1, 2]);
+          });
+        });
+      }
+
+      it(`submits only eligible non-partial TV seasons with authorized bypass on a ${destination} destination`, () => {
+        cy.request('/api/v1/settings/public').then(({ body }) => {
+          cy.intercept('GET', '/api/v1/settings/public', {
+            ...body,
+            movie4kEnabled: true,
+            series4kEnabled: true,
+            partialRequestsEnabled: false,
+          }).as('nonPartialSettings');
+        });
+        setQuota('tv');
+        const target = configureSingleDestination('tv', independent);
+        visitMedia('tv', [], false, independent, [target], [1, 2, 3, 4]);
+        cy.wait('@nonPartialSettings')
+          .its('response.body.partialRequestsEnabled')
+          .should('eq', false);
+        clickAction(/^Request$/);
+        cy.wait('@rules');
+        allSeasonsControl().should('not.be.visible');
+        cy.contains('[role="dialog"] button', /^Request$/).should(
+          'be.disabled'
+        );
+        bypassControl().click();
+        cy.contains('[role="dialog"] button', /^Request$/)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@create').then(({ request }) => {
+          expect(request.body).to.include({
+            mediaType: 'tv',
+            ignoreQuota: true,
+            serverId: 1,
+          });
+          expect(request.body.seasons).to.deep.eq([1, 2]);
+        });
+      });
+
+      for (const ignoreQuota of [false, true]) {
+        it(`uses persisted TV edit bypass ${ignoreQuota} and preserves held seasons on a ${destination} destination`, () => {
+          setQuota('tv');
+          const request = { ...pending(101, 1), ignoreQuota };
+          const targets = servers.map((server) => ({
+            serverId: server.id,
+            name: server.name,
+            is4k: false,
+            isDefault: server.isDefault,
+            isIndependent: independent,
+            status: 2,
+            requestable: true,
+            seasons: [1, 2, 3].map((number) => ({
+              seasonNumber: number,
+              status: number === 1 ? 2 : number === 3 ? 5 : 1,
+              requestable: number === 2,
+            })),
+          }));
+          visitMedia('tv', [request], false, independent, targets, [1, 2, 3]);
+          clickAction(/^View Request — FR$/);
+          cy.get('#profile').should('not.be.disabled');
+          cy.contains('[role="dialog"] label', 'Bypass User Quota').should(
+            'not.exist'
+          );
+          seasonControl(1)
+            .should('not.have.class', 'opacity-50')
+            .click()
+            .should('have.attr', 'aria-checked', 'false')
+            .click()
+            .should('have.attr', 'aria-checked', 'true');
+          seasonControl(2)
+            .should(ignoreQuota ? 'not.have.class' : 'have.class', 'opacity-50')
+            .click()
+            .should('have.attr', 'aria-checked', String(ignoreQuota));
+          if (ignoreQuota)
+            seasonControl(2)
+              .click()
+              .should('have.attr', 'aria-checked', 'false');
+          allSeasonsControl()
+            .click()
+            .should('have.attr', 'aria-checked', String(ignoreQuota));
+          if (ignoreQuota) {
+            allSeasonsControl()
+              .click()
+              .should('have.attr', 'aria-checked', 'false')
+              .click();
+          }
+          seasonControl(3).should('have.class', 'opacity-50').click();
+          cy.contains('[role="dialog"] button', /^Approve Request$/).click();
+          cy.wait('@edit').then(({ request: edit }) => {
+            expect(edit.body.serverId).to.eq(1);
+            expect(edit.body.seasons).to.deep.eq(ignoreQuota ? [1, 2] : [1]);
+            expect(edit.body).not.to.have.property('ignoreQuota');
+          });
+        });
+      }
+    }
   });
 
   describe('explicit creation overrides', () => {
@@ -2141,16 +2430,10 @@ describe('Request destinations', () => {
         cy.get('#folder').should('not.be.disabled').select('/1');
         if (type === 'tv') {
           cy.get('#language').should('not.be.disabled').select('10');
-          cy.contains('[role="dialog"] label', 'Bypass User Quota')
-            .parent()
-            .find('[role="checkbox"]')
-            .should('have.attr', 'aria-disabled', 'false')
-            .focus()
-            .trigger('keydown', { key: ' ' })
-            .should('have.attr', 'aria-checked', 'true')
-            .trigger('keydown', { key: 'Enter' })
-            .should('have.attr', 'aria-checked', 'false');
         }
+        cy.contains('[role="dialog"] label', 'Bypass User Quota').should(
+          'not.exist'
+        );
         cy.get('.react-select__input-container input').type('Tag');
         cy.contains('[role="option"]', 'Tag 1').click();
         cy.contains('.react-select__multi-value', 'Tag 1').should('be.visible');

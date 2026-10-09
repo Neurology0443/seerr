@@ -181,6 +181,7 @@ const AdvancedRequester = ({
   const hasConfigurationChanges =
     destinationChanged || Object.keys(manualValues).length > 0;
   const isIgnoreQuotaVisible =
+    requestId === undefined &&
     currentHasPermission([Permission.MANAGE_REQUESTS]) &&
     ((type === 'movie' ? quota?.movie.limit : quota?.tv.limit) ?? 0) > 0;
 
@@ -575,6 +576,7 @@ const AdvancedRequester = ({
   }
 
   if (
+    !isIgnoreQuotaVisible &&
     isConfigurationReady &&
     !error &&
     !serverError &&
