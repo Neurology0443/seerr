@@ -4,6 +4,7 @@ import CachedImage from '@app/components/Common/CachedImage';
 import Modal from '@app/components/Common/Modal';
 import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequester';
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
+import { getCreationDestinationOverrides } from '@app/components/RequestModal/AdvancedRequester/state';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import useToasts from '@app/hooks/useToasts';
 import { useUser } from '@app/hooks/useUser';
@@ -56,6 +57,12 @@ const CollectionRequestModal = ({
   });
   const intl = useIntl();
   const { user, hasPermission } = useUser();
+  const canUseAdvancedRequester = hasPermission(
+    [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
+    { type: 'or' }
+  );
+  const isAdvancedConfigurationReady =
+    !canUseAdvancedRequester || requestOverrides?.isReady === true;
   const { data: quota } = useSWR<QuotaResponse>(
     user &&
       (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
@@ -184,6 +191,10 @@ const CollectionRequestModal = ({
   }, [isUpdating, onUpdating]);
 
   const sendRequest = useCallback(async () => {
+    if (!isAdvancedConfigurationReady) {
+      return;
+    }
+
     setIsUpdating(true);
 
     try {
@@ -191,10 +202,8 @@ const CollectionRequestModal = ({
       if (requestOverrides) {
         overrideParams = {
           serverId: requestOverrides.server,
-          profileId: requestOverrides.profile,
-          rootFolder: requestOverrides.folder,
           userId: requestOverrides.user?.id,
-          tags: requestOverrides.tags,
+          ...getCreationDestinationOverrides(requestOverrides.manualValues),
         };
       }
 
@@ -238,6 +247,7 @@ const CollectionRequestModal = ({
       setIsUpdating(false);
     }
   }, [
+    isAdvancedConfigurationReady,
     requestOverrides,
     data?.parts,
     data?.name,
@@ -286,7 +296,7 @@ const CollectionRequestModal = ({
                 }
               )
       }
-      okDisabled={selectedParts.length === 0}
+      okDisabled={selectedParts.length === 0 || !isAdvancedConfigurationReady}
       okButtonType={'primary'}
       backdrop={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data?.backdropPath}`}
     >
@@ -517,10 +527,7 @@ const CollectionRequestModal = ({
           </div>
         </div>
       </div>
-      {hasPermission(
-        [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
-        { type: 'or' }
-      ) && (
+      {canUseAdvancedRequester && (
         <AdvancedRequester
           type="movie"
           is4k={is4k}

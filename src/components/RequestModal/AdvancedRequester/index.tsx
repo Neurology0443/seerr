@@ -158,9 +158,8 @@ const AdvancedRequester = ({
   const [ignoreQuota, setIgnoreQuota] = useState<boolean>(
     defaultOverrides?.ignoreQuota ?? false
   );
-  const [configuredServerId, setConfiguredServerId] = useState<number | null>(
-    null
-  );
+  const [configuredServerData, setConfiguredServerData] =
+    useState<ServiceCommonServerWithDetails | null>(null);
   const [overrideRulesError, setOverrideRulesError] = useState(false);
   const [rulesRetry, setRulesRetry] = useState(0);
   const [destinationChanged, setDestinationChanged] = useState(false);
@@ -171,7 +170,7 @@ const AdvancedRequester = ({
   const ruleEvaluationRef = useRef<{
     key: string;
     resolutionInputKey: string;
-    tags: number[];
+    tags?: number[];
     defaults: DestinationValues;
     applied: boolean;
     result: Promise<Partial<OverrideRulesResult>>;
@@ -236,7 +235,7 @@ const AdvancedRequester = ({
     selectedServer !== null &&
     !!data &&
     !!serverData &&
-    configuredServerId === selectedServer &&
+    configuredServerData === serverData &&
     !isListValidating &&
     !error &&
     !isValidating &&
@@ -268,18 +267,19 @@ const AdvancedRequester = ({
     rulesRetry,
     isAnime,
   ]);
-  // A default-tag metadata change is not a user/rule-input change. Retain the
-  // evaluation's tags until another resolution event or explicit tag selection.
-  const ruleTags =
-    manualValues.tags ??
-    (usePersistedOverrides ? original?.tags : undefined) ??
-    (initializedServer.current === selectedServer &&
-    ruleEvaluationRef.current?.resolutionInputKey === resolutionInputKey
-      ? ruleEvaluationRef.current.tags
-      : serverData
-        ? getDestinationDefaults(serverData.server, isAnime).tags
-        : []) ??
-    [];
+  // Creation previews use only the tags that will be explicitly submitted.
+  // Edits retain their existing persisted/default-tag evaluation inputs.
+  const ruleTags = !requestId
+    ? manualValues.tags
+    : (manualValues.tags ??
+      (usePersistedOverrides ? original?.tags : undefined) ??
+      (initializedServer.current === selectedServer &&
+      ruleEvaluationRef.current?.resolutionInputKey === resolutionInputKey
+        ? ruleEvaluationRef.current.tags
+        : serverData
+          ? getDestinationDefaults(serverData.server, isAnime).tags
+          : []) ??
+      []);
   const ruleTagsKey = JSON.stringify(ruleTags);
 
   const { data: userData } = useSWR<UserResultsResponse>(
@@ -428,7 +428,7 @@ const AdvancedRequester = ({
         // Reuse the current evaluation (including an in-flight response or
         // failure) while rule inputs and classification are unchanged.
         if (ruleEvaluationRef.current?.key !== key) {
-          setConfiguredServerId(null);
+          setConfiguredServerData(null);
           setOverrideRulesError(false);
           ruleEvaluationRef.current = {
             key,
@@ -449,17 +449,21 @@ const AdvancedRequester = ({
         const evaluation = ruleEvaluationRef.current;
         if (
           initializing ||
-          evaluation.resolutionInputKey !== resolutionInputKey
+          evaluation.resolutionInputKey !== resolutionInputKey ||
+          (!requestId && !isEqual(evaluation.defaults, defaults))
         ) {
-          setConfiguredServerId(null);
+          setConfiguredServerData(null);
           evaluation.resolutionInputKey = resolutionInputKey;
           evaluation.tags = ruleTags;
           evaluation.defaults = defaults;
           evaluation.applied = false;
         }
-        // Metadata-only refreshes validate established values without replaying
-        // defaults or cached rules. A pending evaluation keeps its own defaults.
-        if (evaluation.applied) return;
+        // Creation resolves refreshed defaults with the cached rule result.
+        // Edits retain their historical resolution and PUT semantics.
+        if (evaluation.applied) {
+          setConfiguredServerData(serverData);
+          return;
+        }
         const override = await evaluation.result;
         if (
           cancelled ||
@@ -476,7 +480,7 @@ const AdvancedRequester = ({
           })
         );
         evaluation.applied = true;
-        setConfiguredServerId(serverData.server.id);
+        setConfiguredServerData(serverData);
       } catch {
         if (!cancelled && revision === formRevision.current) {
           setOverrideRulesError(true);
@@ -520,7 +524,7 @@ const AdvancedRequester = ({
     setDestinationChanged(serverId !== originalServer.current);
     manualValuesRef.current = {};
     setManualValues({});
-    setConfiguredServerId(null);
+    setConfiguredServerData(null);
     setOverrideRulesError(false);
     setSelectedProfile(-1);
     setSelectedFolder('');
@@ -545,7 +549,7 @@ const AdvancedRequester = ({
     setManualValues(manualValuesRef.current);
     if (values.tags !== undefined && !isEqual(values.tags, ruleTags)) {
       formRevision.current += 1;
-      setConfiguredServerId(null);
+      setConfiguredServerData(null);
       setOverrideRulesError(false);
     }
     if (values.profile !== undefined) setSelectedProfile(values.profile);
@@ -558,7 +562,7 @@ const AdvancedRequester = ({
 
     formRevision.current += 1;
     setOverrideRulesError(false);
-    setConfiguredServerId(null);
+    setConfiguredServerData(null);
     setRulesRetry((previous) => previous + 1);
   };
 
@@ -964,7 +968,7 @@ const AdvancedRequester = ({
                 if (disabled || value.id === selectedUserId) return;
                 setHasLocalActions(true);
                 formRevision.current += 1;
-                setConfiguredServerId(null);
+                setConfiguredServerData(null);
                 setOverrideRulesError(false);
                 setIgnoreQuota(false);
                 setSelectedUser(value);

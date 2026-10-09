@@ -45,6 +45,21 @@ const details = (id: number) => ({
   ],
   tags: [{ id, label: `Tag ${id}` }],
 });
+const expectCreationOverrides = (
+  body: Record<string, unknown>,
+  expected: Record<string, unknown> = {}
+) => {
+  for (const field of [
+    'profileId',
+    'rootFolder',
+    'languageProfileId',
+    'tags',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(expected, field))
+      expect(body[field]).to.deep.eq(expected[field]);
+    else expect(body).not.to.have.property(field);
+  }
+};
 const pending = (id: number, serverId: number | null) => ({
   id,
   editRevision: `revision-${id}`,
@@ -233,14 +248,14 @@ const clickAction = (label: RegExp) => {
 
 // Use the existing SWR revalidation test pattern: control its deduplication
 // timer from page load, then reconnect and wait for the actual responses.
-const refreshEditCaches = () => {
+const refreshEditCaches = (restoreClock = true) => {
   cy.tick(2000);
   cy.window().then((win) => {
     win.dispatchEvent(new win.Event('offline'));
     win.dispatchEvent(new win.Event('online'));
   });
   cy.tick(0);
-  cy.clock().then((clock) => clock.restore());
+  if (restoreClock) cy.clock().then((clock) => clock.restore());
 };
 
 // Hold a revalidation while a parent/form rerender commits newer callbacks.
@@ -352,6 +367,427 @@ describe('Request destinations', () => {
     cy.intercept('POST', '/api/v1/request/*/decline', {}).as('decline');
   });
 
+  describe('explicit creation overrides', () => {
+    for (const type of ['movie', 'tv'] as const) {
+      for (const independent of [false, true]) {
+        const openCreation = () => {
+          const kind = type === 'movie' ? 'radarr' : 'sonarr';
+          const configuredServers = servers.map((server) => ({
+            ...server,
+            independentRequestDestination: independent,
+          }));
+          cy.intercept('GET', `/api/v1/service/${kind}`, configuredServers);
+          for (const id of [1, 2])
+            cy.intercept('GET', `/api/v1/service/${kind}/${id}`, {
+              ...details(id),
+              server: configuredServers[id - 1],
+            });
+          visitMedia(type, [], false, independent);
+          clickAction(/^Request$/);
+          cy.get('#profile').should('not.be.disabled').and('have.value', '10');
+          cy.get('#folder').should('have.value', '/1');
+          cy.get('.react-select__multi-value').should('contain', 'Tag 1');
+          if (type === 'tv') cy.get('#language').should('have.value', '10');
+        };
+        const submit = (
+          serverId: number,
+          manual: Record<string, unknown> = {}
+        ) => {
+          if (type === 'tv')
+            cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+          cy.contains(
+            '[role="dialog"] button',
+            type === 'movie' ? /^Request$/ : /^Request 1 Season$/
+          )
+            .should('not.be.disabled')
+            .click();
+          cy.wait('@create').then(({ request }) => {
+            expect(request.body.serverId).to.eq(serverId);
+            expectCreationOverrides(request.body, manual);
+          });
+        };
+        const context = `${type} on a ${independent ? 'independent' : 'native'} destination`;
+
+        it(`omits displayed defaults for ${context}`, () => {
+          openCreation();
+          cy.get('@rules.all').should((calls) => {
+            for (const call of calls as unknown as {
+              request: { body: Record<string, unknown> };
+            }[])
+              expect(call.request.body).not.to.have.property('tags');
+          });
+          submit(1);
+        });
+
+        for (const [field, value, expected] of [
+          ['profile', '11', { profileId: 11 }],
+          ['folder', '/custom', { rootFolder: '/custom' }],
+          ...(type === 'tv'
+            ? [['language', '31', { languageProfileId: 31 }]]
+            : []),
+        ] as [string, string, Record<string, unknown>][]) {
+          it(`sends only the manual ${field} for ${context}`, () => {
+            openCreation();
+            cy.get(`#${field}`).select(value);
+            submit(1, expected);
+          });
+        }
+
+        it(`keeps an explicitly restored default profile for ${context}`, () => {
+          openCreation();
+          cy.get('#profile').select('11').should('have.value', '11');
+          cy.get('#profile').select('10').should('have.value', '10');
+          submit(1, { profileId: 10 });
+        });
+
+        it(`previews and submits explicit empty tags for ${context}`, () => {
+          openCreation();
+          cy.get('.react-select__multi-value__remove').click();
+          cy.get('@rules.all').should((calls) => {
+            const evaluations = calls as unknown as {
+              request: { body: Record<string, unknown> };
+            }[];
+            expect(
+              evaluations[evaluations.length - 1].request.body.tags
+            ).to.deep.eq([]);
+          });
+          submit(1, { tags: [] });
+        });
+
+        for (const returnToOriginal of [false, true]) {
+          it(`clears manual configuration across ${returnToOriginal ? 'A → B → A' : 'A → B'} for ${context}`, () => {
+            openCreation();
+            cy.get('#profile').select('11');
+            cy.get('#folder').select('/custom');
+            if (type === 'tv') cy.get('#language').select('31');
+            cy.get('.react-select__multi-value__remove').click();
+            cy.get('#profile').should('not.be.disabled');
+            cy.get('#server').select('2');
+            cy.get('#profile')
+              .should('not.be.disabled')
+              .and('have.value', '20');
+            cy.get('#folder').should('have.value', '/2');
+            cy.get('.react-select__multi-value').should('contain', 'Tag 2');
+            if (type === 'tv') cy.get('#language').should('have.value', '20');
+            if (returnToOriginal) {
+              cy.get('#profile').select('21');
+              cy.get('#server').select('1');
+              cy.get('#profile')
+                .should('not.be.disabled')
+                .and('have.value', '10');
+              cy.get('#folder').should('have.value', '/1');
+            }
+            submit(returnToOriginal ? 1 : 2);
+          });
+        }
+
+        it(`displays rule tags without adding destination defaults for ${context}`, () => {
+          const kind = type === 'movie' ? 'radarr' : 'sonarr';
+          // Keep the rule tag valid in both native and independent inventories.
+          const metadata = details(1);
+          metadata.tags.push({ id: 2, label: 'Tag 2' });
+          cy.intercept(
+            'POST',
+            '/api/v1/overrideRule/advancedRequest',
+            (req) => {
+              expect(req.body).not.to.have.property('tags');
+              req.reply({ profileId: 11, rootFolder: '/custom', tags: [2] });
+            }
+          ).as('creationRules');
+          const configuredServers = servers.map((server) => ({
+            ...server,
+            independentRequestDestination: independent,
+          }));
+          cy.intercept('GET', `/api/v1/service/${kind}`, configuredServers);
+          cy.intercept('GET', `/api/v1/service/${kind}/1`, {
+            ...metadata,
+            server: configuredServers[0],
+          });
+          visitMedia(type, [], false, independent);
+          clickAction(/^Request$/);
+          cy.get('#profile').should('not.be.disabled').and('have.value', '11');
+          cy.get('#folder').should('have.value', '/custom');
+          cy.get('.react-select__multi-value')
+            .should('have.length', 1)
+            .and('contain', 'Tag 2');
+          submit(1);
+        });
+      }
+    }
+  });
+
+  describe('collection creation overrides', () => {
+    const collectionId = 10;
+    const parts = [movieId, movieId + 1];
+    const openCollectionModal = () => {
+      const collection = {
+        id: collectionId,
+        name: 'Correction Collection',
+        parts: parts.map((id) => ({
+          id,
+          mediaType: 'movie',
+          title: `Collection Movie ${id}`,
+          releaseDate: '2020-01-01',
+          genreIds: [],
+          overview: '',
+          voteAverage: 0,
+          voteCount: 0,
+        })),
+      };
+      cy.intercept('GET', `/api/v1/collection/${collectionId}`, collection).as(
+        'collection'
+      );
+      let appProps: Record<string, unknown>;
+      cy.intercept(
+        'GET',
+        `**/_next/data/**/collection/${collectionId}.json*`,
+        (req) =>
+          req.reply({ ...appProps, pageProps: { collection }, __N_SSP: true })
+      );
+      const movie = visitMedia('movie');
+      Object.assign(movie, {
+        collection: { id: collectionId, name: collection.name },
+      });
+      cy.window().then((win) => {
+        appProps = (
+          win as unknown as {
+            __NEXT_DATA__: { props: Record<string, unknown> };
+          }
+        ).__NEXT_DATA__.props;
+      });
+      cy.get(`a[href="/collection/${collectionId}"]`).click();
+      cy.contains('button', /^Request Collection$/).click();
+      cy.get('[role="dialog"] tbody [role="checkbox"]').each(($checkbox) =>
+        cy.wrap($checkbox).click()
+      );
+    };
+    const openCollection = () => {
+      openCollectionModal();
+      cy.get('#profile').should('not.be.disabled').and('have.value', '10');
+      cy.get('#server').select('2');
+      cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+      cy.get('#folder').should('have.value', '/2');
+      cy.contains('[role="dialog"] button', 'Admin').click();
+      cy.contains('[role="option"]', 'Beneficiary').click();
+      cy.get('#profile').should('not.be.disabled');
+    };
+    const submitCollection = (manual: Record<string, unknown> = {}) => {
+      cy.contains('[role="dialog"] button', /^Request 2 Movies$/).click();
+      cy.wait(['@create', '@create']).then((calls) => {
+        expect(
+          calls.map(({ request }) => request.body.mediaId).sort()
+        ).to.deep.eq(parts);
+        for (const { request } of calls) {
+          expect(request.body).to.include({
+            mediaType: 'movie',
+            is4k: false,
+            serverId: 2,
+            userId: 2,
+          });
+          expectCreationOverrides(request.body, manual);
+        }
+      });
+    };
+    it('omits displayed configuration on every selected collection movie', () => {
+      openCollection();
+      submitCollection();
+    });
+    it('sends an explicit collection profile even when restored to the displayed default', () => {
+      openCollection();
+      cy.get('#profile').select('21').should('have.value', '21');
+      cy.get('#profile').select('20').should('have.value', '20');
+      submitCollection({ profileId: 20 });
+    });
+    it('sends only the explicit collection root folder', () => {
+      openCollection();
+      cy.get('#folder').select('/custom');
+      submitCollection({ rootFolder: '/custom' });
+    });
+    it('sends explicit empty collection tags', () => {
+      openCollection();
+      cy.get('.react-select__multi-value__remove').click();
+      submitCollection({ tags: [] });
+    });
+    it('sends explicit collection tags independently of profile and folder', () => {
+      openCollection();
+      cy.get('.react-select__multi-value__remove').click();
+      cy.get('.react-select__input-container input').type('Tag 2');
+      cy.contains('[role="option"]', /^Tag 2$/).click();
+      submitCollection({ tags: [2] });
+    });
+
+    for (const permission of ['REQUEST_ADVANCED', 'MANAGE_REQUESTS'] as const) {
+      it(`blocks collection submission for ${permission} until initial metadata resolution completes`, () => {
+        cy.intercept('GET', '/api/v1/auth/me', {
+          ...admin,
+          // Exercise each permission independently, without ADMIN.
+          permissions:
+            32 | 16384 | (permission === 'REQUEST_ADVANCED' ? 8192 : 16),
+        });
+        let release: (() => void) | undefined;
+        cy.intercept(
+          'GET',
+          '/api/v1/service/radarr/1',
+          (req) =>
+            new Promise<void>((resolve) => {
+              release = () => {
+                req.reply(details(1));
+                resolve();
+              };
+            })
+        ).as('pendingConfiguration');
+        openCollectionModal();
+        cy.wrap(null).should(() => expect(release).to.be.a('function'));
+        cy.contains('[role="dialog"] button', /^Request 2 Movies$/)
+          .should('be.disabled')
+          .click({ force: true });
+        cy.get('@create.all').should('have.length', 0);
+        cy.then(() => release?.());
+        cy.wait('@pendingConfiguration');
+        cy.contains('[role="dialog"] button', /^Request 2 Movies$/).should(
+          'not.be.disabled'
+        );
+        cy.get('@create.all').should('have.length', 0);
+      });
+    }
+
+    for (const field of ['profile', 'folder'] as const) {
+      it(`blocks every collection movie after ${field} invalidation and recovers with an explicit replacement`, () => {
+        cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+        openCollection();
+        cy.get(`#${field}`).select(field === 'profile' ? '21' : '/custom');
+        cy.contains('[role="dialog"] button', /^Request 2 Movies$/).should(
+          'not.be.disabled'
+        );
+        const unavailable = {
+          ...details(2),
+          ...(field === 'profile'
+            ? {
+                profiles: [
+                  details(2).profiles[0],
+                  { id: 22, name: 'Replacement' },
+                ],
+              }
+            : {
+                rootFolders: [
+                  details(2).rootFolders[0],
+                  { id: 3, path: '/replacement' },
+                ],
+              }),
+        };
+        cy.intercept('GET', '/api/v1/service/radarr/2', unavailable).as(
+          'removed'
+        );
+        refreshEditCaches(false);
+        cy.wait('@removed');
+        cy.contains('[role="alert"]', 'Some selected configuration').should(
+          'be.visible'
+        );
+        cy.contains('[role="dialog"] button', /^Request 2 Movies$/)
+          .should('be.disabled')
+          .click({ force: true })
+          .then(($button) => {
+            // Invoke the registered handler directly to test its guard as well
+            // as the disabled UI; React suppresses clicks on disabled buttons.
+            const button = $button[0] as unknown as Record<string, unknown>;
+            const propsKey = Object.keys(button).find((key) =>
+              key.startsWith('__reactProps$')
+            );
+            expect(propsKey).to.be.a('string');
+            return (
+              button[propsKey!] as { onClick: () => Promise<void> }
+            ).onClick();
+          });
+        cy.get('@create.all').should('have.length', 0);
+        cy.get(`#${field}`).select(field === 'profile' ? '22' : '/replacement');
+        cy.contains('[role="dialog"] button', /^Request 2 Movies$/).should(
+          'not.be.disabled'
+        );
+
+        // A later unresolved refresh must block the recovered form again.
+        let release: (() => void) | undefined;
+        cy.intercept(
+          'GET',
+          '/api/v1/service/radarr/2',
+          (req) =>
+            new Promise<void>((resolve) => {
+              release = () => {
+                req.reply(unavailable);
+                resolve();
+              };
+            })
+        ).as('recovery');
+        refreshEditCaches(false);
+        cy.wrap(null).should(() => expect(release).to.be.a('function'));
+        cy.contains('[role="dialog"] button', /^Request 2 Movies$/).should(
+          'be.disabled'
+        );
+        cy.get('@create.all').should('have.length', 0);
+        cy.then(() => release?.());
+        cy.wait('@recovery');
+        cy.contains('[role="dialog"] button', /^Request 2 Movies$/).should(
+          'not.be.disabled'
+        );
+        submitCollection(
+          field === 'profile'
+            ? { profileId: 22 }
+            : { rootFolder: '/replacement' }
+        );
+      });
+    }
+
+    it('blocks collection submission after a metadata failure and recovers', () => {
+      cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+      openCollection();
+      cy.intercept('GET', '/api/v1/service/radarr/2', { statusCode: 500 }).as(
+        'failure'
+      );
+      refreshEditCaches(false);
+      cy.wait('@failure');
+      cy.contains(
+        '[role="alert"]',
+        'Unable to load destination metadata.'
+      ).should('be.visible');
+      cy.contains('[role="dialog"] button', /^Request 2 Movies$/)
+        .should('be.disabled')
+        .click({ force: true });
+      cy.get('@create.all').should('have.length', 0);
+      cy.intercept('GET', '/api/v1/service/radarr/2', details(2)).as(
+        'recovery'
+      );
+      refreshEditCaches(false);
+      cy.wait('@recovery');
+      cy.contains('[role="dialog"] button', /^Request 2 Movies$/).should(
+        'not.be.disabled'
+      );
+      submitCollection();
+    });
+
+    it('submits native collection requests without Advanced Request state', () => {
+      cy.intercept('GET', '/api/v1/auth/me', {
+        ...admin,
+        permissions: 32 | 16384, // REQUEST, REQUEST_VIEW
+      });
+      openCollectionModal();
+      cy.get('[role="dialog"] #server').should('not.exist');
+      cy.get('@rules.all').should('have.length', 0);
+      cy.contains('[role="dialog"] button', /^Request 2 Movies$/)
+        .should('not.be.disabled')
+        .click();
+      cy.wait(['@create', '@create']).then((calls) => {
+        expect(
+          calls.map(({ request }) => request.body.mediaId).sort()
+        ).to.deep.eq(parts);
+        for (const { request } of calls) {
+          expect(request.body).to.include({ mediaType: 'movie', is4k: false });
+          expect(request.body).not.to.have.property('serverId');
+          expect(request.body).not.to.have.property('userId');
+          expectCreationOverrides(request.body);
+        }
+      });
+    });
+  });
+
   describe('confirmed configuration invalidation', () => {
     // Keep SWR's deduplication timers controlled across multiple retries.
     const revalidateMetadata = () => {
@@ -377,6 +813,173 @@ describe('Request destinations', () => {
     };
     beforeEach(() => {
       cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
+    });
+
+    describe('refreshed destination defaults', () => {
+      const metadata = (refreshed: boolean) => ({
+        ...details(1),
+        server: {
+          ...servers[0],
+          activeProfileId: refreshed ? 11 : 10,
+          activeDirectory: refreshed ? '/custom' : '/1',
+          activeLanguageProfileId: refreshed ? 31 : 10,
+          activeTags: refreshed ? [2] : [1],
+          activeAnimeProfileId: refreshed ? 11 : 12,
+          activeAnimeDirectory: refreshed ? '/custom' : '/anime',
+          activeAnimeLanguageProfileId: refreshed ? 31 : 13,
+          activeAnimeTags: refreshed ? [2] : [3],
+        },
+        profiles: [...details(1).profiles, { id: 12, name: 'Anime' }],
+        rootFolders: [...details(1).rootFolders, { id: 3, path: '/anime' }],
+        languageProfiles: [
+          ...details(1).languageProfiles,
+          { id: 13, name: 'Anime' },
+        ],
+        tags: [
+          { id: 1, label: 'Tag 1' },
+          { id: 2, label: 'Tag 2' },
+          { id: 3, label: 'Tag 3' },
+        ],
+      });
+      const open = (type: 'movie' | 'tv', isAnime = false) => {
+        const kind = type === 'movie' ? 'radarr' : 'sonarr';
+        cy.intercept('GET', `/api/v1/service/${kind}/1`, metadata(false));
+        visitMedia(type, [], false, false, undefined, [1, 2], isAnime);
+        clickAction(/^Request$/);
+        cy.get('#profile')
+          .should('not.be.disabled')
+          .and('have.value', isAnime ? '12' : '10');
+        if (type === 'tv')
+          cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+      };
+      const refresh = (type: 'movie' | 'tv') => {
+        let release: (() => void) | undefined;
+        let rulesCount = 0;
+        cy.get('@rules.all').then((calls) => {
+          rulesCount = (calls as unknown as unknown[]).length;
+        });
+        cy.intercept(
+          'GET',
+          `/api/v1/service/${type === 'movie' ? 'radarr' : 'sonarr'}/1`,
+          (req) =>
+            new Promise<void>((resolve) => {
+              release = () => {
+                req.reply(metadata(true));
+                resolve();
+              };
+            })
+        ).as('refreshedDefaults');
+        revalidateMetadata();
+        cy.wrap(null).should(() => expect(release).to.be.a('function'));
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'be.disabled'
+        );
+        cy.then(() => release?.());
+        cy.wait('@refreshedDefaults');
+        cy.contains('[role="dialog"] button', creationButton).should(
+          'not.be.disabled'
+        );
+        cy.get('@rules.all').should((calls) =>
+          expect((calls as unknown as unknown[]).length).to.eq(rulesCount)
+        );
+      };
+      const expectValues = (
+        type: 'movie' | 'tv',
+        values: {
+          profile: number;
+          folder: string;
+          language: number;
+          tags: number[];
+        }
+      ) => {
+        cy.get('#profile').should('have.value', String(values.profile));
+        cy.get('#folder').should('have.value', values.folder);
+        if (type === 'tv')
+          cy.get('#language').should('have.value', String(values.language));
+        cy.get('.react-select__multi-value').should(
+          'have.length',
+          values.tags.length
+        );
+        for (const tag of values.tags)
+          cy.get('.react-select__multi-value').should('contain', `Tag ${tag}`);
+      };
+      const submit = (manual: Record<string, unknown> = {}) => {
+        cy.contains('[role="dialog"] button', creationButton)
+          .should('not.be.disabled')
+          .click();
+        cy.wait('@create').then(({ request }) =>
+          expectCreationOverrides(request.body, manual)
+        );
+      };
+      const refreshed = {
+        profile: 11,
+        folder: '/custom',
+        language: 31,
+        tags: [2],
+      };
+      for (const type of ['movie', 'tv'] as const) {
+        for (const isAnime of type === 'tv' ? [false, true] : [false]) {
+          it(`refreshes untouched ${isAnime ? 'anime' : 'normal'} ${type} defaults while old options remain available`, () => {
+            open(type, isAnime);
+            refresh(type);
+            expectValues(type, refreshed);
+            submit();
+          });
+        }
+        for (const field of [
+          'profile',
+          'folder',
+          'tags',
+          ...(type === 'tv' ? ['language'] : []),
+        ]) {
+          it(`protects only the explicit ${type} ${field} across a defaults refresh`, () => {
+            open(type);
+            const manual: Record<string, unknown> = {};
+            const expected = { ...refreshed };
+            if (field === 'profile') {
+              cy.get('#profile').select('11').should('have.value', '11');
+              cy.get('#profile').select('10').should('have.value', '10');
+              manual.profileId = expected.profile = 10;
+            }
+            if (field === 'folder') {
+              cy.get('#folder')
+                .select('/custom')
+                .should('have.value', '/custom');
+              cy.get('#folder').select('/1').should('have.value', '/1');
+              manual.rootFolder = expected.folder = '/1';
+            }
+            if (field === 'language') {
+              cy.get('#language').select('31').should('have.value', '31');
+              cy.get('#language').select('10').should('have.value', '10');
+              manual.languageProfileId = expected.language = 10;
+            }
+            if (field === 'tags') {
+              cy.get('.react-select__multi-value__remove').click();
+              cy.get('#profile').should('not.be.disabled');
+              manual.tags = expected.tags = [];
+            }
+            refresh(type);
+            expectValues(type, expected);
+            submit(manual);
+          });
+        }
+        it(`retains cached ${type} rule outputs over refreshed defaults`, () => {
+          cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {
+            profileId: 10,
+            rootFolder: '/1',
+            tags: [1],
+          }).as('rules');
+          open(type);
+          refresh(type);
+          expectValues(type, {
+            profile: 10,
+            folder: '/1',
+            language: 31,
+            tags: [1],
+          });
+          submit();
+        });
+      }
     });
 
     describe('anime classification resolution', () => {
@@ -456,18 +1059,13 @@ describe('Request destinations', () => {
         for (const id of values.tags)
           cy.get('.react-select__multi-value').should('contain', `Tag ${id}`);
       };
-      const expectCreation = (values: typeof normal) => {
+      const expectCreation = (manual: Record<string, unknown> = {}) => {
         cy.contains('[role="dialog"] button', creationButton)
           .should('not.be.disabled')
           .click();
         cy.wait('@create').then(({ request }) => {
-          expect(request.body).to.include({
-            serverId: 1,
-            profileId: values.profile,
-            rootFolder: values.folder,
-            languageProfileId: values.language,
-          });
-          expect(request.body.tags).to.deep.eq(values.tags);
+          expect(request.body.serverId).to.eq(1);
+          expectCreationOverrides(request.body, manual);
           expect(request.body.seasons).to.deep.eq([1]);
         });
       };
@@ -510,7 +1108,7 @@ describe('Request destinations', () => {
           changeClassification(title, !initiallyAnime);
           expectConfiguration(expected);
           expectRuleCalls(2, true);
-          expectCreation(expected);
+          expectCreation();
         });
       }
 
@@ -526,47 +1124,51 @@ describe('Request destinations', () => {
         changeClassification(title, false);
         expectConfiguration(normal);
         expectRuleCalls(3);
-        expectCreation(normal);
+        expectCreation();
       });
 
       for (const sharedTags of [true, false]) {
-        it(`keeps the latest anime rules after an obsolete evaluation with ${sharedTags ? 'identical' : 'changed'} HTTP inputs`, () => {
-          configureAnime(sharedTags);
-          let release: (() => void) | undefined;
-          let evaluations = 0;
-          cy.intercept(
-            'POST',
-            '/api/v1/overrideRule/advancedRequest',
-            (req) => {
-              if (++evaluations > 1) {
-                req.reply({ rootFolder: '/custom' });
-                return;
+        it(
+          `keeps the latest anime rules after an obsolete evaluation with ${sharedTags ? 'shared' : 'distinct'} default tags and identical HTTP inputs`,
+          { defaultCommandTimeout: 15000, requestTimeout: 15000 },
+          () => {
+            configureAnime(sharedTags);
+            let release: (() => void) | undefined;
+            let evaluations = 0;
+            cy.intercept(
+              'POST',
+              '/api/v1/overrideRule/advancedRequest',
+              (req) => {
+                if (++evaluations > 1) {
+                  req.reply({ rootFolder: '/custom' });
+                  return;
+                }
+                return new Promise<void>((resolve) => {
+                  release = () => {
+                    req.reply(genericRules);
+                    resolve();
+                  };
+                });
               }
-              return new Promise<void>((resolve) => {
-                release = () => {
-                  req.reply(genericRules);
-                  resolve();
-                };
-              });
-            }
-          ).as('rules');
-          const title = visitMedia('tv');
-          clickAction(/^Request$/);
-          cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
-          cy.wrap(null).should(() => expect(release).to.be.a('function'));
-          changeClassification(title, true);
-          const expected = { ...anime(sharedTags), folder: '/custom' };
-          expectConfiguration(expected);
-          expectRuleCalls(2, sharedTags);
-          cy.contains('[role="dialog"] button', creationButton).should(
-            'not.be.disabled'
-          );
-          cy.then(() => release?.());
-          cy.wait(['@rules', '@rules']);
-          expectConfiguration(expected);
-          expectRuleCalls(2, sharedTags);
-          expectCreation(expected);
-        });
+            ).as('rules');
+            const title = visitMedia('tv');
+            clickAction(/^Request$/);
+            cy.get('[role="dialog"] tbody [role="checkbox"]').first().click();
+            cy.wrap(null).should(() => expect(release).to.be.a('function'));
+            changeClassification(title, true);
+            const expected = { ...anime(sharedTags), folder: '/custom' };
+            expectConfiguration(expected);
+            expectRuleCalls(2, true);
+            cy.contains('[role="dialog"] button', creationButton).should(
+              'not.be.disabled'
+            );
+            cy.then(() => release?.());
+            cy.wait(['@rules', '@rules']);
+            expectConfiguration(expected);
+            expectRuleCalls(2, true);
+            expectCreation();
+          }
+        );
       }
 
       it('preserves manual fields while resolving unprotected anime fields', () => {
@@ -600,7 +1202,12 @@ describe('Request destinations', () => {
         changeClassification(title, false);
         expectConfiguration(protectedValues);
         expectRuleCalls(4);
-        expectCreation(protectedValues);
+        expectCreation({
+          profileId: 11,
+          rootFolder: '/custom',
+          languageProfileId: 31,
+          tags: [],
+        });
       });
 
       for (const nullable of [false, true]) {
@@ -654,7 +1261,7 @@ describe('Request destinations', () => {
         ...(type === 'tv' ? ['language'] : []),
       ]) {
         for (const automatic of [false, true]) {
-          it(`preserves an invalid ${automatic ? 'automatically resolved ' : ''}${type} ${field} and exposes its only replacement`, () => {
+          it(`${automatic ? 'adopts the refreshed default' : 'preserves an invalid manual selection'} for ${type} ${field}`, () => {
             openCreation(type);
             const selected = automatic
               ? field === 'folder'
@@ -712,6 +1319,20 @@ describe('Request destinations', () => {
             );
             revalidateMetadata();
             cy.wait('@metadata');
+            if (automatic) {
+              // Native selectors disappear once their sole option is valid.
+              cy.get(`#${field}`).should('not.exist');
+              cy.contains('[role="dialog"] button', creationButton)
+                .should('not.be.disabled')
+                .click();
+              cy.wait('@create').then(({ request }) =>
+                expectCreationOverrides(request.body)
+              );
+              cy.get('@rules.all').should((calls) =>
+                expect((calls as unknown as unknown[]).length).to.eq(rulesCount)
+              );
+              return;
+            }
             cy.get(`#${field}`)
               .should('be.visible')
               .and('not.be.disabled')
@@ -731,20 +1352,6 @@ describe('Request destinations', () => {
               'not.be.disabled'
             );
             cy.get('@create.all').should('have.length', 0);
-            if (automatic) {
-              cy.contains('[role="dialog"] button', creationButton).click();
-              cy.wait('@create').then(({ request }) => {
-                const key =
-                  field === 'profile'
-                    ? 'profileId'
-                    : field === 'folder'
-                      ? 'rootFolder'
-                      : 'languageProfileId';
-                expect(request.body[key]).to.eq(
-                  field === 'folder' ? replacement : Number(replacement)
-                );
-              });
-            }
           });
         }
       }
@@ -757,7 +1364,8 @@ describe('Request destinations', () => {
         });
         cy.intercept('GET', `/api/v1/service/${kind}/1`, {
           ...details(1),
-          server: { ...servers[0], activeTags: [] },
+          // The latest configured default itself remains invalid.
+          server: servers[0],
           tags: [],
         }).as('metadata');
         revalidateMetadata();
@@ -1194,7 +1802,7 @@ describe('Request destinations', () => {
         .should('not.be.disabled')
         .and('have.prop', 'value', '11');
       cy.get('#profile option:selected').should('contain', 'Unavailable');
-      cy.get('#folder').should('have.prop', 'value', '/1');
+      cy.get('#folder').should('have.prop', 'value', '/new-default');
       cy.get('@resolvedRules.all').should((calls) => {
         expect((calls as unknown as unknown[]).length).to.eq(rulesCount);
       });
@@ -1214,18 +1822,22 @@ describe('Request destinations', () => {
       cy.wait('@userRules').then(({ request }) => {
         expect(request.body.requestUser).to.eq(2);
         expect(request.body.serviceId).to.eq(1);
+        expect(request.body).not.to.have.property('tags');
       });
       cy.get('#profile')
         .should('not.be.disabled')
         .and('have.prop', 'value', '20');
       cy.get('#folder').should('have.prop', 'value', '/new-default');
       cy.get('.react-select__multi-value').should('contain', 'Tag 2');
-      cy.contains('[role="dialog"] button', creationButton).should(
-        'not.be.disabled'
-      );
+      cy.contains('[role="dialog"] button', creationButton)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@create').then(({ request }) => {
+        expectCreationOverrides(request.body, { profileId: 20 });
+      });
     });
 
-    it('keeps the resolution defaults when metadata changes during pending rules', () => {
+    it('uses refreshed defaults when metadata changes during pending rules', () => {
       let release: (() => void) | undefined;
       cy.intercept(
         'POST',
@@ -1244,23 +1856,24 @@ describe('Request destinations', () => {
       cy.intercept('GET', '/api/v1/service/radarr/1', {
         ...details(1),
         server: { ...servers[0], activeProfileId: 20 },
-        profiles: [{ id: 20, name: 'New default' }],
+        profiles: [...details(1).profiles, { id: 20, name: 'New default' }],
       }).as('metadata');
       revalidateMetadata();
       cy.wait('@metadata');
+      cy.contains('[role="dialog"] button', creationButton).should(
+        'be.disabled'
+      );
       cy.then(() => release?.());
       cy.wait('@pendingRules');
       cy.get('@pendingRules.all').should('have.length', 1);
       cy.get('#profile')
         .should('not.be.disabled')
-        .and('have.prop', 'value', '10');
-      cy.get('#profile option:selected').should('contain', 'Unavailable');
-      cy.contains('[role="dialog"] button', creationButton).should(
-        'be.disabled'
-      );
-      cy.get('#profile').select('20');
-      cy.contains('[role="dialog"] button', creationButton).should(
-        'not.be.disabled'
+        .and('have.prop', 'value', '20');
+      cy.contains('[role="dialog"] button', creationButton)
+        .should('not.be.disabled')
+        .click();
+      cy.wait('@create').then(({ request }) =>
+        expectCreationOverrides(request.body)
       );
     });
 
@@ -2626,11 +3239,9 @@ describe('Request destinations', () => {
         mediaId: movieId,
         is4k: false,
         serverId: 2,
-        profileId: 20,
-        rootFolder: '/2',
         userId: 1,
       });
-      expect(request.body.tags).to.deep.eq([2]);
+      expectCreationOverrides(request.body);
     });
     cy.get('[role="dialog"]').should('not.exist');
     cy.contains('Correction Movie requested successfully!').should(
@@ -2722,13 +3333,10 @@ describe('Request destinations', () => {
         tvdbId: 123,
         is4k: false,
         serverId: 2,
-        profileId: 20,
-        rootFolder: '/2',
-        languageProfileId: 20,
         userId: 1,
       });
       expect(request.body.seasons).to.deep.eq([2]);
-      expect(request.body.tags).to.deep.eq([2]);
+      expectCreationOverrides(request.body);
     });
     cy.get('[role="dialog"]').should('not.exist');
     cy.contains('Correction Series requested successfully!').should(
@@ -2770,67 +3378,72 @@ describe('Request destinations', () => {
     );
   });
 
-  it('ignores a stale retry response after destination, beneficiary and manual selection changes', () => {
-    let retryStarted = false;
-    let releaseRetry: (() => void) | undefined;
-    cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', (req) => {
-      if (req.body.serviceId === 1) {
-        if (!retryStarted) {
-          req.alias = 'failedRules';
-          req.reply({
-            statusCode: 500,
-            body: { message: 'Rules unavailable' },
+  // The held callback must outlive the scripted destination and user changes.
+  it(
+    'ignores a stale retry response after destination, beneficiary and manual selection changes',
+    { defaultCommandTimeout: 15000 },
+    () => {
+      let retryStarted = false;
+      let releaseRetry: (() => void) | undefined;
+      cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', (req) => {
+        if (req.body.serviceId === 1) {
+          if (!retryStarted) {
+            req.alias = 'failedRules';
+            req.reply({
+              statusCode: 500,
+              body: { message: 'Rules unavailable' },
+            });
+            return;
+          }
+          req.alias = 'staleRetry';
+          return new Promise<void>((resolve) => {
+            releaseRetry = () => {
+              req.reply({ body: { profileId: 11, rootFolder: '/custom' } });
+              resolve();
+            };
           });
-          return;
         }
-        req.alias = 'staleRetry';
-        return new Promise<void>((resolve) => {
-          releaseRetry = () => {
-            req.reply({ body: { profileId: 11, rootFolder: '/custom' } });
-            resolve();
-          };
+        req.reply({
+          body: {
+            profileId: req.body.requestUser === 2 ? 21 : 20,
+            rootFolder: req.body.requestUser === 2 ? '/custom' : '/2',
+          },
         });
-      }
-      req.reply({
-        body: {
-          profileId: req.body.requestUser === 2 ? 21 : 20,
-          rootFolder: req.body.requestUser === 2 ? '/custom' : '/2',
-        },
       });
-    });
-    visitMedia('movie');
-    clickAction(/^Request$/);
-    cy.wait('@failedRules');
-    cy.contains('[role="dialog"] button', /^Retry$/).should('be.visible');
-    cy.then(() => {
-      retryStarted = true;
-    });
-    cy.contains('[role="dialog"] button', /^Retry$/).click();
-    cy.wrap(null).should(() => {
-      expect(releaseRetry).to.be.a('function');
-    });
-    cy.get('#server').select('2');
-    cy.get('#profile').should('not.be.disabled').and('have.value', '20');
-    cy.contains('[role="dialog"] button', 'Admin').click();
-    cy.contains('[role="option"]', 'Beneficiary').click();
-    cy.get('#profile')
-      .should('not.be.disabled')
-      .and('have.value', '21')
-      .select('20');
-    cy.contains('[role="dialog"] button', /^Request$/).should(
-      'not.be.disabled'
-    );
-    cy.then(() => {
-      releaseRetry?.();
-    });
-    cy.wait('@staleRetry');
-    cy.get('#server').should('have.value', '2');
-    cy.get('#profile').should('not.be.disabled').and('have.value', '20');
-    cy.get('#folder').should('have.value', '/custom');
-    cy.contains('[role="dialog"] button', /^Request$/).should(
-      'not.be.disabled'
-    );
-  });
+      visitMedia('movie');
+      clickAction(/^Request$/);
+      cy.wait('@failedRules');
+      cy.contains('[role="dialog"] button', /^Retry$/).should('be.visible');
+      cy.then(() => {
+        retryStarted = true;
+      });
+      cy.contains('[role="dialog"] button', /^Retry$/).click();
+      cy.wrap(null).should(() => {
+        expect(releaseRetry).to.be.a('function');
+      });
+      cy.get('#server').select('2');
+      cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+      cy.contains('[role="dialog"] button', 'Admin').click();
+      cy.contains('[role="option"]', 'Beneficiary').click();
+      cy.get('#profile')
+        .should('not.be.disabled')
+        .and('have.value', '21')
+        .select('20');
+      cy.contains('[role="dialog"] button', /^Request$/).should(
+        'not.be.disabled'
+      );
+      cy.then(() => {
+        releaseRetry?.();
+      });
+      cy.wait('@staleRetry');
+      cy.get('#server').should('have.value', '2');
+      cy.get('#profile').should('not.be.disabled').and('have.value', '20');
+      cy.get('#folder').should('have.value', '/custom');
+      cy.contains('[role="dialog"] button', /^Request$/).should(
+        'not.be.disabled'
+      );
+    }
+  );
 
   it('cancels a movie and deletes an empty TV edit when Override Rules fail', () => {
     cy.intercept('POST', '/api/v1/overrideRule/advancedRequest', {

@@ -2,7 +2,10 @@ import Alert from '@app/components/Common/Alert';
 import Modal from '@app/components/Common/Modal';
 import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequester';
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
-import { getEditedDestinationValues } from '@app/components/RequestModal/AdvancedRequester/state';
+import {
+  getCreationDestinationOverrides,
+  getEditedDestinationValues,
+} from '@app/components/RequestModal/AdvancedRequester/state';
 import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
 import { useRequestEditSession } from '@app/components/RequestModal/useRequestEditSession';
 import {
@@ -144,10 +147,8 @@ const MovieRequestModal = ({
       if (requestOverrides) {
         overrideParams = {
           serverId: canSelectDestination ? requestOverrides.server : undefined,
-          profileId: requestOverrides.profile,
-          rootFolder: requestOverrides.folder,
           userId: requestOverrides.user?.id,
-          tags: requestOverrides.tags,
+          ...getCreationDestinationOverrides(requestOverrides.manualValues),
         };
       }
       const response = await axios.post<MediaRequest>('/api/v1/request', {
