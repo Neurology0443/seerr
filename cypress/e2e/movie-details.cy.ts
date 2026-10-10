@@ -64,7 +64,9 @@ describe('Movie management gear UX correction', () => {
     touch = false
   ) => {
     const movie = { ...uxMovie, mediaInfo };
-    cy.intercept('GET', '/api/v1/auth/me', { ...uxUser, permissions });
+    cy.intercept('GET', '/api/v1/auth/me', { ...uxUser, permissions }).as(
+      'managedUser'
+    );
     cy.intercept('GET', '/api/v1/movie/438148', movie).as('managedMovie');
     cy.intercept('GET', '/api/v1/movie/438148/request-targets', []).as(
       'managedTargets'
@@ -82,6 +84,9 @@ describe('Movie management gear UX correction', () => {
           }
         : {}
     );
+    cy.wait('@managedUser')
+      .its('response.body.permissions')
+      .should('eq', permissions);
     stubUxNavigation('/movie/438148', { movie });
     cy.get('[data-testid="title-card"]')
       .first()
@@ -90,6 +95,10 @@ describe('Movie management gear UX correction', () => {
       .click();
     cy.wait(['@managedMovie', '@managedTargets']);
     cy.get('[data-testid="media-title"]').should('contain', 'UX Movie');
+    // Wait for SWR to replace SSR's admin permissions in the rendered UI.
+    cy.get('[data-testid="sidebar-menu-settings"]').should(
+      permissions === uxUser.permissions ? 'exist' : 'not.exist'
+    );
   };
 
   beforeEach(() => {

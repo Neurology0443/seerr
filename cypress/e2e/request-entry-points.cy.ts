@@ -144,7 +144,7 @@ describe('Detail request entry points after card Quick Request removal', () => {
     cy.intercept('GET', '/api/v1/auth/me', {
       ...uxUser,
       permissions: scenario.permissions,
-    });
+    }).as('entryUser');
     cy.intercept('GET', '/api/v1/discover/trending*', {
       page: 1,
       totalPages: 1,
@@ -199,6 +199,9 @@ describe('Detail request entry points after card Quick Request removal', () => {
     ).as('entryTargets');
     cy.clock(Date.now(), ['setTimeout', 'clearTimeout']);
     cy.visit('/');
+    cy.wait('@entryUser')
+      .its('response.body.permissions')
+      .should('eq', scenario.permissions);
     stubUxNavigation(
       `/${type}/${base.id}`,
       { [type]: title },
@@ -215,6 +218,8 @@ describe('Detail request entry points after card Quick Request removal', () => {
       'contain',
       type === 'movie' ? 'UX Movie' : 'UX Series'
     );
+    // A network response alone does not prove SSR's admin fallback was replaced.
+    cy.get('[data-testid="sidebar-menu-settings"]').should('not.exist');
   };
 
   scenarios.forEach((scenario) => {
