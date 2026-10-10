@@ -160,6 +160,12 @@ const RequestItemError = ({
                     title={intl.formatMessage(messages.unknowntitle)}
                     inProgress={requestDownloadStatus.length > 0}
                     is4k={requestData.is4k}
+                    isIndependent={requestData.target?.isIndependent}
+                    tmdbId={
+                      requestData.target?.isIndependent
+                        ? requestData.media.tmdbId
+                        : undefined
+                    }
                     mediaType={requestData.type}
                     plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
                     serviceUrl={presentation.serviceUrl}
@@ -566,6 +572,7 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                   title={isMovie(title) ? title.title : title.name}
                   inProgress={requestDownloadStatus.length > 0}
                   is4k={requestData.is4k}
+                  isIndependent={requestData.target?.isIndependent}
                   tmdbId={requestData.media.tmdbId}
                   mediaType={requestData.type}
                   plexUrl={requestData.is4k ? plexUrl4k : plexUrl}

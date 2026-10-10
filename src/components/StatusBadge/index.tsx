@@ -28,6 +28,7 @@ interface StatusBadgeProps {
   inProgress?: boolean;
   plexUrl?: string;
   serviceUrl?: string;
+  isIndependent?: boolean;
   tmdbId?: number;
   mediaType?: 'movie' | 'tv';
   title?: string | string[];
@@ -41,6 +42,7 @@ const StatusBadge = ({
   inProgress = false,
   plexUrl,
   serviceUrl,
+  isIndependent = false,
   tmdbId,
   mediaType,
   title,
@@ -57,7 +59,13 @@ const StatusBadge = ({
     return Math.round(((media?.size - media?.sizeLeft) / media?.size) * 100);
   };
 
-  if (
+  if (isIndependent && hasPermission(Permission.ADMIN) && serviceUrl) {
+    mediaLink = serviceUrl;
+    mediaLinkDescription = intl.formatMessage(messages.openinarr, {
+      arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+    });
+  } else if (
+    !isIndependent &&
     mediaType &&
     plexUrl &&
     hasPermission(

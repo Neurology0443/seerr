@@ -43,6 +43,48 @@ const target = (name: string, status: MediaStatus): MediaRequestTarget => ({
 });
 
 describe('request presentation', () => {
+  it('stops polling deleted independent targets without downloads while retaining active progress', () => {
+    const configured = {
+      ...native,
+      status: MediaRequestStatus.APPROVED,
+      target: { ...target('EN', MediaStatus.PROCESSING), downloadStatus: [] },
+    };
+    for (const downloadStatus of [[], undefined]) {
+      const deleted = {
+        ...configured,
+        target: { ...configured.target, deleted: true, downloadStatus },
+      };
+      assert.equal(getRequestRefreshInterval(configured, 15000, deleted), 0);
+      assert.equal(getRequestRefreshInterval(deleted, 15000), 0);
+      assert.equal(
+        getRequestRefreshInterval(deleted, 15000, configured),
+        15000
+      );
+      for (const status of [
+        MediaRequestStatus.APPROVED,
+        MediaRequestStatus.COMPLETED,
+        MediaRequestStatus.DECLINED,
+        MediaRequestStatus.FAILED,
+      ]) {
+        assert.equal(
+          getRequestRefreshInterval({ ...deleted, status }, 15000),
+          0
+        );
+        assert.equal(
+          getRequestRefreshInterval(
+            {
+              ...deleted,
+              status,
+              target: { ...deleted.target, downloadStatus: [download('EN')] },
+            },
+            15000
+          ),
+          15000
+        );
+      }
+    }
+  });
+
   it('polls approved independent requests from an empty queue through download discovery', () => {
     const initial = {
       ...native,

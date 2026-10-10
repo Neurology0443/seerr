@@ -36,7 +36,8 @@ export const getRequestRefreshInterval = (
   latestRequest: MediaRequestResponse = request
 ) => {
   if (latestRequest.target?.isIndependent) {
-    return latestRequest.status === MediaRequestStatus.APPROVED ||
+    return (latestRequest.status === MediaRequestStatus.APPROVED &&
+      !latestRequest.target.deleted) ||
       (latestRequest.target.downloadStatus ?? []).length > 0
       ? timer
       : 0;

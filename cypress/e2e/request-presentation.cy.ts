@@ -27,6 +27,8 @@ const media = {
   status: 5,
   status4k: 5,
   serviceUrl: 'https://native.example',
+  mediaUrl: 'https://native-playback.example/item/100',
+  mediaUrl4k: 'https://native-playback.example/item/100-4k',
   downloadStatus: queue('native'),
   requests: [],
   seasons: [],
@@ -145,6 +147,133 @@ describe('independent request presentation', () => {
 
   for (const view of ['cards', 'list']) {
     for (const fallback of [false, true]) {
+      for (const [role, permissions] of [
+        ['administrator', 2],
+        ['request manager', 16 | 32 | 16384],
+        ['request viewer', 32 | 16384],
+      ] as const) {
+        it(`selects exact independent badge links for a ${role} in ${view}${fallback ? ' when title loading fails' : ''}`, () => {
+          cy.intercept('GET', '/api/v1/auth/me', { ...admin, permissions }).as(
+            'badgeUser'
+          );
+          const linkedRequests = [
+            makeRequest(1, 'FR', 5),
+            {
+              ...makeRequest(2, 'EN', 5),
+              is4k: true,
+              target: { ...makeRequest(2, 'EN', 5).target, is4k: true },
+            },
+            {
+              ...makeRequest(3, 'No linkage', 5),
+              target: {
+                ...makeRequest(3, 'No linkage', 5).target,
+                serviceUrl: '',
+              },
+            },
+            {
+              ...makeRequest(4, 'Deleted destination', 5),
+              target: {
+                ...makeRequest(4, 'Deleted destination', 5).target,
+                deleted: true,
+                serviceUrl: undefined,
+              },
+            },
+          ];
+          cy.intercept('GET', '/api/v1/request?*', {
+            pageInfo: { pages: 1, page: 1, results: 4, pageSize: 10 },
+            results: linkedRequests,
+            serviceErrors: { radarr: [], sonarr: [] },
+          });
+          for (const request of linkedRequests)
+            cy.intercept('GET', `/api/v1/request/${request.id}`, request);
+          if (fallback)
+            cy.intercept('GET', `/api/v1/movie/${movieId}`, {
+              statusCode: 500,
+              body: { message: 'Unavailable' },
+            });
+          cy.visit(view === 'cards' ? '/' : '/requests?filter=all');
+          cy.wait('@badgeUser');
+          for (const request of linkedRequests) {
+            if (view === 'cards' && request.id === 4)
+              cy.get('[data-testid="media-slider"]')
+                .find('button')
+                .eq(1)
+                .click();
+            const badge = cy
+              .contains(
+                '[data-testid="request-destination"]',
+                request.target.name
+              )
+              .parent()
+              .contains('a, span', request.is4k ? '4K Available' : 'Available');
+            if (role === 'administrator' && request.target.serviceUrl) {
+              badge
+                .should('have.attr', 'href', request.target.serviceUrl)
+                .and('have.attr', 'target', '_blank');
+            } else if (role !== 'request viewer') {
+              badge.should('have.attr', 'href', `/movie/${movieId}?manage=1`);
+            } else {
+              badge.should('be.visible').and('not.have.attr', 'href');
+            }
+          }
+          cy.get(
+            'a[href^="https://native-playback.example"], a[href="https://native.example"]'
+          ).should('not.exist');
+        });
+      }
+
+      it(`preserves native badge link precedence in ${view}${fallback ? ' when title loading fails' : ''}`, () => {
+        for (const [permissions, playback, expected] of [
+          [2, true, media.mediaUrl],
+          [16 | 32 | 16384, true, media.mediaUrl],
+          [
+            2,
+            false,
+            fallback ? media.serviceUrl : `/movie/${movieId}?manage=1`,
+          ],
+          [
+            16 | 32 | 16384,
+            false,
+            fallback ? undefined : `/movie/${movieId}?manage=1`,
+          ],
+          [32 | 16384, false, undefined],
+        ] as const) {
+          cy.intercept('GET', '/api/v1/auth/me', { ...admin, permissions }).as(
+            'nativeBadgeUser'
+          );
+          const nativeRequest = {
+            ...makeRequest(1, 'Native', 5),
+            target: null,
+            media: {
+              ...media,
+              downloadStatus: [],
+              mediaUrl: playback ? media.mediaUrl : undefined,
+            },
+          };
+          cy.intercept('GET', '/api/v1/request?*', {
+            pageInfo: { pages: 1, page: 1, results: 1, pageSize: 10 },
+            results: [nativeRequest],
+            serviceErrors: { radarr: [], sonarr: [] },
+          });
+          cy.intercept('GET', '/api/v1/request/1', nativeRequest);
+          cy.intercept(
+            'GET',
+            `/api/v1/movie/${movieId}`,
+            fallback
+              ? {
+                  statusCode: 500,
+                  body: { message: 'Unavailable' },
+                }
+              : movie
+          );
+          cy.visit(view === 'cards' ? '/' : '/requests?filter=all');
+          cy.wait('@nativeBadgeUser');
+          const badge = cy.contains('a, span', 'Available');
+          if (expected) badge.should('have.attr', 'href', expected);
+          else badge.should('be.visible').and('not.have.attr', 'href');
+        }
+      });
+
       it(`discovers a later download and stops terminal polling in ${view}${fallback ? ' when title loading fails' : ''}`, () => {
         let pageLoads = 0;
         cy.on('window:before:load', () => {
@@ -239,8 +368,8 @@ describe('independent request presentation', () => {
             'Deleted Radarr server (#3)'
           )
             .parent()
-            .contains('Deleted')
-            .should('not.have.attr', 'href');
+            .contains('a', 'Deleted')
+            .should('have.attr', 'href', `/movie/${movieId}?manage=1`);
         }
       });
     }
