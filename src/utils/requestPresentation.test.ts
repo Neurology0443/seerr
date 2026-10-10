@@ -1,4 +1,8 @@
-import { MediaStatus, MediaType } from '@server/constants/media';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import type {
@@ -39,6 +43,35 @@ const target = (name: string, status: MediaStatus): MediaRequestTarget => ({
 });
 
 describe('request presentation', () => {
+  it('polls approved independent requests from an empty queue through download discovery', () => {
+    const initial = {
+      ...native,
+      status: MediaRequestStatus.APPROVED,
+      target: { ...target('EN', MediaStatus.PROCESSING), downloadStatus: [] },
+    };
+    assert.equal(getRequestRefreshInterval(initial, 15000), 15000);
+    const downloading = {
+      ...initial,
+      target: target('EN', MediaStatus.PROCESSING),
+    };
+    assert.equal(getRequestRefreshInterval(initial, 15000, downloading), 15000);
+    assert.deepEqual(getRequestPresentation(downloading).downloadStatus, [
+      download('EN'),
+    ]);
+    for (const status of [
+      MediaRequestStatus.COMPLETED,
+      MediaRequestStatus.DECLINED,
+      MediaRequestStatus.FAILED,
+    ]) {
+      const terminal = { ...initial, status };
+      assert.equal(getRequestRefreshInterval(initial, 15000, terminal), 0);
+      assert.equal(
+        getRequestRefreshInterval(initial, 15000, { ...downloading, status }),
+        15000
+      );
+    }
+  });
+
   it('selects distinct destination identity, status, queue and link for the same media', () => {
     for (const [name, status] of [
       ['FR', MediaStatus.AVAILABLE],

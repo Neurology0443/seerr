@@ -6,6 +6,7 @@ import Media from '@server/entity/Media';
 import {
   findIndependentDestinationCandidates,
   markMissingMovieDestination,
+  notifyAvailableRequests,
   updateIndependentMovieDestination,
 } from '@server/lib/destinationAvailability';
 import type {
@@ -210,16 +211,19 @@ class RadarrScanner
 
     try {
       if (this.currentServer.independentRequestDestination === true) {
-        await this.asyncLock.dispatch(radarrMovie.tmdbId, () =>
-          updateIndependentMovieDestination({
-            tmdbId: radarrMovie.tmdbId,
-            serverId: this.currentServer.id,
-            externalServiceId: radarrMovie.id,
-            externalServiceSlug: radarrMovie.titleSlug,
-            hasFile: radarrMovie.hasFile,
-            monitored: radarrMovie.monitored,
-          })
-        );
+        await this.asyncLock.dispatch(radarrMovie.tmdbId, async () => {
+          const { completedRequests } = await updateIndependentMovieDestination(
+            {
+              tmdbId: radarrMovie.tmdbId,
+              serverId: this.currentServer.id,
+              externalServiceId: radarrMovie.id,
+              externalServiceSlug: radarrMovie.titleSlug,
+              hasFile: radarrMovie.hasFile,
+              monitored: radarrMovie.monitored,
+            }
+          );
+          await notifyAvailableRequests(completedRequests);
+        });
         return;
       }
 

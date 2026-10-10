@@ -18,6 +18,7 @@ import IssueComment from '@server/entity/IssueComment';
 import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import downloadTracker, {
   type DownloadingItem,
@@ -266,8 +267,25 @@ for (const { path, tmdbId, mediaType } of routes) {
           })
         );
         const queue = [
-          { downloadId: 'english', title: 'English download' },
+          {
+            downloadId: 'english',
+            title: 'English download',
+            ...(mediaType === MediaType.TV
+              ? { episode: { seasonNumber: 1 } }
+              : {}),
+          },
         ] as DownloadingItem[];
+        if (mediaType === MediaType.TV) {
+          await getRepository(SeasonRequest).save(
+            new SeasonRequest({
+              request: await getRepository(MediaRequest).findOneOrFail({
+                where: { media: { id: media.id } },
+              }),
+              seasonNumber: 1,
+              status: MediaRequestStatus.APPROVED,
+            })
+          );
+        }
         t.mock.method(
           downloadTracker,
           mediaType === MediaType.MOVIE
@@ -276,7 +294,15 @@ for (const { path, tmdbId, mediaType } of routes) {
           (serverId: number, externalId: number) => {
             assert.equal(serverId, 81);
             assert.equal(externalId, 181);
-            return queue;
+            return mediaType === MediaType.TV
+              ? [
+                  ...queue,
+                  {
+                    ...queue[0],
+                    episode: { seasonNumber: 2 },
+                  } as DownloadingItem,
+                ]
+              : queue;
           }
         );
         await setViewerPermissions(Permission.REQUEST);

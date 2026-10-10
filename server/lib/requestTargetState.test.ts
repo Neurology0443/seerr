@@ -409,6 +409,115 @@ const downloading = (
 });
 
 describe('independent request serialization', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`normalizes ${type} external URLs while preserving proxy paths`, async () => {
+      const server =
+        type === MediaType.MOVIE
+          ? radarr(1, { independentRequestDestination: true, baseUrl: '/arr' })
+          : sonarr(1, { independentRequestDestination: true, baseUrl: '/arr' });
+      if (type === MediaType.MOVIE)
+        getSettings().radarr = [server as RadarrSettings];
+      else getSettings().sonarr = [server as SonarrSettings];
+      const { media, request } = await seedRequest({ type });
+      await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 1,
+          status: MediaStatus.PROCESSING,
+          externalServiceSlug: 'exact-slug',
+        })
+      );
+      const path = type === MediaType.MOVIE ? 'movie' : 'series';
+      for (const [externalUrl, base] of [
+        ['https://example.com', 'https://example.com'],
+        ['https://example.com/', 'https://example.com'],
+        ['https://example.com/arr', 'https://example.com/arr'],
+        ['https://example.com/arr/', 'https://example.com/arr'],
+        ['', `http://localhost:${type === MediaType.MOVIE ? 7878 : 8989}/arr`],
+      ]) {
+        server.externalUrl = externalUrl;
+        assert.equal(
+          (
+            await getRequestTargetState(
+              request,
+              getRepository(MediaRequest).manager
+            )
+          )?.serviceUrl,
+          `${base}/${path}/exact-slug`
+        );
+      }
+    });
+  }
+
+  it('loads persisted TV seasons and exposes no progress when none can be established', async (t) => {
+    getSettings().sonarr = [sonarr(2, { independentRequestDestination: true })];
+    const { media, request } = await seedRequest({
+      type: MediaType.TV,
+      serverId: 2,
+    });
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 2,
+        status: MediaStatus.PROCESSING,
+        externalServiceId: 100,
+      })
+    );
+    const queue = [1, 2].map((season) =>
+      downloading(`en-s${season}`, MediaType.TV, season)
+    );
+    const progress = t.mock.method(
+      downloadTracker,
+      'getSeriesProgress',
+      (serverId: number, externalId: number) => {
+        assert.equal(serverId, 2);
+        assert.equal(externalId, 100);
+        return queue;
+      }
+    );
+    const manager = getRepository(MediaRequest).manager;
+    for (const seasons of [undefined, []]) {
+      assert.deepEqual(
+        (await getRequestTargetState({ ...request, seasons }, manager))
+          ?.downloadStatus,
+        []
+      );
+    }
+    await getRepository(SeasonRequest).save(
+      new SeasonRequest({
+        request,
+        seasonNumber: 1,
+        status: MediaRequestStatus.COMPLETED,
+      })
+    );
+    for (const seasons of [undefined, []]) {
+      assert.deepEqual(
+        (await getRequestTargetState({ ...request, seasons }, manager))
+          ?.downloadStatus,
+        [queue[0]]
+      );
+    }
+    assert.deepEqual(
+      (
+        await getRequestTargetState(
+          { ...request, id: undefined, seasons: undefined },
+          manager
+        )
+      )?.downloadStatus,
+      []
+    );
+    assert.equal(progress.mock.callCount(), 5);
+    assert.equal(
+      (
+        await getRepository(MediaDestinationStatus).findOneByOrFail({
+          mediaId: media.id,
+          serverId: 2,
+        })
+      ).status,
+      MediaStatus.PROCESSING
+    );
+  });
+
   it('isolates movie status, queue and links on the same media and reflects renames', async (t) => {
     getSettings().radarr = [
       radarr(1, {
@@ -456,7 +565,7 @@ describe('independent request serialization', () => {
     assert.equal(en.status, MediaStatus.PROCESSING);
     assert.deepEqual(fr.downloadStatus, [downloading('fr')]);
     assert.deepEqual(en.downloadStatus, [downloading('en')]);
-    assert.equal(fr.serviceUrl, 'https://fr.example/arr//movie/fr-slug');
+    assert.equal(fr.serviceUrl, 'https://fr.example/arr/movie/fr-slug');
     assert.equal(en.serviceUrl, 'http://en.example:7878/radarr/movie/en-slug');
     assert.deepEqual(
       progress.mock.calls.map((call) => call.arguments),
@@ -487,7 +596,11 @@ describe('independent request serialization', () => {
 
   it('filters TV progress by requested seasons on the exact Sonarr server', async (t) => {
     getSettings().sonarr = [
-      sonarr(1, { name: 'FR', independentRequestDestination: true }),
+      sonarr(1, {
+        name: 'FR',
+        independentRequestDestination: true,
+        externalUrl: 'https://fr.example/sonarr/',
+      }),
       sonarr(2, {
         name: 'EN',
         independentRequestDestination: true,
@@ -510,6 +623,15 @@ describe('independent request serialization', () => {
         externalServiceSlug: 'show',
       })
     );
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 1,
+        status: MediaStatus.AVAILABLE,
+        externalServiceId: 100,
+        externalServiceSlug: 'french-show',
+      })
+    );
     const queue = [1, 2, 3].map((season) =>
       downloading(`en-s${season}`, MediaType.TV, season)
     );
@@ -528,6 +650,18 @@ describe('independent request serialization', () => {
     assert.deepEqual(target?.downloadStatus, [queue[0], queue[2]]);
     assert.deepEqual(progress.mock.calls[0].arguments, [2, 100]);
     assert.equal(target?.serviceUrl, 'https://en.example/series/show');
+    const french = await getRequestTargetState(
+      { ...request, serverId: 1 },
+      manager
+    );
+    assert.equal(
+      french?.serviceUrl,
+      'https://fr.example/sonarr/series/french-show'
+    );
+    assert.deepEqual(french?.downloadStatus, [
+      downloading('fr', MediaType.TV, 1),
+    ]);
+    assert.equal(french?.status, MediaStatus.AVAILABLE);
     getSettings().sonarr[1].externalUrl = '';
     assert.equal(
       (await getRequestTargetState(request, manager))?.serviceUrl,

@@ -31,7 +31,7 @@ import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
 import axios from 'axios';
 import Link from 'next/link';
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useInView } from 'react-intersection-observer';
 import { FormattedRelativeTime, useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
@@ -312,11 +312,16 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
   const { data: title, error } = useSWR<MovieDetails | TvDetails>(
     inView ? url : null
   );
+  // Title retries must not restart the request polling interval.
+  const requestRefreshInterval = useCallback(
+    (data?: MediaRequestResponse) =>
+      getRequestRefreshInterval(request, 15000, data),
+    [request]
+  );
   const { data: requestData, mutate: revalidate } =
     useSWR<MediaRequestResponse>(`/api/v1/request/${request.id}`, {
       fallbackData: request,
-      refreshInterval: (data) =>
-        getRequestRefreshInterval(request, 15000, data),
+      refreshInterval: requestRefreshInterval,
     });
 
   const [isRetrying, setRetrying] = useState(false);

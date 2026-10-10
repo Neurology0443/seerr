@@ -29,7 +29,7 @@ import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
 import axios from 'axios';
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useInView } from 'react-intersection-observer';
 import { useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
@@ -236,13 +236,19 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
   const { data: title, error } = useSWR<MovieDetails | TvDetails>(
     inView ? `${url}` : null
   );
+  // Title retries must not restart the request polling interval.
+  const requestRefreshInterval = useCallback(
+    (data?: MediaRequestResponse) =>
+      getRequestRefreshInterval(request, 15000, data),
+    [request]
+  );
   const {
     data: requestData,
     error: requestError,
     mutate: revalidate,
   } = useSWR<MediaRequestResponse>(`/api/v1/request/${request.id}`, {
     fallbackData: request,
-    refreshInterval: (data) => getRequestRefreshInterval(request, 15000, data),
+    refreshInterval: requestRefreshInterval,
   });
 
   const { mediaUrl: plexUrl, mediaUrl4k: plexUrl4k } = useDeepLinks({

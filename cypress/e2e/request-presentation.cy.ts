@@ -2,7 +2,7 @@ const movieId = 438148;
 const admin = {
   id: 1,
   displayName: 'Admin',
-  avatar: '/avatar.png',
+  avatar: '/user-icon-192x192.png',
   permissions: 2,
   warnings: [],
   userType: 1,
@@ -123,11 +123,84 @@ describe('independent request presentation', () => {
     cy.intercept('GET', '/api/v1/media/100/watch_data', {
       data: { users: [] },
     });
-    cy.loginAsAdmin();
+    // Authenticate directly so the login page's asynchronous redirect cannot
+    // navigate away from the page whose polling is being measured.
+    cy.session(
+      'request-presentation-admin',
+      () => {
+        cy.request('POST', '/api/v1/auth/local', {
+          email: Cypress.env('ADMIN_EMAIL'),
+          password: Cypress.env('ADMIN_PASSWORD'),
+        })
+          .its('status')
+          .should('eq', 200);
+      },
+      {
+        validate() {
+          cy.request('/api/v1/auth/me').its('status').should('eq', 200);
+        },
+      }
+    );
   });
 
   for (const view of ['cards', 'list']) {
     for (const fallback of [false, true]) {
+      it(`discovers a later download and stops terminal polling in ${view}${fallback ? ' when title loading fails' : ''}`, () => {
+        let pageLoads = 0;
+        cy.on('window:before:load', () => {
+          pageLoads += 1;
+        });
+        let current: ReturnType<typeof makeRequest> = {
+          ...makeRequest(2, 'EN', 3),
+          target: { ...makeRequest(2, 'EN', 3).target, downloadStatus: [] },
+        };
+        cy.intercept('GET', '/api/v1/request?*', {
+          pageInfo: { pages: 1, page: 1, results: 1, pageSize: 10 },
+          results: [current],
+          serviceErrors: { radarr: [], sonarr: [] },
+        });
+        cy.intercept('GET', '/api/v1/request/2', (req) =>
+          req.reply(current)
+        ).as('progress');
+        if (fallback)
+          cy.intercept('GET', `/api/v1/movie/${movieId}`, {
+            statusCode: 500,
+            body: { message: 'Unavailable' },
+          });
+        cy.visit(view === 'cards' ? '/' : '/requests?filter=all');
+        cy.wait('@progress');
+        cy.contains('[data-testid="request-destination"]', 'EN')
+          .parent()
+          .should('contain', 'Requested');
+        cy.contains('EN download').should('not.exist');
+        cy.then(() => {
+          current = makeRequest(2, 'EN', 3);
+        });
+        cy.wait('@progress', { requestTimeout: 20000 });
+        cy.contains('[data-testid="request-destination"]', 'EN')
+          .parent()
+          .contains('a', 'Processing')
+          .trigger('mouseenter');
+        cy.contains('EN download').should('be.visible');
+        cy.contains('native download').should('not.exist');
+        cy.then(() => {
+          current = { ...makeRequest(2, 'EN', 5), status: 5 };
+        });
+        cy.wait('@progress', { requestTimeout: 20000 });
+        cy.contains('[data-testid="request-destination"]', 'EN')
+          .parent()
+          .should('contain', 'Available');
+        cy.get('@progress.all').then((calls) => {
+          // Observe two full polling intervals after the terminal response.
+          cy.wait(30000);
+          const expectedCalls = calls.length;
+          cy.get('@progress.all').should((laterCalls) => {
+            expect(pageLoads, 'no page reload during polling').to.equal(1);
+            expect(laterCalls.length).to.equal(expectedCalls);
+          });
+        });
+      });
+
       it(`shows exact destinations, status and progress in ${view}${fallback ? ' when title loading fails' : ''}`, () => {
         if (fallback)
           cy.intercept('GET', `/api/v1/movie/${movieId}`, {

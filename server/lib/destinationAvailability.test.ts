@@ -15,8 +15,11 @@ import {
   declineRequestsForDestination,
   markMissingMovieDestination,
   markMissingTvDestination,
+  notifyAvailableRequests,
   rollupDestinationTvStatus,
   transitionDestinationSeasonStatus,
+  updateIndependentMovieDestination,
+  updateIndependentTvDestination,
 } from '@server/lib/destinationAvailability';
 import { Notification } from '@server/lib/notifications';
 import { setupTestDb } from '@server/test/db';
@@ -30,6 +33,12 @@ const sendNotificationMock = mock.method(
   'sendNotification',
   async () => undefined
 );
+
+const completeAndNotify = async (mediaId: number, serverId: number) => {
+  await notifyAvailableRequests(
+    await completeRequestsForDestination(mediaId, serverId)
+  );
+};
 
 const setRequestStatusWithoutListeners = async (
   request: MediaRequest,
@@ -198,8 +207,8 @@ describe('destination availability', () => {
     });
 
     const initialNotifications = sendNotificationMock.mock.callCount();
-    await completeRequestsForDestination(media.id, 10);
-    await completeRequestsForDestination(media.id, 10);
+    await completeAndNotify(media.id, 10);
+    await completeAndNotify(media.id, 10);
     assert.equal(
       sendNotificationMock.mock.callCount(),
       initialNotifications + 1
@@ -239,7 +248,7 @@ describe('destination availability', () => {
     );
     const request = await createRequest({ media, serverId: 12 });
 
-    await completeRequestsForDestination(media.id, 12);
+    await completeAndNotify(media.id, 12);
 
     assert.strictEqual(
       (
@@ -279,7 +288,7 @@ describe('destination availability', () => {
       });
 
       const initialNotifications = sendNotificationMock.mock.callCount();
-      await completeRequestsForDestination(media.id, 13);
+      await completeAndNotify(media.id, 13);
       assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
 
       assert.strictEqual(
@@ -377,7 +386,7 @@ describe('destination availability', () => {
     });
 
     const initialNotifications = sendNotificationMock.mock.callCount();
-    await completeRequestsForDestination(media.id, 23);
+    await completeAndNotify(media.id, 23);
     assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
 
     const updated = await getRepository(MediaRequest).findOneOrFail({
@@ -494,7 +503,7 @@ describe('destination availability', () => {
     });
 
     const initialNotifications = sendNotificationMock.mock.callCount();
-    await completeRequestsForDestination(media.id, 20);
+    await completeAndNotify(media.id, 20);
     assert.equal(
       sendNotificationMock.mock.callCount(),
       initialNotifications + 1
@@ -533,8 +542,8 @@ describe('destination availability', () => {
     });
     season2.status = MediaStatus.AVAILABLE;
     await getRepository(MediaDestinationSeasonStatus).save(season2);
-    await completeRequestsForDestination(media.id, 20);
-    await completeRequestsForDestination(media.id, 20);
+    await completeAndNotify(media.id, 20);
+    await completeAndNotify(media.id, 20);
     assert.equal(
       sendNotificationMock.mock.callCount(),
       initialNotifications + 2
@@ -869,6 +878,135 @@ describe('destination availability', () => {
 });
 
 describe('independent completion notifications', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    for (const rollback of [false, true]) {
+      it(`dispatches ${type} completion only after commit (rollback: ${rollback})`, async () => {
+        const media = await getRepository(Media).save(
+          new Media({ tmdbId: 401, mediaType: type })
+        );
+        const request = await createRequest({
+          media,
+          serverId: 41,
+          seasons: type === MediaType.TV ? [1, 2] : [],
+        });
+        const otherRequest = await createRequest({
+          media,
+          serverId: 42,
+          seasons: type === MediaType.TV ? [1, 2] : [],
+        });
+        const initialNotifications = sendNotificationMock.mock.callCount();
+        const manager = getRepository(MediaRequest).manager;
+        let completionManager: EntityManager | undefined;
+        let completedInside: MediaRequest[] = [];
+        const transaction = manager.transaction(async (transactionManager) => {
+          completionManager = transactionManager;
+          const result =
+            type === MediaType.MOVIE
+              ? await updateIndependentMovieDestination(
+                  {
+                    tmdbId: media.tmdbId,
+                    serverId: 41,
+                    externalServiceId: 141,
+                    externalServiceSlug: 'exact',
+                    hasFile: true,
+                    monitored: true,
+                  },
+                  transactionManager
+                )
+              : await updateIndependentTvDestination(
+                  {
+                    tmdbId: media.tmdbId,
+                    tvdbId: 141,
+                    serverId: 41,
+                    externalServiceId: 141,
+                    externalServiceSlug: 'exact',
+                    seasons: [1, 2].map((seasonNumber) => ({
+                      seasonNumber,
+                      totalEpisodes: 2,
+                      availableEpisodes: 2,
+                      monitored: true,
+                    })),
+                  },
+                  transactionManager
+                );
+          completedInside = result.completedRequests;
+          assert.equal(
+            transactionManager.queryRunner?.isTransactionActive,
+            true
+          );
+          assert.deepEqual(
+            completedInside.map((completed) => completed.id),
+            [request.id]
+          );
+          assert.equal(
+            sendNotificationMock.mock.callCount(),
+            initialNotifications
+          );
+          assert.equal(
+            (
+              await transactionManager.findOneByOrFail(MediaRequest, {
+                id: request.id,
+              })
+            ).status,
+            MediaRequestStatus.COMPLETED
+          );
+          if (rollback) throw new Error('Rollback after completion');
+          return result.completedRequests;
+        });
+        if (rollback) {
+          await assert.rejects(transaction, /Rollback after completion/);
+          assert.equal(completedInside.length, 1);
+          assert.equal(
+            (await manager.findOneByOrFail(MediaRequest, { id: request.id }))
+              .status,
+            MediaRequestStatus.APPROVED
+          );
+          assert.equal(
+            sendNotificationMock.mock.callCount(),
+            initialNotifications
+          );
+          if (type === MediaType.TV) {
+            assert.ok(
+              (
+                await manager.find(SeasonRequest, {
+                  where: { request: { id: request.id } },
+                })
+              ).every((season) => season.status === MediaRequestStatus.APPROVED)
+            );
+          }
+        } else {
+          const completed = await transaction;
+          let transactionActiveAtDelivery: boolean | undefined;
+          let statusAtDelivery: MediaRequestStatus | undefined;
+          sendNotificationMock.mock.mockImplementation(async () => {
+            transactionActiveAtDelivery =
+              completionManager?.queryRunner?.isTransactionActive;
+            statusAtDelivery = (
+              await manager.findOneByOrFail(MediaRequest, { id: request.id })
+            ).status;
+          });
+          try {
+            await notifyAvailableRequests(completed);
+            assert.equal(transactionActiveAtDelivery, false);
+            assert.equal(statusAtDelivery, MediaRequestStatus.COMPLETED);
+            await completeAndNotify(media.id, 41);
+            assert.equal(
+              sendNotificationMock.mock.callCount(),
+              initialNotifications + 1
+            );
+          } finally {
+            sendNotificationMock.mock.mockImplementation(async () => undefined);
+          }
+        }
+        assert.equal(
+          (await manager.findOneByOrFail(MediaRequest, { id: otherRequest.id }))
+            .status,
+          MediaRequestStatus.APPROVED
+        );
+      });
+    }
+  }
+
   for (const failDelivery of [false, true]) {
     it(`notifies only the winner of concurrent movie completion (delivery fails: ${failDelivery})`, async () => {
       const media = await getRepository(Media).save(
@@ -889,10 +1027,10 @@ describe('independent completion notifications', () => {
         });
       try {
         await Promise.all([
-          completeRequestsForDestination(media.id, 40),
-          completeRequestsForDestination(media.id, 40),
+          completeAndNotify(media.id, 40),
+          completeAndNotify(media.id, 40),
         ]);
-        await completeRequestsForDestination(media.id, 40);
+        await completeAndNotify(media.id, 40);
         assert.equal(
           sendNotificationMock.mock.callCount(),
           initialNotifications + 1

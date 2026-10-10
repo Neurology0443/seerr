@@ -4,6 +4,7 @@ import { MediaStatus, MediaType } from '@server/constants/media';
 import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import type { MediaRequest } from '@server/entity/MediaRequest';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import type {
   MediaRequestTarget,
   RequestDetailResponse,
@@ -19,6 +20,7 @@ import {
 } from '@server/lib/requestSlot';
 import {
   getConfiguredRequestServer,
+  getRequestTargetName,
   isIndependentRequest,
 } from '@server/lib/requestTarget';
 import { getSettings, type DVRSettings } from '@server/lib/settings';
@@ -119,7 +121,7 @@ export const getConfiguredRequestTargetState = ({
 
 export const getRequestTargetState = async (
   request: Pick<MediaRequest, 'type' | 'serverId' | 'is4k' | 'media'> &
-    Partial<Pick<MediaRequest, 'seasons'>>,
+    Partial<Pick<MediaRequest, 'id' | 'seasons'>>,
   manager: EntityManager
 ): Promise<MediaRequestTarget | null> => {
   if (request.serverId == null) {
@@ -146,6 +148,16 @@ export const getRequestTargetState = async (
   let downloadStatus: DownloadingItem[] = [];
   if (independent && server && destination) {
     if (destination.externalServiceId != null) {
+      let seasons = request.seasons;
+      if (
+        request.type === MediaType.TV &&
+        !seasons?.length &&
+        request.id != null
+      ) {
+        seasons = await manager.getRepository(SeasonRequest).find({
+          where: { request: { id: request.id } },
+        });
+      }
       downloadStatus =
         request.type === MediaType.MOVIE
           ? downloadTracker.getMovieProgress(
@@ -157,13 +169,14 @@ export const getRequestTargetState = async (
                 request.serverId,
                 destination.externalServiceId
               ),
-              (request.seasons ?? []).map((season) => season.seasonNumber)
+              (seasons ?? []).map((season) => season.seasonNumber),
+              MediaType.TV
             );
     }
     if (destination.externalServiceSlug) {
       const path = `/${request.type === MediaType.MOVIE ? 'movie' : 'series'}/${destination.externalServiceSlug}`;
       serviceUrl = server.externalUrl
-        ? `${server.externalUrl}${path}`
+        ? `${server.externalUrl.replace(/\/+$/, '')}${path}`
         : (request.type === MediaType.MOVIE ? RadarrAPI : SonarrAPI).buildUrl(
             server,
             path
@@ -173,9 +186,7 @@ export const getRequestTargetState = async (
 
   return {
     serverId: request.serverId,
-    name:
-      server?.name ??
-      `Deleted ${request.type === MediaType.MOVIE ? 'Radarr' : 'Sonarr'} server (#${request.serverId})`,
+    name: getRequestTargetName(request),
     is4k: request.is4k,
     isIndependent: independent,
     deleted: !server,
@@ -193,7 +204,7 @@ export const getRequestTargetState = async (
 
 export const serializeMediaRequest = async <
   T extends Pick<MediaRequest, 'type' | 'serverId' | 'is4k' | 'media'> &
-    Partial<Pick<MediaRequest, 'seasons'>>,
+    Partial<Pick<MediaRequest, 'id' | 'seasons'>>,
 >(
   request: T,
   manager: EntityManager

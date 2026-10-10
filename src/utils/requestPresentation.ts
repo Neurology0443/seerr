@@ -1,4 +1,4 @@
-import { MediaStatus } from '@server/constants/media';
+import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
 import type { MediaRequestResponse } from '@server/interfaces/api/requestInterfaces';
 import {
   getRequestDownloadStatus,
@@ -34,16 +34,19 @@ export const getRequestRefreshInterval = (
   request: MediaRequestResponse,
   timer: number,
   latestRequest: MediaRequestResponse = request
-) =>
-  refreshIntervalHelper(
-    latestRequest.target?.isIndependent
-      ? {
-          downloadStatus: latestRequest.target.downloadStatus,
-          downloadStatus4k: undefined,
-        }
-      : {
-          downloadStatus: request.media.downloadStatus,
-          downloadStatus4k: request.media.downloadStatus4k,
-        },
+) => {
+  if (latestRequest.target?.isIndependent) {
+    return latestRequest.status === MediaRequestStatus.APPROVED ||
+      (latestRequest.target.downloadStatus ?? []).length > 0
+      ? timer
+      : 0;
+  }
+
+  return refreshIntervalHelper(
+    {
+      downloadStatus: request.media.downloadStatus,
+      downloadStatus4k: request.media.downloadStatus4k,
+    },
     timer
   );
+};

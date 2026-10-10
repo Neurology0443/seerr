@@ -15,6 +15,7 @@ import { MediaRequest } from '@server/entity/MediaRequest';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import { initI18n } from '@server/i18n';
+import downloadTracker from '@server/lib/downloadtracker';
 import notificationManager, { Notification } from '@server/lib/notifications';
 import type { NotificationPayload } from '@server/lib/notifications/agents/agent';
 import WebPushAgent from '@server/lib/notifications/agents/webpush';
@@ -118,11 +119,19 @@ describe('request notification destination identity', () => {
         );
       }
       server.independentRequestDestination = true;
+      const progress = t.mock.method(
+        downloadTracker,
+        type === MediaType.MOVIE ? 'getMovieProgress' : 'getSeriesProgress',
+        () => {
+          throw new Error('Presentation queue unavailable');
+        }
+      );
       await getRepository(MediaDestinationStatus).save(
         new MediaDestinationStatus({
           mediaId: media.id,
           serverId: 91,
           status: MediaStatus.AVAILABLE,
+          externalServiceId: 191,
         })
       );
       for (const name of [
@@ -144,6 +153,7 @@ describe('request notification destination identity', () => {
         }
       }
       assert.equal(capture.mock.callCount(), categories.length * 4);
+      assert.equal(progress.mock.callCount(), 0);
     });
   }
 });

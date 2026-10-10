@@ -14,13 +14,13 @@ import {
   isRequestableDestinationStatus,
 } from '@server/lib/requestSlot';
 import {
+  getRequestTargetName,
   isIndependentRequest,
   isNativeRequest,
   resolveRequestTarget,
   validateRequestCreationTarget,
   type RequestCreationTarget,
 } from '@server/lib/requestTarget';
-import { getRequestTargetState } from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
@@ -864,17 +864,12 @@ export class MediaRequest {
           break;
       }
 
-      const target = (await isIndependentRequest(
+      const independent = await isIndependentRequest(
         entity,
         getRepository(MediaRequest).manager
-      ))
-        ? await getRequestTargetState(
-            entity,
-            getRepository(MediaRequest).manager
-          )
-        : null;
-      const destinationExtra = target?.isIndependent
-        ? [{ name: 'Destination Server', value: target.name }]
+      );
+      const destinationExtra = independent
+        ? [{ name: 'Destination Server', value: getRequestTargetName(entity) }]
         : [];
 
       if (entity.type === MediaType.MOVIE) {
