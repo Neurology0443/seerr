@@ -16,9 +16,15 @@ import { getRepository } from '@server/datasource';
 import Issue from '@server/entity/Issue';
 import IssueComment from '@server/entity/IssueComment';
 import Media from '@server/entity/Media';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import downloadTracker, {
+  type DownloadingItem,
+} from '@server/lib/downloadtracker';
 import { Permission } from '@server/lib/permissions';
+import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { checkUser, isAuthenticated } from '@server/middleware/auth';
 import { setupTestDb } from '@server/test/db';
@@ -227,6 +233,99 @@ for (const { path, tmdbId, mediaType } of routes) {
       assert.strictEqual(requestedBy.id, 1);
       assert.strictEqual(typeof requestedBy.displayName, 'string');
       assert.ok('avatar' in requestedBy);
+    });
+
+    it('enriches only the existing filtered embedded requests with exact target presentation', async (t) => {
+      const { media } = await seedMedia(mediaType, tmdbId);
+      const key = mediaType === MediaType.MOVIE ? 'radarr' : 'sonarr';
+      const priorServers = getSettings()[key];
+      getSettings()[key] = [
+        {
+          id: 81,
+          name: 'English',
+          isDefault: true,
+          is4k: false,
+          independentRequestDestination: true,
+          externalUrl: 'https://en.example',
+        },
+      ] as RadarrSettings[] & SonarrSettings[];
+      try {
+        await getRepository(MediaRequest)
+          .createQueryBuilder()
+          .update(MediaRequest)
+          .set({ serverId: 81 })
+          .where('mediaId = :mediaId', { mediaId: media.id })
+          .callListeners(false)
+          .execute();
+        await getRepository(MediaDestinationStatus).save(
+          new MediaDestinationStatus({
+            mediaId: media.id,
+            serverId: 81,
+            status: MediaStatus.PROCESSING,
+            externalServiceId: 181,
+            externalServiceSlug: 'english',
+          })
+        );
+        const queue = [
+          {
+            downloadId: 'english',
+            title: 'English download',
+            ...(mediaType === MediaType.TV
+              ? { episode: { seasonNumber: 1 } }
+              : {}),
+          },
+        ] as DownloadingItem[];
+        if (mediaType === MediaType.TV) {
+          await getRepository(SeasonRequest).save(
+            new SeasonRequest({
+              request: await getRepository(MediaRequest).findOneOrFail({
+                where: { media: { id: media.id } },
+              }),
+              seasonNumber: 1,
+              status: MediaRequestStatus.APPROVED,
+            })
+          );
+        }
+        t.mock.method(
+          downloadTracker,
+          mediaType === MediaType.MOVIE
+            ? 'getMovieProgress'
+            : 'getSeriesProgress',
+          (serverId: number, externalId: number) => {
+            assert.equal(serverId, 81);
+            assert.equal(externalId, 181);
+            return mediaType === MediaType.TV
+              ? [
+                  ...queue,
+                  {
+                    ...queue[0],
+                    episode: { seasonNumber: 2 },
+                  } as DownloadingItem,
+                ]
+              : queue;
+          }
+        );
+        await setViewerPermissions(Permission.REQUEST);
+        const agent = await loginAs('demo@seerr.dev', 'test1234');
+        const res = await agent.get(`${path}/${tmdbId}`);
+        assert.equal(res.status, 200);
+        assert.equal(res.body.mediaInfo.requests.length, 1);
+        assert.deepEqual(res.body.mediaInfo.requests[0].target, {
+          serverId: 81,
+          name: 'English',
+          is4k: false,
+          isIndependent: true,
+          deleted: false,
+          status: MediaStatus.PROCESSING,
+          downloadStatus: queue,
+          serviceUrl: `https://en.example/${mediaType === MediaType.MOVIE ? 'movie' : 'series'}/english`,
+        });
+        assert.equal(res.body.mediaInfo.status, MediaStatus.AVAILABLE);
+        assert.ok(!JSON.stringify(res.body).includes(OWNER_EMAIL));
+      } finally {
+        getSettings()[key] = priorServers as RadarrSettings[] &
+          SonarrSettings[];
+      }
     });
 
     it('hides issues from a viewer without an issue permission', async () => {

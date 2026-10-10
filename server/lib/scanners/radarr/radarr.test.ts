@@ -38,7 +38,11 @@ Object.defineProperty(RadarrAPI.prototype, 'getLibraryMoviesByTmdbId', {
   configurable: true,
 });
 
-mock.method(MediaRequest, 'sendNotification', async () => undefined);
+const sendNotificationMock = mock.method(
+  MediaRequest,
+  'sendNotification',
+  async () => undefined
+);
 
 setupTestDb();
 
@@ -843,7 +847,21 @@ describe('Radarr Scanner', () => {
         fakeRadarrMovie({ id: 77, titleSlug: 'exact-link' }),
       ];
 
+      const initialNotifications = sendNotificationMock.mock.callCount();
       await runWithMockTimers(() => radarrScanner.run());
+      assert.equal(
+        sendNotificationMock.mock.callCount(),
+        initialNotifications + 1
+      );
+      assert.equal(
+        sendNotificationMock.mock.calls.at(-1)?.arguments[0]?.id,
+        exactRequest.id
+      );
+      await runWithMockTimers(() => radarrScanner.run());
+      assert.equal(
+        sendNotificationMock.mock.callCount(),
+        initialNotifications + 1
+      );
 
       const updatedMedia = await mediaRepository.findOneOrFail({
         where: { id: media.id },

@@ -14,6 +14,7 @@ import Media from '@server/entity/Media';
 import {
   findIndependentDestinationCandidates,
   markMissingTvDestination,
+  notifyAvailableRequests,
   updateIndependentTvDestination,
 } from '@server/lib/destinationAvailability';
 import type {
@@ -287,8 +288,8 @@ class SonarrScanner
       }
 
       if (this.currentServer.independentRequestDestination === true) {
-        await this.asyncLock.dispatch(tmdbId, () =>
-          updateIndependentTvDestination({
+        await this.asyncLock.dispatch(tmdbId, async () => {
+          const { completedRequests } = await updateIndependentTvDestination({
             tmdbId,
             tvdbId: sonarrSeries.tvdbId,
             serverId: this.currentServer.id,
@@ -301,8 +302,9 @@ class SonarrScanner
               monitored: season.monitored,
               observedInService: observedSonarrSeasons.has(season.seasonNumber),
             })),
-          })
-        );
+          });
+          await notifyAvailableRequests(completedRequests);
+        });
         return;
       }
 

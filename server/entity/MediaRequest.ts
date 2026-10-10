@@ -14,6 +14,7 @@ import {
   isRequestableDestinationStatus,
 } from '@server/lib/requestSlot';
 import {
+  getRequestTargetName,
   isIndependentRequest,
   isNativeRequest,
   resolveRequestTarget,
@@ -863,6 +864,14 @@ export class MediaRequest {
           break;
       }
 
+      const independent = await isIndependentRequest(
+        entity,
+        getRepository(MediaRequest).manager
+      );
+      const destinationExtra = independent
+        ? [{ name: 'Destination Server', value: getRequestTargetName(entity) }]
+        : [];
+
       if (entity.type === MediaType.MOVIE) {
         const movie = await tmdb.getMovie({ movieId: media.tmdbId });
         notificationManager.sendNotification(type, {
@@ -881,6 +890,7 @@ export class MediaRequest {
             omission: '…',
           }),
           image: `https://image.tmdb.org/t/p/w600_and_h900_bestv2${movie.poster_path}`,
+          ...(destinationExtra.length ? { extra: destinationExtra } : {}),
         });
       } else if (entity.type === MediaType.TV) {
         const tv = await tmdb.getTvShow({ tvId: media.tmdbId });
@@ -907,6 +917,7 @@ export class MediaRequest {
                 .map((season) => season.seasonNumber)
                 .join(', '),
             },
+            ...destinationExtra,
           ],
         });
       }

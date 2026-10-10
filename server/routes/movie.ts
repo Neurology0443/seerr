@@ -11,6 +11,7 @@ import type { MovieRequestTarget } from '@server/interfaces/api/requestInterface
 import {
   classifyActiveRequestTargets,
   getConfiguredRequestTargetState,
+  serializeMediaRequest,
 } from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -104,6 +105,14 @@ movieRoutes.get('/:id', async (req, res, next) => {
       media?.filter(req.user),
       onUserWatchlist
     );
+
+    if (data.mediaInfo) {
+      data.mediaInfo.requests = await Promise.all(
+        data.mediaInfo.requests.map((request) =>
+          serializeMediaRequest(request, getRepository(Media).manager)
+        )
+      );
+    }
 
     // TMDB issue where it doesnt fallback to English when no overview is available in requested locale.
     if (!data.overview) {

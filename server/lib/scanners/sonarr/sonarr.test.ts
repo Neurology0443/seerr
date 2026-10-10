@@ -18,6 +18,7 @@ import MediaRequest from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import { Notification } from '@server/lib/notifications';
 import { sonarrScanner } from '@server/lib/scanners/sonarr';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
@@ -141,7 +142,16 @@ for (const method of ['getTvShow', 'getTvShowForScan'] as const) {
   });
 }
 
-mock.method(MediaRequest, 'sendNotification', async () => undefined);
+const sendNotificationMock = mock.method(
+  MediaRequest,
+  'sendNotification',
+  async () => undefined
+);
+
+const availableNotifications = () =>
+  sendNotificationMock.mock.calls.filter(
+    (call) => call.arguments[2] === Notification.MEDIA_AVAILABLE
+  );
 
 setupTestDb();
 
@@ -1216,6 +1226,7 @@ describe('Sonarr Scanner', () => {
     });
 
     it('completes requested TV seasons incrementally only on the exact destination', async () => {
+      const initialNotifications = availableNotifications().length;
       const media = await getRepository(Media).save(
         new Media({
           tmdbId: 3100,
@@ -1322,6 +1333,7 @@ describe('Sonarr Scanner', () => {
         relations: { seasons: true },
       });
       assert.strictEqual(updated.status, MediaRequestStatus.APPROVED);
+      assert.equal(availableNotifications().length, initialNotifications);
       assert.strictEqual(
         updated.seasons.find((season) => season.seasonNumber === 1)?.status,
         MediaRequestStatus.COMPLETED
@@ -1362,6 +1374,13 @@ describe('Sonarr Scanner', () => {
         relations: { seasons: true },
       });
       assert.strictEqual(updated.status, MediaRequestStatus.COMPLETED);
+      assert.equal(availableNotifications().length, initialNotifications + 1);
+      assert.equal(
+        availableNotifications().at(-1)?.arguments[0]?.id,
+        request.id
+      );
+      await runWithMockTimers(() => sonarrScanner.run());
+      assert.equal(availableNotifications().length, initialNotifications + 1);
       assert.ok(
         updated.seasons.every(
           (season) => season.status === MediaRequestStatus.COMPLETED

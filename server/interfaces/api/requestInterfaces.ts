@@ -1,8 +1,13 @@
 import type { MediaStatus, MediaType } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
+import type { DownloadingItem } from '@server/lib/downloadtracker';
 import type { NonFunctionProperties, PaginatedResponse } from './common';
 
-export type RequestDetailResponse = NonFunctionProperties<MediaRequest> & {
+export type MediaRequestResponse = NonFunctionProperties<MediaRequest> & {
+  target?: MediaRequestTarget | null;
+};
+
+export type RequestDetailResponse = MediaRequestResponse & {
   editRevision: string;
   target: MediaRequestTarget | null;
 };
@@ -26,6 +31,8 @@ export interface MediaRequestTarget {
   isIndependent: boolean;
   deleted: boolean;
   status: MediaStatus;
+  serviceUrl?: string;
+  downloadStatus?: DownloadingItem[];
 }
 
 export interface MovieRequestTarget {

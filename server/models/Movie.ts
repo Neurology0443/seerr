@@ -4,6 +4,7 @@ import type {
   TmdbProductionCompany,
 } from '@server/api/themoviedb/interfaces';
 import type Media from '@server/entity/Media';
+import type { MediaRequestResponse } from '@server/interfaces/api/requestInterfaces';
 import type {
   Cast,
   Crew,
@@ -80,7 +81,7 @@ export interface MovieDetails {
     posterPath?: string;
     backdropPath?: string;
   };
-  mediaInfo?: Media;
+  mediaInfo?: Media & { requests: MediaRequestResponse[] };
   externalIds: ExternalIds;
   mediaUrl?: string;
   watchProviders?: WatchProviders[];

@@ -145,3 +145,9 @@ export const isNativeRequest = async (
 ): Promise<boolean> => !(await isIndependentRequest(request, manager));
 
 export const getConfiguredRequestServer = findConfiguredServer;
+
+export const getRequestTargetName = (
+  request: Pick<MediaRequest, 'type' | 'serverId'>
+): string =>
+  findConfiguredServer(request)?.name ??
+  `Deleted ${request.type === MediaType.MOVIE ? 'Radarr' : 'Sonarr'} server (#${request.serverId})`;

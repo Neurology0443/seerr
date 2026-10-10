@@ -14,12 +14,18 @@ import { MediaRequest } from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import notificationManager, { Notification } from '@server/lib/notifications';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
 
 mock.method(MediaRequest, 'sendNotification', async () => undefined);
+const sendNotificationMock = mock.method(
+  notificationManager,
+  'sendNotification',
+  () => undefined
+);
 mock.method(
   MediaRequestSubscriber.prototype,
   'sendToRadarr',
@@ -99,6 +105,7 @@ describe('MediaSubscriber request isolation', () => {
       })
     );
 
+    const initialNotifications = sendNotificationMock.mock.callCount();
     media.status = MediaStatus.AVAILABLE;
     await mediaRepository.save(media);
 
@@ -106,6 +113,18 @@ describe('MediaSubscriber request isolation', () => {
       where: { id: request.id },
     });
     assert.strictEqual(persisted.status, MediaRequestStatus.COMPLETED);
+    assert.equal(
+      sendNotificationMock.mock.callCount(),
+      initialNotifications + 1
+    );
+    assert.equal(
+      sendNotificationMock.mock.calls.at(-1)?.arguments[1]?.request?.id,
+      request.id
+    );
+    assert.equal(
+      sendNotificationMock.mock.calls.at(-1)?.arguments[0],
+      Notification.MEDIA_AVAILABLE
+    );
   });
 
   it('does not approve or complete independent movie requests from native state', async () => {
@@ -140,6 +159,7 @@ describe('MediaSubscriber request isolation', () => {
       })
     );
 
+    const initialNotifications = sendNotificationMock.mock.callCount();
     media.status = MediaStatus.AVAILABLE;
     await mediaRepository.save(media);
 
@@ -151,6 +171,7 @@ describe('MediaSubscriber request isolation', () => {
     });
     assert.strictEqual(persistedPending.status, MediaRequestStatus.PENDING);
     assert.strictEqual(persistedFailed.status, MediaRequestStatus.FAILED);
+    assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
   });
 
   it('does not complete independent TV season requests from native season state', async () => {
@@ -188,6 +209,7 @@ describe('MediaSubscriber request isolation', () => {
       })
     );
 
+    const initialNotifications = sendNotificationMock.mock.callCount();
     media.seasons[0].status = MediaStatus.AVAILABLE;
     media.status = MediaStatus.AVAILABLE;
     await mediaRepository.save(media);
@@ -196,6 +218,7 @@ describe('MediaSubscriber request isolation', () => {
       where: { id: request.id },
     });
     assert.strictEqual(persisted.status, MediaRequestStatus.APPROVED);
+    assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
     assert.strictEqual(
       persisted.seasons[0].status,
       MediaRequestStatus.APPROVED

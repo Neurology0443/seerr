@@ -203,18 +203,59 @@ const transitionApprovedRequest = async (
   return result.affected === 1;
 };
 
+const completeRequest = async (
+  requestId: number,
+  manager: EntityManager
+): Promise<MediaRequest | null> => {
+  const completed = await transitionApprovedRequest(
+    requestId,
+    MediaRequestStatus.COMPLETED,
+    manager
+  );
+  if (!completed) {
+    return null;
+  }
+
+  return manager.getRepository(MediaRequest).findOneOrFail({
+    where: { id: requestId },
+    relations: { media: true, seasons: true },
+  });
+};
+
+// Transaction owners must dispatch only after their transaction has committed.
+export const notifyAvailableRequests = async (
+  requests: MediaRequest[]
+): Promise<void> => {
+  for (const request of requests) {
+    try {
+      await MediaRequest.sendNotification(
+        request,
+        request.media,
+        Notification.MEDIA_AVAILABLE
+      );
+    } catch (e) {
+      logger.error('Something went wrong sending media notification(s)', {
+        label: 'Notifications',
+        errorMessage: e instanceof Error ? e.message : String(e),
+        requestId: request.id,
+      });
+    }
+  }
+};
+
 export const completeRequestsForDestination = async (
   mediaId: number,
   serverId: number,
   manager?: EntityManager
-): Promise<void> => {
+): Promise<MediaRequest[]> => {
   const entityManager = managerOrDefault(manager);
+  const completedRequests: MediaRequest[] = [];
   const requestRepository = entityManager.getRepository(MediaRequest);
   const destination = await entityManager.findOne(MediaDestinationStatus, {
     where: { mediaId, serverId },
   });
   if (!destination) {
-    return;
+    return completedRequests;
   }
 
   const requests = await requestRepository.find({
@@ -226,7 +267,7 @@ export const completeRequestsForDestination = async (
     relations: { media: true, seasons: true },
   });
   if (requests.length === 0) {
-    return;
+    return completedRequests;
   }
 
   const destinationSeasons = await entityManager.find(
@@ -240,11 +281,8 @@ export const completeRequestsForDestination = async (
   for (const request of requests) {
     if (request.type === MediaType.MOVIE) {
       if (destination.status === MediaStatus.AVAILABLE) {
-        await transitionApprovedRequest(
-          request.id,
-          MediaRequestStatus.COMPLETED,
-          entityManager
-        );
+        const completed = await completeRequest(request.id, entityManager);
+        if (completed) completedRequests.push(completed);
       }
       continue;
     }
@@ -284,14 +322,17 @@ export const completeRequestsForDestination = async (
       },
     });
     if (requestedSeasonCount > 0 && incompleteSeasonCount === 0) {
-      await transitionApprovedRequest(
-        request.id,
-        MediaRequestStatus.COMPLETED,
-        entityManager
-      );
+      const completed = await completeRequest(request.id, entityManager);
+      if (completed) completedRequests.push(completed);
     }
   }
+  return completedRequests;
 };
+
+interface IndependentDestinationUpdate {
+  destination: MediaDestinationStatus;
+  completedRequests: MediaRequest[];
+}
 
 export const declineRequestsForDestination = async (
   mediaId: number,
@@ -348,7 +389,7 @@ export const updateIndependentMovieDestination = async (
     monitored: boolean;
   },
   manager?: EntityManager
-): Promise<MediaDestinationStatus> => {
+): Promise<IndependentDestinationUpdate> => {
   const entityManager = managerOrDefault(manager);
   const media = await ensureMediaIdentity(
     { tmdbId, mediaType: MediaType.MOVIE },
@@ -375,8 +416,12 @@ export const updateIndependentMovieDestination = async (
   destination.externalServiceId = externalServiceId;
   destination.externalServiceSlug = externalServiceSlug;
   destination = await destinationRepository.save(destination);
-  await completeRequestsForDestination(media.id, serverId, entityManager);
-  return destination;
+  const completedRequests = await completeRequestsForDestination(
+    media.id,
+    serverId,
+    entityManager
+  );
+  return { destination, completedRequests };
 };
 
 export const updateIndependentTvDestination = async (
@@ -396,7 +441,7 @@ export const updateIndependentTvDestination = async (
     seasons: DestinationSeasonObservation[];
   },
   manager?: EntityManager
-): Promise<MediaDestinationStatus> => {
+): Promise<IndependentDestinationUpdate> => {
   const entityManager = managerOrDefault(manager);
   const media = await ensureMediaIdentity(
     { tmdbId, tvdbId, mediaType: MediaType.TV },
@@ -491,8 +536,12 @@ export const updateIndependentTvDestination = async (
     ...rollupSeasonsByNumber.values(),
   ]);
   destination = await destinationRepository.save(destination);
-  await completeRequestsForDestination(media.id, serverId, entityManager);
-  return destination;
+  const completedRequests = await completeRequestsForDestination(
+    media.id,
+    serverId,
+    entityManager
+  );
+  return { destination, completedRequests };
 };
 
 const releaseRequestDrivenDestinationSeasons = async (

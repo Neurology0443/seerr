@@ -12,9 +12,9 @@ import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import {
-  getRequestDownloadStatus,
-  refreshIntervalHelper,
-} from '@app/utils/refreshIntervalHelper';
+  getRequestPresentation,
+  getRequestRefreshInterval,
+} from '@app/utils/requestPresentation';
 import { withProperties } from '@app/utils/typeHelpers';
 import {
   ArrowPathIcon,
@@ -24,13 +24,12 @@ import {
   XMarkIcon,
 } from '@heroicons/react/24/solid';
 import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
-import type { MediaRequest } from '@server/entity/MediaRequest';
-import type { NonFunctionProperties } from '@server/interfaces/api/common';
+import type { MediaRequestResponse } from '@server/interfaces/api/requestInterfaces';
 import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
 import axios from 'axios';
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useInView } from 'react-intersection-observer';
 import { useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
@@ -65,7 +64,7 @@ const RequestCardPlaceholder = () => {
 };
 
 interface RequestCardErrorProps {
-  requestData?: NonFunctionProperties<MediaRequest>;
+  requestData?: MediaRequestResponse;
 }
 
 const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
@@ -79,14 +78,8 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
     iOSPlexUrl4k: requestData?.media?.iOSPlexUrl4k,
   });
 
-  const requestDownloadStatus = getRequestDownloadStatus(
-    requestData?.media?.[
-      requestData?.is4k ? 'downloadStatus4k' : 'downloadStatus'
-    ],
-    requestData?.type === 'tv'
-      ? (requestData?.seasons ?? []).map((season) => season.seasonNumber)
-      : []
-  );
+  const presentation = getRequestPresentation(requestData);
+  const requestDownloadStatus = presentation.downloadStatus;
 
   const deleteRequest = async () => {
     await axios.delete(`/api/v1/media/${requestData?.media.id}`);
@@ -144,6 +137,14 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
                     </Link>
                   </div>
                 )}
+                {presentation.name && (
+                  <div
+                    className="my-1 text-sm text-gray-300"
+                    data-testid="request-destination"
+                  >
+                    {presentation.name}
+                  </div>
+                )}
                 <div className="mt-2 flex items-center text-sm sm:mt-1">
                   <span className="mr-2 hidden font-bold sm:block">
                     {intl.formatMessage(globalMessages.status)}
@@ -155,24 +156,27 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
                         ? intl.formatMessage(globalMessages.declined)
                         : intl.formatMessage(globalMessages.failed)}
                     </Badge>
+                  ) : requestData.target?.isIndependent &&
+                    requestData.status === MediaRequestStatus.PENDING ? (
+                    <Badge badgeType="warning">
+                      {intl.formatMessage(globalMessages.pending)}
+                    </Badge>
                   ) : (
                     <StatusBadge
-                      status={
-                        requestData.media[
-                          requestData.is4k ? 'status4k' : 'status'
-                        ]
-                      }
+                      status={presentation.status}
                       downloadItem={requestDownloadStatus}
                       title={intl.formatMessage(messages.unknowntitle)}
                       inProgress={requestDownloadStatus.length > 0}
                       is4k={requestData.is4k}
+                      isIndependent={requestData.target?.isIndependent}
+                      tmdbId={
+                        requestData.target?.isIndependent
+                          ? requestData.media.tmdbId
+                          : undefined
+                      }
                       mediaType={requestData.type}
                       plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
-                      serviceUrl={
-                        requestData.is4k
-                          ? requestData.media.serviceUrl4k
-                          : requestData.media.serviceUrl
-                      }
+                      serviceUrl={presentation.serviceUrl}
                     />
                   )}
                 </div>
@@ -214,7 +218,7 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
 };
 
 interface RequestCardProps {
-  request: NonFunctionProperties<MediaRequest>;
+  request: MediaRequestResponse;
   onTitleData?: (requestId: number, title: MovieDetails | TvDetails) => void;
 }
 
@@ -238,23 +242,20 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
   const { data: title, error } = useSWR<MovieDetails | TvDetails>(
     inView ? `${url}` : null
   );
+  // Title retries must not restart the request polling interval.
+  const requestRefreshInterval = useCallback(
+    (data?: MediaRequestResponse) =>
+      getRequestRefreshInterval(request, 15000, data),
+    [request]
+  );
   const {
     data: requestData,
     error: requestError,
     mutate: revalidate,
-  } = useSWR<NonFunctionProperties<MediaRequest>>(
-    `/api/v1/request/${request.id}`,
-    {
-      fallbackData: request,
-      refreshInterval: refreshIntervalHelper(
-        {
-          downloadStatus: request.media.downloadStatus,
-          downloadStatus4k: request.media.downloadStatus4k,
-        },
-        15000
-      ),
-    }
-  );
+  } = useSWR<MediaRequestResponse>(`/api/v1/request/${request.id}`, {
+    fallbackData: request,
+    refreshInterval: requestRefreshInterval,
+  });
 
   const { mediaUrl: plexUrl, mediaUrl4k: plexUrl4k } = useDeepLinks({
     mediaUrl: requestData?.media?.mediaUrl,
@@ -338,12 +339,8 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
     return <RequestCardError requestData={requestData} />;
   }
 
-  const requestDownloadStatus = getRequestDownloadStatus(
-    requestData.media[requestData.is4k ? 'downloadStatus4k' : 'downloadStatus'],
-    requestData.type === 'tv'
-      ? requestData.seasons.map((season) => season.seasonNumber)
-      : []
-  );
+  const presentation = getRequestPresentation(requestData);
+  const requestDownloadStatus = presentation.downloadStatus;
 
   return (
     <>
@@ -446,6 +443,14 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
               </div>
             </div>
           )}
+          {presentation.name && (
+            <div
+              className="my-1 text-sm text-gray-300"
+              data-testid="request-destination"
+            >
+              {presentation.name}
+            </div>
+          )}
           <div className="mt-2 flex items-center text-sm sm:mt-1">
             <span className="mr-2 hidden font-bold sm:block">
               {intl.formatMessage(globalMessages.status)}
@@ -462,8 +467,8 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                 {intl.formatMessage(globalMessages.failed)}
               </Badge>
             ) : requestData.status === MediaRequestStatus.PENDING &&
-              requestData.media[requestData.is4k ? 'status4k' : 'status'] ===
-                MediaStatus.DELETED ? (
+              (requestData.target?.isIndependent ||
+                presentation.status === MediaStatus.DELETED) ? (
               <Badge
                 badgeType="warning"
                 href={`/${requestData.type}/${requestData.media.tmdbId}?manage=1`}
@@ -472,21 +477,16 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
               </Badge>
             ) : (
               <StatusBadge
-                status={
-                  requestData.media[requestData.is4k ? 'status4k' : 'status']
-                }
+                status={presentation.status}
                 downloadItem={requestDownloadStatus}
                 title={isMovie(title) ? title.title : title.name}
                 inProgress={requestDownloadStatus.length > 0}
                 is4k={requestData.is4k}
+                isIndependent={requestData.target?.isIndependent}
                 tmdbId={requestData.media.tmdbId}
                 mediaType={requestData.type}
                 plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
-                serviceUrl={
-                  requestData.is4k
-                    ? requestData.media.serviceUrl4k
-                    : requestData.media.serviceUrl
-                }
+                serviceUrl={presentation.serviceUrl}
               />
             )}
           </div>
