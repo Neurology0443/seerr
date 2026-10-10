@@ -172,6 +172,13 @@ class WebPushAgent
         };
     }
 
+    const destination = payload.extra?.find(
+      (extra) => extra.name === 'Destination Server'
+    );
+    if (destination) {
+      message = `${message ?? ''}\n${destination.name}: ${destination.value}`;
+    }
+
     const actionUrl = payload.issue
       ? `/issues/${payload.issue.id}`
       : payload.media

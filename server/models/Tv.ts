@@ -7,6 +7,7 @@ import type {
   TmdbTvSeasonResult,
 } from '@server/api/themoviedb/interfaces';
 import type Media from '@server/entity/Media';
+import type { MediaRequestResponse } from '@server/interfaces/api/requestInterfaces';
 import type { Video } from './Movie';
 import type {
   Cast,
@@ -109,7 +110,7 @@ export interface TvDetails {
   };
   externalIds: ExternalIds;
   keywords: Keyword[];
-  mediaInfo?: Media;
+  mediaInfo?: Media & { requests: MediaRequestResponse[] };
   watchProviders?: WatchProviders[];
   onUserWatchlist?: boolean;
 }

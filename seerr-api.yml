@@ -1255,6 +1255,40 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/WatchProviders'
+    DownloadingItem:
+      type: object
+      properties:
+        mediaType:
+          type: string
+          enum: [movie, tv]
+        externalId:
+          type: number
+        size:
+          type: number
+        sizeLeft:
+          type: number
+        status:
+          type: string
+        timeLeft:
+          type: string
+        estimatedCompletionTime:
+          type: string
+          format: date-time
+        title:
+          type: string
+        downloadId:
+          type: string
+        episode:
+          type: object
+          properties:
+            seasonNumber:
+              type: number
+            episodeNumber:
+              type: number
+            absoluteEpisodeNumber:
+              type: number
+            id:
+              type: number
     MediaRequestTarget:
       type: object
       nullable: true
@@ -1272,6 +1306,14 @@ components:
         status:
           type: number
           description: Effective availability status for this request target.
+        serviceUrl:
+          type: string
+          description: Arr URL for the exact independent destination linkage.
+        downloadStatus:
+          type: array
+          description: Downloads for the exact independent destination and requested seasons.
+          items:
+            $ref: '#/components/schemas/DownloadingItem'
       required:
         - serverId
         - name

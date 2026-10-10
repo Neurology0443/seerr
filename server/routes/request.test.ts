@@ -1792,6 +1792,7 @@ describe('GET /request/:requestId', () => {
       isIndependent: true,
       deleted: false,
       status: MediaStatus.PROCESSING,
+      downloadStatus: [],
     });
   });
 

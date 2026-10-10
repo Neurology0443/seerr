@@ -197,7 +197,18 @@ describe('destination availability', () => {
       status: MediaRequestStatus.DECLINED,
     });
 
+    const initialNotifications = sendNotificationMock.mock.callCount();
     await completeRequestsForDestination(media.id, 10);
+    await completeRequestsForDestination(media.id, 10);
+    assert.equal(
+      sendNotificationMock.mock.callCount(),
+      initialNotifications + 1
+    );
+    const call = sendNotificationMock.mock.calls.at(-1)!;
+    assert.equal(call.arguments[0]!.id, exact.id);
+    assert.equal(call.arguments[0]!.serverId, 10);
+    assert.equal(call.arguments[0]!.status, MediaRequestStatus.COMPLETED);
+    assert.equal(call.arguments[2], Notification.MEDIA_AVAILABLE);
 
     const statuses = new Map(
       (
@@ -267,7 +278,9 @@ describe('destination availability', () => {
         return requests;
       });
 
+      const initialNotifications = sendNotificationMock.mock.callCount();
       await completeRequestsForDestination(media.id, 13);
+      assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
 
       assert.strictEqual(
         (
@@ -363,7 +376,9 @@ describe('destination availability', () => {
       return requests;
     });
 
+    const initialNotifications = sendNotificationMock.mock.callCount();
     await completeRequestsForDestination(media.id, 23);
+    assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
 
     const updated = await getRepository(MediaRequest).findOneOrFail({
       where: { id: candidate.id },
@@ -478,7 +493,16 @@ describe('destination availability', () => {
       seasons: [1],
     });
 
+    const initialNotifications = sendNotificationMock.mock.callCount();
     await completeRequestsForDestination(media.id, 20);
+    assert.equal(
+      sendNotificationMock.mock.callCount(),
+      initialNotifications + 1
+    );
+    assert.equal(
+      sendNotificationMock.mock.calls.at(-1)!.arguments[0]!.id,
+      singleSeasonRequest.id
+    );
 
     let updated = await getRepository(MediaRequest).findOneOrFail({
       where: { id: request.id },
@@ -510,6 +534,21 @@ describe('destination availability', () => {
     season2.status = MediaStatus.AVAILABLE;
     await getRepository(MediaDestinationSeasonStatus).save(season2);
     await completeRequestsForDestination(media.id, 20);
+    await completeRequestsForDestination(media.id, 20);
+    assert.equal(
+      sendNotificationMock.mock.callCount(),
+      initialNotifications + 2
+    );
+    const call = sendNotificationMock.mock.calls.at(-1)!;
+    assert.equal(call.arguments[0]!.id, request.id);
+    assert.equal(call.arguments[0]!.serverId, 20);
+    assert.equal(call.arguments[0]!.status, MediaRequestStatus.COMPLETED);
+    assert.ok(
+      call.arguments[0]!.seasons.every(
+        (season) => season.status === MediaRequestStatus.COMPLETED
+      )
+    );
+    assert.equal(call.arguments[2], Notification.MEDIA_AVAILABLE);
 
     updated = await getRepository(MediaRequest).findOneOrFail({
       where: { id: request.id },
@@ -827,4 +866,48 @@ describe('destination availability', () => {
       Notification.MEDIA_DECLINED
     );
   });
+});
+
+describe('independent completion notifications', () => {
+  for (const failDelivery of [false, true]) {
+    it(`notifies only the winner of concurrent movie completion (delivery fails: ${failDelivery})`, async () => {
+      const media = await getRepository(Media).save(
+        new Media({ tmdbId: 400, mediaType: MediaType.MOVIE })
+      );
+      await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 40,
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+      const request = await createRequest({ media, serverId: 40 });
+      const initialNotifications = sendNotificationMock.mock.callCount();
+      if (failDelivery)
+        sendNotificationMock.mock.mockImplementation(async () => {
+          throw new Error('delivery failed');
+        });
+      try {
+        await Promise.all([
+          completeRequestsForDestination(media.id, 40),
+          completeRequestsForDestination(media.id, 40),
+        ]);
+        await completeRequestsForDestination(media.id, 40);
+        assert.equal(
+          sendNotificationMock.mock.callCount(),
+          initialNotifications + 1
+        );
+        assert.equal(
+          (
+            await getRepository(MediaRequest).findOneByOrFail({
+              id: request.id,
+            })
+          ).status,
+          MediaRequestStatus.COMPLETED
+        );
+      } finally {
+        sendNotificationMock.mock.mockImplementation(async () => undefined);
+      }
+    });
+  }
 });

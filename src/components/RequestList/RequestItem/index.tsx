@@ -12,9 +12,9 @@ import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import {
-  getRequestDownloadStatus,
-  refreshIntervalHelper,
-} from '@app/utils/refreshIntervalHelper';
+  getRequestPresentation,
+  getRequestRefreshInterval,
+} from '@app/utils/requestPresentation';
 import {
   ArrowPathIcon,
   CheckIcon,
@@ -23,9 +23,10 @@ import {
   XMarkIcon,
 } from '@heroicons/react/24/solid';
 import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
-import type { MediaRequest } from '@server/entity/MediaRequest';
-import type { NonFunctionProperties } from '@server/interfaces/api/common';
-import type { RequestResultsResponse } from '@server/interfaces/api/requestInterfaces';
+import type {
+  MediaRequestResponse,
+  RequestResultsResponse,
+} from '@server/interfaces/api/requestInterfaces';
 import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
 import axios from 'axios';
@@ -60,7 +61,7 @@ const isMovie = (movie: MovieDetails | TvDetails): movie is MovieDetails => {
 };
 
 interface RequestItemErrorProps {
-  requestData?: NonFunctionProperties<MediaRequest>;
+  requestData?: MediaRequestResponse;
   revalidateList: () => void;
 }
 
@@ -84,14 +85,8 @@ const RequestItemError = ({
     iOSPlexUrl4k: requestData?.media?.iOSPlexUrl4k,
   });
 
-  const requestDownloadStatus = getRequestDownloadStatus(
-    requestData?.media?.[
-      requestData?.is4k ? 'downloadStatus4k' : 'downloadStatus'
-    ],
-    requestData?.type === 'tv'
-      ? (requestData?.seasons ?? []).map((season) => season.seasonNumber)
-      : []
-  );
+  const presentation = getRequestPresentation(requestData);
+  const requestDownloadStatus = presentation.downloadStatus;
 
   return (
     <div className="flex h-64 w-full flex-col justify-center rounded-xl bg-gray-800 py-4 text-gray-400 shadow-md ring-1 ring-red-500 xl:h-28 xl:flex-row">
@@ -134,6 +129,14 @@ const RequestItemError = ({
         <div className="ml-4 mt-4 flex w-full flex-col justify-center overflow-hidden pr-4 text-sm sm:ml-2 sm:mt-0 xl:flex-1 xl:pr-0">
           {requestData && (
             <>
+              {presentation.name && (
+                <div
+                  className="my-1 text-sm text-gray-300"
+                  data-testid="request-destination"
+                >
+                  {presentation.name}
+                </div>
+              )}
               <div className="card-field">
                 <span className="card-field-name">
                   {intl.formatMessage(globalMessages.status)}
@@ -145,24 +148,21 @@ const RequestItemError = ({
                       ? intl.formatMessage(globalMessages.declined)
                       : intl.formatMessage(globalMessages.failed)}
                   </Badge>
+                ) : requestData.target?.isIndependent &&
+                  requestData.status === MediaRequestStatus.PENDING ? (
+                  <Badge badgeType="warning">
+                    {intl.formatMessage(globalMessages.pending)}
+                  </Badge>
                 ) : (
                   <StatusBadge
-                    status={
-                      requestData.media[
-                        requestData.is4k ? 'status4k' : 'status'
-                      ]
-                    }
+                    status={presentation.status}
                     downloadItem={requestDownloadStatus}
                     title={intl.formatMessage(messages.unknowntitle)}
                     inProgress={requestDownloadStatus.length > 0}
                     is4k={requestData.is4k}
                     mediaType={requestData.type}
                     plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
-                    serviceUrl={
-                      requestData.is4k
-                        ? requestData.media.serviceUrl4k
-                        : requestData.media.serviceUrl
-                    }
+                    serviceUrl={presentation.serviceUrl}
                   />
                 )}
               </div>
@@ -312,18 +312,12 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
   const { data: title, error } = useSWR<MovieDetails | TvDetails>(
     inView ? url : null
   );
-  const { data: requestData, mutate: revalidate } = useSWR<
-    NonFunctionProperties<MediaRequest>
-  >(`/api/v1/request/${request.id}`, {
-    fallbackData: request,
-    refreshInterval: refreshIntervalHelper(
-      {
-        downloadStatus: request.media.downloadStatus,
-        downloadStatus4k: request.media.downloadStatus4k,
-      },
-      15000
-    ),
-  });
+  const { data: requestData, mutate: revalidate } =
+    useSWR<MediaRequestResponse>(`/api/v1/request/${request.id}`, {
+      fallbackData: request,
+      refreshInterval: (data) =>
+        getRequestRefreshInterval(request, 15000, data),
+    });
 
   const [isRetrying, setRetrying] = useState(false);
   const [updatingType, setUpdatingType] = useState<
@@ -428,12 +422,8 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
     );
   }
 
-  const requestDownloadStatus = getRequestDownloadStatus(
-    requestData.media[requestData.is4k ? 'downloadStatus4k' : 'downloadStatus'],
-    requestData.type === 'tv'
-      ? requestData.seasons.map((season) => season.seasonNumber)
-      : []
-  );
+  const presentation = getRequestPresentation(requestData);
+  const requestDownloadStatus = presentation.downloadStatus;
 
   return (
     <>
@@ -532,6 +522,14 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
             </div>
           </div>
           <div className="z-10 ml-4 mt-4 flex w-full flex-col justify-center gap-1 overflow-hidden pr-4 text-sm sm:ml-2 sm:mt-0 xl:flex-1 xl:pr-0">
+            {presentation.name && (
+              <div
+                className="my-1 text-sm text-gray-300"
+                data-testid="request-destination"
+              >
+                {presentation.name}
+              </div>
+            )}
             <div className="card-field">
               <span className="card-field-name">
                 {intl.formatMessage(globalMessages.status)}
@@ -548,8 +546,8 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                   {intl.formatMessage(globalMessages.failed)}
                 </Badge>
               ) : requestData.status === MediaRequestStatus.PENDING &&
-                requestData.media[requestData.is4k ? 'status4k' : 'status'] ===
-                  MediaStatus.DELETED ? (
+                (requestData.target?.isIndependent ||
+                  presentation.status === MediaStatus.DELETED) ? (
                 <Badge
                   badgeType="warning"
                   href={`/${requestData.type}/${requestData.media.tmdbId}?manage=1`}
@@ -558,9 +556,7 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                 </Badge>
               ) : (
                 <StatusBadge
-                  status={
-                    requestData.media[requestData.is4k ? 'status4k' : 'status']
-                  }
+                  status={presentation.status}
                   downloadItem={requestDownloadStatus}
                   title={isMovie(title) ? title.title : title.name}
                   inProgress={requestDownloadStatus.length > 0}
@@ -568,11 +564,7 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                   tmdbId={requestData.media.tmdbId}
                   mediaType={requestData.type}
                   plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
-                  serviceUrl={
-                    requestData.is4k
-                      ? requestData.media.serviceUrl4k
-                      : requestData.media.serviceUrl
-                  }
+                  serviceUrl={presentation.serviceUrl}
                 />
               )}
             </div>

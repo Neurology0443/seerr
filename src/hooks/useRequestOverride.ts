@@ -1,4 +1,4 @@
-import type { MediaRequest } from '@server/entity/MediaRequest';
+import type { MediaRequestResponse } from '@server/interfaces/api/requestInterfaces';
 import type {
   ServiceCommonServer,
   ServiceCommonServerWithDetails,
@@ -12,7 +12,7 @@ interface OverrideStatus {
   languageProfile?: string;
 }
 
-const useRequestOverride = (request: MediaRequest): OverrideStatus => {
+const useRequestOverride = (request: MediaRequestResponse): OverrideStatus => {
   const { data: allServers } = useSWR<ServiceCommonServer[]>(
     `/api/v1/service/${request.type === 'movie' ? 'radarr' : 'sonarr'}`
   );

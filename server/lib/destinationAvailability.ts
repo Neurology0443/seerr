@@ -203,6 +203,38 @@ const transitionApprovedRequest = async (
   return result.affected === 1;
 };
 
+const completeRequestAndNotify = async (
+  requestId: number,
+  manager: EntityManager
+): Promise<void> => {
+  const completed = await transitionApprovedRequest(
+    requestId,
+    MediaRequestStatus.COMPLETED,
+    manager
+  );
+  if (!completed) {
+    return;
+  }
+
+  try {
+    const request = await manager.getRepository(MediaRequest).findOneOrFail({
+      where: { id: requestId },
+      relations: { media: true, seasons: true },
+    });
+    await MediaRequest.sendNotification(
+      request,
+      request.media,
+      Notification.MEDIA_AVAILABLE
+    );
+  } catch (e) {
+    logger.error('Something went wrong sending media notification(s)', {
+      label: 'Notifications',
+      errorMessage: e instanceof Error ? e.message : String(e),
+      requestId,
+    });
+  }
+};
+
 export const completeRequestsForDestination = async (
   mediaId: number,
   serverId: number,
@@ -240,11 +272,7 @@ export const completeRequestsForDestination = async (
   for (const request of requests) {
     if (request.type === MediaType.MOVIE) {
       if (destination.status === MediaStatus.AVAILABLE) {
-        await transitionApprovedRequest(
-          request.id,
-          MediaRequestStatus.COMPLETED,
-          entityManager
-        );
+        await completeRequestAndNotify(request.id, entityManager);
       }
       continue;
     }
@@ -284,11 +312,7 @@ export const completeRequestsForDestination = async (
       },
     });
     if (requestedSeasonCount > 0 && incompleteSeasonCount === 0) {
-      await transitionApprovedRequest(
-        request.id,
-        MediaRequestStatus.COMPLETED,
-        entityManager
-      );
+      await completeRequestAndNotify(request.id, entityManager);
     }
   }
 };

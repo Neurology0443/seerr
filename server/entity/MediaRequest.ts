@@ -20,6 +20,7 @@ import {
   validateRequestCreationTarget,
   type RequestCreationTarget,
 } from '@server/lib/requestTarget';
+import { getRequestTargetState } from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
@@ -863,6 +864,19 @@ export class MediaRequest {
           break;
       }
 
+      const target = (await isIndependentRequest(
+        entity,
+        getRepository(MediaRequest).manager
+      ))
+        ? await getRequestTargetState(
+            entity,
+            getRepository(MediaRequest).manager
+          )
+        : null;
+      const destinationExtra = target?.isIndependent
+        ? [{ name: 'Destination Server', value: target.name }]
+        : [];
+
       if (entity.type === MediaType.MOVIE) {
         const movie = await tmdb.getMovie({ movieId: media.tmdbId });
         notificationManager.sendNotification(type, {
@@ -881,6 +895,7 @@ export class MediaRequest {
             omission: '…',
           }),
           image: `https://image.tmdb.org/t/p/w600_and_h900_bestv2${movie.poster_path}`,
+          ...(destinationExtra.length ? { extra: destinationExtra } : {}),
         });
       } else if (entity.type === MediaType.TV) {
         const tv = await tmdb.getTvShow({ tvId: media.tmdbId });
@@ -907,6 +922,7 @@ export class MediaRequest {
                 .map((season) => season.seasonNumber)
                 .join(', '),
             },
+            ...destinationExtra,
           ],
         });
       }

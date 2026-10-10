@@ -3,11 +3,13 @@ import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import Tooltip from '@app/components/Common/Tooltip';
 import RequestModal from '@app/components/RequestModal';
+import StatusBadge from '@app/components/StatusBadge';
 import useRequestOverride from '@app/hooks/useRequestOverride';
 import { revalidateRequestData } from '@app/hooks/useRequestTargets';
 import { useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import { getRequestPresentation } from '@app/utils/requestPresentation';
 import {
   CalendarIcon,
   CheckIcon,
@@ -18,7 +20,7 @@ import {
   XMarkIcon,
 } from '@heroicons/react/24/solid';
 import { MediaRequestStatus } from '@server/constants/media';
-import type { MediaRequest } from '@server/entity/MediaRequest';
+import type { MediaRequestResponse } from '@server/interfaces/api/requestInterfaces';
 import axios from 'axios';
 import Link from 'next/link';
 import { useState } from 'react';
@@ -41,7 +43,7 @@ const messages = defineMessages('components.RequestBlock', {
 });
 
 interface RequestBlockProps {
-  request: MediaRequest;
+  request: MediaRequestResponse;
   onUpdate?: () => void;
 }
 
@@ -52,6 +54,11 @@ const RequestBlock = ({ request, onUpdate }: RequestBlockProps) => {
   const [showEditModal, setShowEditModal] = useState(false);
   const { profile, rootFolder, server, languageProfile } =
     useRequestOverride(request);
+
+  const presentation = getRequestPresentation(request);
+  const destinationServer = request.target?.isIndependent
+    ? request.target.name
+    : server;
 
   const updateRequest = async (type: 'approve' | 'decline'): Promise<void> => {
     setIsUpdating(true);
@@ -268,6 +275,14 @@ const RequestBlock = ({ request, onUpdate }: RequestBlockProps) => {
             </Tooltip>
           </div>
         </div>
+        {request.target?.isIndependent && (
+          <div
+            className="mt-2 flex items-center text-sm"
+            data-testid="request-destination-status"
+          >
+            <StatusBadge status={presentation.status} is4k={request.is4k} />
+          </div>
+        )}
         {(request.seasons ?? []).length > 0 && (
           <div className="mt-2 flex flex-col text-sm">
             <div className="mb-1 font-medium">
@@ -291,18 +306,20 @@ const RequestBlock = ({ request, onUpdate }: RequestBlockProps) => {
             </div>
           </div>
         )}
-        {(server || profile || rootFolder || languageProfile) && (
+        {(destinationServer || profile || rootFolder || languageProfile) && (
           <>
             <div className="mb-1 mt-4 text-sm">
               {intl.formatMessage(messages.requestoverrides)}
             </div>
             <ul className="divide-y divide-gray-700 rounded-md bg-gray-800 px-2 text-xs">
-              {server && (
+              {destinationServer && (
                 <li className="flex justify-between px-1 py-2">
                   <span className="font-bold">
                     {intl.formatMessage(messages.server)}
                   </span>
-                  <span>{server}</span>
+                  <span data-testid="request-destination">
+                    {destinationServer}
+                  </span>
                 </li>
               )}
               {profile && (
