@@ -5,7 +5,7 @@ import {
   uxMovie,
   uxTv,
   uxUser,
-} from 'cypress/support/ux-correction';
+} from '../support/ux-correction';
 
 // Button eligibility smoke checks complement the existing PR5 modal/POST tests.
 describe('Detail request entry points after card Quick Request removal', () => {

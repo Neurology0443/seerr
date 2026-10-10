@@ -6,7 +6,7 @@ import {
   uxMovie,
   uxTv,
   uxUser,
-} from 'cypress/support/ux-correction';
+} from '../support/ux-correction';
 
 const clickFirstTitleCardInSlider = (sliderTitle: string): void => {
   cy.contains('.slider-header', sliderTitle)

@@ -3,7 +3,7 @@ import {
   uxMedia,
   uxMovie,
   uxUser,
-} from 'cypress/support/ux-correction';
+} from '../support/ux-correction';
 
 describe('Movie Details', () => {
   it('loads a movie page', () => {
@@ -35,8 +35,7 @@ describe('Movie Details', () => {
 });
 
 describe('Movie management gear UX correction', () => {
-  const gear = () =>
-    cy.get('.media-actions button').filter(':has(svg path[d^="M4.5 12"])');
+  const gear = () => cy.get('[data-testid="manage-movie-button"]');
   const request = (serverId: number) => ({
     id: 200 + serverId,
     type: 'movie',
