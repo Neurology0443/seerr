@@ -88,20 +88,6 @@ export default defineConfig(
   },
   prettier,
   {
-    files: [
-      'cypress/e2e/discover.cy.ts',
-      'cypress/e2e/movie-details.cy.ts',
-      'cypress/e2e/request-entry-points.cy.ts',
-    ],
-    rules: {
-      // Shared Cypress fixtures resolve through ../support in the native bundler.
-      'no-relative-import-paths/no-relative-import-paths': [
-        'error',
-        { allowSameFolder: true, allowedDepth: 1 },
-      ],
-    },
-  },
-  {
     linterOptions: {
       reportUnusedDisableDirectives: true,
     },
