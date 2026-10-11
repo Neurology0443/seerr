@@ -783,12 +783,12 @@ discoverRoutes.get('/trending', async (req, res, next) => {
       all: async () => ({
         data: await tmdb.getAllTrending({ page, language, timeWindow }),
         mapper: (result: any, media?: Media) => {
-          if (isMovie(result)) {
+          if (isCollection(result)) {
+            return mapCollectionResult(result);
+          } else if (isMovie(result)) {
             return mapMovieResult(result, media);
           } else if (isPerson(result)) {
             return mapPersonResult(result);
-          } else if (isCollection(result)) {
-            return mapCollectionResult(result);
           } else {
             return mapTvResult(result, media);
           }
@@ -814,11 +814,16 @@ discoverRoutes.get('/trending', async (req, res, next) => {
       totalResults: data.total_results,
       results: await enrichQuickRequestVisibility(
         data.results.map((result) => {
-          // - If "type" is set (case: "movie" or "tv"), the mediaType must also match.
-          // - If "type" is not set (case: "all"), only filter by tmdbId.
+          // TMDB IDs are unique only within a media type, including in all mode.
+          const resultType =
+            type ??
+            (isPerson(result) || isCollection(result)
+              ? null
+              : isMovie(result)
+                ? MediaType.MOVIE
+                : MediaType.TV);
           const selectedMedia = media.find(
-            (med) =>
-              med.tmdbId === result.id && (type ? med.mediaType === type : true)
+            (med) => med.tmdbId === result.id && med.mediaType === resultType
           );
 
           return mapper(result, selectedMedia);
