@@ -10,6 +10,7 @@ import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSea
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { Watchlist } from '@server/entity/Watchlist';
 import type { TvRequestTarget } from '@server/interfaces/api/requestInterfaces';
+import { enrichQuickRequestVisibility } from '@server/lib/quickRequestVisibility';
 import {
   classifyActiveRequestTargets,
   getConfiguredRequestTargetState,
@@ -238,13 +239,17 @@ tvRoutes.get('/:id/recommendations', async (req, res, next) => {
       page: results.page,
       totalPages: results.total_pages,
       totalResults: results.total_results,
-      results: results.results.map((result) =>
-        mapTvResult(
-          result,
-          media.find(
-            (req) => req.tmdbId === result.id && req.mediaType === MediaType.TV
+      results: await enrichQuickRequestVisibility(
+        results.results.map((result) =>
+          mapTvResult(
+            result,
+            media.find(
+              (req) =>
+                req.tmdbId === result.id && req.mediaType === MediaType.TV
+            )
           )
-        )
+        ),
+        req.user
       ),
     });
   } catch (e) {
@@ -283,13 +288,17 @@ tvRoutes.get('/:id/similar', async (req, res, next) => {
       page: results.page,
       totalPages: results.total_pages,
       totalResults: results.total_results,
-      results: results.results.map((result) =>
-        mapTvResult(
-          result,
-          media.find(
-            (req) => req.tmdbId === result.id && req.mediaType === MediaType.TV
+      results: await enrichQuickRequestVisibility(
+        results.results.map((result) =>
+          mapTvResult(
+            result,
+            media.find(
+              (req) =>
+                req.tmdbId === result.id && req.mediaType === MediaType.TV
+            )
           )
-        )
+        ),
+        req.user
       ),
     });
   } catch (e) {

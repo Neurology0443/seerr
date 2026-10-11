@@ -35,6 +35,7 @@ const Trending = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
   } = useDiscover<MovieResult | TvResult | PersonResult>(
     '/api/v1/discover/trending',
@@ -104,6 +105,7 @@ const Trending = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

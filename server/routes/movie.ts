@@ -8,6 +8,7 @@ import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { Watchlist } from '@server/entity/Watchlist';
 import type { MovieRequestTarget } from '@server/interfaces/api/requestInterfaces';
+import { enrichQuickRequestVisibility } from '@server/lib/quickRequestVisibility';
 import {
   classifyActiveRequestTargets,
   getConfiguredRequestTargetState,
@@ -157,14 +158,17 @@ movieRoutes.get('/:id/recommendations', async (req, res, next) => {
       page: results.page,
       totalPages: results.total_pages,
       totalResults: results.total_results,
-      results: results.results.map((result) =>
-        mapMovieResult(
-          result,
-          media.find(
-            (req) =>
-              req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+      results: await enrichQuickRequestVisibility(
+        results.results.map((result) =>
+          mapMovieResult(
+            result,
+            media.find(
+              (req) =>
+                req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+            )
           )
-        )
+        ),
+        req.user
       ),
     });
   } catch (e) {
@@ -203,14 +207,17 @@ movieRoutes.get('/:id/similar', async (req, res, next) => {
       page: results.page,
       totalPages: results.total_pages,
       totalResults: results.total_results,
-      results: results.results.map((result) =>
-        mapMovieResult(
-          result,
-          media.find(
-            (req) =>
-              req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+      results: await enrichQuickRequestVisibility(
+        results.results.map((result) =>
+          mapMovieResult(
+            result,
+            media.find(
+              (req) =>
+                req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+            )
           )
-        )
+        ),
+        req.user
       ),
     });
   } catch (e) {

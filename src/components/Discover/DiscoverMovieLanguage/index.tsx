@@ -24,6 +24,7 @@ const DiscoverMovieLanguage = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
   } = useDiscover<
     MovieResult,
@@ -63,6 +64,7 @@ const DiscoverMovieLanguage = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

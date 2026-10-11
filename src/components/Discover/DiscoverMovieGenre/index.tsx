@@ -24,6 +24,7 @@ const DiscoverMovieGenre = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
     firstResultData,
   } = useDiscover<MovieResult, { genre: { id: number; name: string } }>(
@@ -54,6 +55,7 @@ const DiscoverMovieGenre = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

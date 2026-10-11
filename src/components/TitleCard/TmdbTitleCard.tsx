@@ -58,6 +58,8 @@ const TmdbTitleCard = ({
     ) : null;
   }
 
+  // Detail-backed cards deliberately use TitleCard's native fallback; list
+  // projections can differ until the authoritative Request Modal is opened.
   return isMovie(title) ? (
     <TitleCard
       key={title.id}

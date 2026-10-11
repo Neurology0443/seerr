@@ -747,6 +747,9 @@ components:
         - mediaType
         - title
       properties:
+        quickRequestable:
+          type: boolean
+          description: User-specific Standard request visibility based on locally synchronized state; omitted when unavailable.
         id:
           type: number
           example: 1234
@@ -792,6 +795,9 @@ components:
     TvResult:
       type: object
       properties:
+        quickRequestable:
+          type: boolean
+          description: User-specific Standard request visibility based on locally synchronized state; omitted when unavailable.
         id:
           type: number
           example: 1234

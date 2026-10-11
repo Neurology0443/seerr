@@ -44,7 +44,7 @@ const MediaSlider = ({
 }: MediaSliderProps) => {
   const settings = useSettings();
   const { hasPermission } = useUser();
-  const { data, error, setSize, size } = useSWRInfinite<MixedResult>(
+  const { data, error, setSize, size, mutate } = useSWRInfinite<MixedResult>(
     (pageIndex: number, previousPageData: MixedResult | null) => {
       if (previousPageData && pageIndex + 1 > previousPageData.totalPages) {
         return null;
@@ -137,6 +137,10 @@ const MediaSlider = ({
               isAddedToWatchlist={title.mediaInfo?.watchlists?.length ?? 0}
               image={title.posterPath}
               status={title.mediaInfo?.status}
+              quickRequestable={title.quickRequestable}
+              mutateParent={() => {
+                void mutate();
+              }}
               summary={title.overview}
               title={title.title}
               userScore={title.voteAverage}
@@ -153,6 +157,10 @@ const MediaSlider = ({
               isAddedToWatchlist={title.mediaInfo?.watchlists?.length ?? 0}
               image={title.posterPath}
               status={title.mediaInfo?.status}
+              quickRequestable={title.quickRequestable}
+              mutateParent={() => {
+                void mutate();
+              }}
               summary={title.overview}
               title={title.name}
               userScore={title.voteAverage}

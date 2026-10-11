@@ -87,6 +87,8 @@ const ListView = ({
                     }
                     image={title.posterPath}
                     status={title.mediaInfo?.status}
+                    quickRequestable={title.quickRequestable}
+                    mutateParent={mutateParent}
                     summary={title.overview}
                     title={title.title}
                     userScore={title.voteAverage}
@@ -109,6 +111,8 @@ const ListView = ({
                     }
                     image={title.posterPath}
                     status={title.mediaInfo?.status}
+                    quickRequestable={title.quickRequestable}
+                    mutateParent={mutateParent}
                     summary={title.overview}
                     title={title.name}
                     userScore={title.voteAverage}

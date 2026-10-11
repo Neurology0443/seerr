@@ -26,6 +26,7 @@ const DiscoverTvNetwork = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
     firstResultData,
   } = useDiscover<TvResult, { network: TvNetwork }>(
@@ -70,6 +71,7 @@ const DiscoverTvNetwork = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

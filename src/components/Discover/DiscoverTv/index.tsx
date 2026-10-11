@@ -58,6 +58,7 @@ const DiscoverTv = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
   } = useDiscover<TvResult, never, FilterOptions>('/api/v1/discover/tv', {
     ...preparedFilters,
@@ -138,6 +139,7 @@ const DiscoverTv = () => {
           isLoadingInitialData || (isLoadingMore && (titles?.length ?? 0) > 0)
         }
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

@@ -58,6 +58,7 @@ const DiscoverMovies = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
   } = useDiscover<MovieResult, unknown, FilterOptions>(
     '/api/v1/discover/movies',
@@ -140,6 +141,7 @@ const DiscoverMovies = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );
