@@ -16,6 +16,7 @@ import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
+import { beginDestinationScan } from '@server/utils/destinationOperationLock';
 import {
   dvrIdentityKey,
   withDvrIdentityLock,
@@ -628,6 +629,90 @@ for (const kind of ['radarr', 'sonarr'] as const) {
         historicalRequestLookup.mock.callCount(),
         roleLookupCount
       );
+    });
+
+    for (const [field, value] of [
+      ['hostname', 'replacement'],
+      ['port', 9999],
+      ['useSsl', true],
+      ['baseUrl', '/replacement'],
+      ['apiKey', 'new-key'],
+    ] as const) {
+      it(`invalidates active observations for a ${field} change, including restoration`, async (t) => {
+        mockSettingsSave(t);
+        const current = serverFixture(kind, 14, {
+          independentRequestDestination: true,
+          syncEnabled: true,
+        });
+        setServers(kind, [current]);
+        const type = kind === 'radarr' ? MediaType.MOVIE : MediaType.TV;
+        const old = beginDestinationScan(type, 14, current);
+        const other = beginDestinationScan(type, 15);
+        const otherType = beginDestinationScan(
+          type === MediaType.MOVIE ? MediaType.TV : MediaType.MOVIE,
+          14
+        );
+        t.after(() => {
+          old.close();
+          other.close();
+          otherType.close();
+        });
+        assert.equal(old.isFresh(550), true);
+        assert.equal(
+          (
+            await request(app)
+              .put(`/${kind}/14`)
+              .send(serverPayload(current, { [field]: value }))
+          ).status,
+          200
+        );
+        assert.equal(old.isFresh(550), false);
+        assert.equal(old.isFresh(551), false);
+        assert.equal(other.isFresh(550), true);
+        assert.equal(otherType.isFresh(550), true);
+        const fresh = beginDestinationScan(type, 14, getServers(kind)[0]);
+        t.after(() => fresh.close());
+        assert.equal(fresh.isFresh(550), true);
+        assert.equal(
+          (await request(app).put(`/${kind}/14`).send(serverPayload(current)))
+            .status,
+          200
+        );
+        assert.equal(old.isFresh(550), false);
+        assert.equal(fresh.isFresh(550), false);
+        const restored = beginDestinationScan(type, 14, getServers(kind)[0]);
+        t.after(() => restored.close());
+        assert.equal(restored.isFresh(550), true);
+      });
+    }
+
+    it('keeps active observations valid after non-connection settings changes', async (t) => {
+      mockSettingsSave(t);
+      const current = serverFixture(kind, 14, {
+        independentRequestDestination: true,
+        syncEnabled: true,
+      });
+      setServers(kind, [current]);
+      const scan = beginDestinationScan(
+        kind === 'radarr' ? MediaType.MOVIE : MediaType.TV,
+        14,
+        current
+      );
+      t.after(() => scan.close());
+      assert.equal(
+        (
+          await request(app)
+            .put(`/${kind}/14`)
+            .send(
+              serverPayload(current, {
+                name: 'Renamed',
+                activeDirectory: '/other',
+              })
+            )
+        ).status,
+        200
+      );
+      assert.equal(scan.isFresh(550), true);
     });
 
     it('uses the server identity lock for role changes', async (t) => {

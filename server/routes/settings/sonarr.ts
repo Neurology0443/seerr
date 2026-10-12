@@ -1,4 +1,5 @@
 import SonarrAPI from '@server/api/servarr/sonarr';
+import { MediaType } from '@server/constants/media';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import {
@@ -12,7 +13,9 @@ import {
   hasValidIndependentRequestDestination,
 } from '@server/lib/settings/dvrValidation';
 import logger from '@server/logger';
+import { invalidateDestinationConnectionScans } from '@server/utils/destinationOperationLock';
 import {
+  hasDvrConnectionChanged,
   withDvrIdentityLock,
   withDvrSettingsMutationLock,
 } from '@server/utils/dvrIdentityLock';
@@ -208,6 +211,9 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
     }
 
     settings.sonarr[sonarrIndex] = updatedSonarr;
+    if (hasDvrConnectionChanged(currentSonarr, updatedSonarr)) {
+      invalidateDestinationConnectionScans(MediaType.TV, serverId);
+    }
     await settings.save();
 
     return res.status(200).json(settings.sonarr[sonarrIndex]);
@@ -238,6 +244,7 @@ sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
       }
 
       const removed = settings.sonarr.splice(sonarrIndex, 1);
+      invalidateDestinationConnectionScans(MediaType.TV, serverId);
       await settings.save();
 
       return res.status(200).json(removed[0]);

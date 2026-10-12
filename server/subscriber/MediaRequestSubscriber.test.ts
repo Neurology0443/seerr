@@ -25,10 +25,13 @@ import { Permission } from '@server/lib/permissions';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import mediaRoutes from '@server/routes/media';
+import radarrRoutes from '@server/routes/settings/radarr';
+import sonarrRoutes from '@server/routes/settings/sonarr';
 import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
 import * as destinationOperations from '@server/utils/destinationOperationLock';
 import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
+import * as dvrIdentityLocks from '@server/utils/dvrIdentityLock';
 import express from 'express';
 import httpRequest from 'supertest';
 import type { EntityManager } from 'typeorm';
@@ -311,7 +314,10 @@ const removalApp = (admin: User) => {
     req.user = admin;
     next();
   });
+  app.use(express.json());
   app.use('/media', mediaRoutes);
+  app.use('/settings/radarr', radarrRoutes);
+  app.use('/settings/sonarr', sonarrRoutes);
   return app;
 };
 
@@ -337,7 +343,258 @@ const stubArrArrowMethod = (
   return fn;
 };
 
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
+
 describe('independent Arr addition and removal coordination', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(
+      `holds the ${type} connection through remote addition and result persistence, without blocking another server's settings`,
+      { timeout: 10000 },
+      async (t) => {
+        const req =
+          type === MediaType.MOVIE
+            ? await seedMovieRequest()
+            : await seedTvRequest();
+        await markApprovedWithoutListeners(req);
+        const kind = type === MediaType.MOVIE ? 'radarr' : 'sonarr';
+        const settings = getSettings();
+        const originalServer = { ...settings[kind][1] };
+        t.mock.method(settings, 'save', async () => undefined);
+        const remoteStarted = deferred();
+        const remoteReleased = deferred();
+        const callbackStarted = deferred();
+        const callbackReleased = deferred();
+        t.after(() => {
+          remoteReleased.resolve();
+          callbackReleased.resolve();
+        });
+        const connection =
+          type === MediaType.MOVIE
+            ? 'http://radarr-en:7878/api/v3'
+            : 'http://sonarr-en:8989/api/v3';
+        const add = async function (this: RadarrAPI | SonarrAPI) {
+          assert.equal(
+            (this as unknown as { axios: { defaults: { baseURL: string } } })
+              .axios.defaults.baseURL,
+            connection
+          );
+          remoteStarted.resolve();
+          await remoteReleased.promise;
+          return { id: 7007, titleSlug: 'added' };
+        };
+        if (type === MediaType.MOVIE) {
+          stubArrArrowMethod(t, RadarrAPI.prototype, 'addMovie', add);
+        } else t.mock.method(SonarrAPI.prototype, 'addSeries', add);
+        const subscriber = new MediaRequestSubscriber();
+        const internals = subscriber as unknown as {
+          applyArrSuccessIfStillApproved: (
+            ...args: unknown[]
+          ) => Promise<boolean>;
+        };
+        const originalSuccess =
+          internals.applyArrSuccessIfStillApproved.bind(subscriber);
+        t.mock.method(
+          internals,
+          'applyArrSuccessIfStillApproved',
+          async (...args: unknown[]) => {
+            callbackStarted.resolve();
+            await callbackReleased.promise;
+            return originalSuccess(...args);
+          }
+        );
+        const manager = getRepository(MediaRequest).manager;
+        if (type === MediaType.MOVIE)
+          await subscriber.sendToRadarr(req, manager);
+        else await subscriber.sendToSonarr(req, manager);
+        await remoteStarted.promise;
+        const attempting = deferred();
+        const originalLock = dvrIdentityLocks.withDvrIdentityLock;
+        t.mock.method(
+          dvrIdentityLocks,
+          'withDvrIdentityLock',
+          (...args: Parameters<typeof originalLock>) => {
+            if (args[0] === kind && args[1] === req.serverId)
+              attempting.resolve();
+            return originalLock(...args);
+          }
+        );
+        const app = removalApp(
+          await getRepository(User).findOneByOrFail({ id: 1 })
+        );
+        let settled = false;
+        const changing = httpRequest(app)
+          .put(`/settings/${kind}/${req.serverId}`)
+          .send({
+            ...originalServer,
+            hostname: 'connection-b',
+            apiKey: 'key-b',
+          })
+          .then((response) => {
+            settled = true;
+            return response;
+          });
+        await attempting.promise;
+        assert.equal(settled, false);
+        assert.equal(
+          (
+            await httpRequest(app)
+              .put(`/settings/${kind}/${req.serverId - 1}`)
+              .send({ ...settings[kind][0], hostname: 'other-b' })
+          ).status,
+          200
+        );
+        remoteReleased.resolve();
+        await callbackStarted.promise;
+        assert.equal(settled, false);
+        assert.equal(settings[kind][1].hostname, originalServer.hostname);
+        callbackReleased.resolve();
+        assert.equal((await changing).status, 200);
+        assert.equal(settings[kind][1].hostname, 'connection-b');
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              mediaId: req.media.id,
+              serverId: req.serverId,
+            })
+          ).externalServiceId,
+          7007
+        );
+        assert.equal(
+          (await getRepository(MediaRequest).findOneByOrFail({ id: req.id }))
+            .status,
+          MediaRequestStatus.APPROVED
+        );
+      }
+    );
+
+    for (const declined of [false, true]) {
+      it(
+        `uses current ${type} connection for delayed additions and revalidates approval (declined: ${declined})`,
+        { timeout: 10000 },
+        async (t) => {
+          const req =
+            type === MediaType.MOVIE
+              ? await seedMovieRequest()
+              : await seedTvRequest();
+          await markApprovedWithoutListeners(req);
+          const kind = type === MediaType.MOVIE ? 'radarr' : 'sonarr';
+          const settings = getSettings();
+          const originalServer = { ...settings[kind][1] };
+          t.mock.method(settings, 'save', async () => undefined);
+          const held = deferred();
+          const released = deferred();
+          const queued = deferred();
+          const finished = deferred();
+          t.after(() => released.resolve());
+          const blocking = withDestinationOperationLock(
+            type,
+            req.media.tmdbId,
+            req.serverId,
+            async () => {
+              held.resolve();
+              await released.promise;
+            }
+          );
+          await held.promise;
+          const originalLock =
+            destinationOperations.withDestinationOperationLock;
+          t.mock.method(
+            destinationOperations,
+            'withDestinationOperationLock',
+            (...args: Parameters<typeof originalLock>) => {
+              queued.resolve();
+              return originalLock(...args);
+            }
+          );
+          const subscriber = new MediaRequestSubscriber();
+          const internals = subscriber as unknown as {
+            runIndependentArrOperation: (
+              ...args: [
+                MediaRequest,
+                number,
+                EntityManager,
+                () => Promise<void>,
+              ]
+            ) => Promise<void>;
+          };
+          const originalRun =
+            internals.runIndependentArrOperation.bind(subscriber);
+          t.mock.method(
+            internals,
+            'runIndependentArrOperation',
+            async (...args: Parameters<typeof originalRun>) => {
+              try {
+                await originalRun(...args);
+              } finally {
+                finished.resolve();
+              }
+            }
+          );
+          const connections: string[] = [];
+          const add = async function (this: RadarrAPI | SonarrAPI) {
+            connections.push(
+              (this as unknown as { axios: { defaults: { baseURL: string } } })
+                .axios.defaults.baseURL
+            );
+            return { id: 7010, titleSlug: 'current' };
+          };
+          if (type === MediaType.MOVIE) {
+            stubArrArrowMethod(t, RadarrAPI.prototype, 'addMovie', add);
+          } else t.mock.method(SonarrAPI.prototype, 'addSeries', add);
+          const manager = getRepository(MediaRequest).manager;
+          if (type === MediaType.MOVIE)
+            await subscriber.sendToRadarr(req, manager);
+          else await subscriber.sendToSonarr(req, manager);
+          await queued.promise;
+          const app = removalApp(
+            await getRepository(User).findOneByOrFail({ id: 1 })
+          );
+          assert.equal(
+            (
+              await httpRequest(app)
+                .put(`/settings/${kind}/${req.serverId}`)
+                .send({
+                  ...originalServer,
+                  hostname: 'connection-b',
+                  apiKey: 'key-b',
+                  activeDirectory: '/current',
+                })
+            ).status,
+            200
+          );
+          if (declined) {
+            req.status = MediaRequestStatus.DECLINED;
+            await getRepository(MediaRequest).save(req);
+          }
+          released.resolve();
+          await blocking;
+          await finished.promise;
+          assert.deepEqual(
+            connections,
+            declined
+              ? []
+              : [`http://connection-b:${originalServer.port}/api/v3`]
+          );
+          const destination = await getRepository(
+            MediaDestinationStatus
+          ).findOneByOrFail({ mediaId: req.media.id, serverId: req.serverId });
+          assert.equal(destination.externalServiceId, declined ? null : 7010);
+          assert.equal(
+            (await getRepository(MediaRequest).findOneByOrFail({ id: req.id }))
+              .status,
+            declined ? MediaRequestStatus.DECLINED : MediaRequestStatus.APPROVED
+          );
+        }
+      );
+    }
+  }
+
   it('starts detached Arr work after commit and cancels work from a rolled-back savepoint', async () => {
     const req = await seedMovieRequest();
     await markApprovedWithoutListeners(req);
@@ -1898,6 +2155,10 @@ describe('MediaRequestSubscriber request destinations', () => {
         }
       }
     );
+    let started!: () => void;
+    const remoteStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
     let rejectAdd!: (reason: Error) => void;
     t.mock.method(
       RadarrAPI.prototype,
@@ -1905,11 +2166,13 @@ describe('MediaRequestSubscriber request destinations', () => {
       () =>
         new Promise<RadarrMovie>((_resolve, reject) => {
           rejectAdd = reject;
+          started();
         })
     );
 
     await markApprovedWithoutListeners(request);
     await subscriber.sendToRadarr(request, requestRepository.manager);
+    await remoteStarted;
     request.status = MediaRequestStatus.DECLINED;
     await requestRepository.save(request);
     sendNotificationMock.mock.resetCalls();

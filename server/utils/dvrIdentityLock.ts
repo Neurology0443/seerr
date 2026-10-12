@@ -1,3 +1,4 @@
+import type { DVRSettings } from '@server/lib/settings';
 import AsyncLock from '@server/utils/asyncLock';
 
 export type DvrIdentityKind = 'radarr' | 'sonarr';
@@ -24,3 +25,18 @@ export const withDvrSettingsMutationLock = <T>(
   kind: DvrIdentityKind,
   callback: () => Promise<T>
 ): Promise<T> => dvrSettingsMutationLock.dispatch(kind, callback);
+
+export type DvrConnectionSettings = Pick<
+  DVRSettings,
+  'hostname' | 'port' | 'useSsl' | 'baseUrl' | 'apiKey'
+>;
+
+export const hasDvrConnectionChanged = (
+  previous: DvrConnectionSettings,
+  next: DvrConnectionSettings
+): boolean =>
+  previous.hostname !== next.hostname ||
+  previous.port !== next.port ||
+  Boolean(previous.useSsl) !== Boolean(next.useSsl) ||
+  (previous.baseUrl ?? '') !== (next.baseUrl ?? '') ||
+  previous.apiKey !== next.apiKey;

@@ -31,6 +31,7 @@ import {
   beginDestinationScan,
   withDestinationOperationLock,
 } from '@server/utils/destinationOperationLock';
+import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -100,7 +101,16 @@ class SonarrScanner
           sonarrA.baseUrl === sonarrB.baseUrl
       );
 
-      for (const server of this.servers) {
+      for (const configuredServer of this.servers) {
+        const server =
+          configuredServer.independentRequestDestination === true
+            ? getSettings().sonarr.find(
+                (current) =>
+                  current.id === configuredServer.id &&
+                  current.independentRequestDestination === true
+              )
+            : configuredServer;
+        if (!server) continue;
         this.currentServer = server;
         if (server.syncEnabled) {
           this.log(
@@ -115,7 +125,7 @@ class SonarrScanner
 
           destinationScan =
             server.independentRequestDestination === true
-              ? beginDestinationScan(MediaType.TV, server.id)
+              ? beginDestinationScan(MediaType.TV, server.id, server)
               : undefined;
           this.items = await this.sonarrApi.getSeries();
 
@@ -318,26 +328,27 @@ class SonarrScanner
             MediaType.TV,
             tmdbId,
             server.id,
-            async () => {
-              if (!observation?.isFresh(tmdbId)) return [];
-              const result = await updateIndependentTvDestination({
-                tmdbId,
-                tvdbId: sonarrSeries.tvdbId,
-                serverId: server.id,
-                externalServiceId: sonarrSeries.id ?? null,
-                externalServiceSlug: sonarrSeries.titleSlug,
-                seasons: filteredSeasons.map((season) => ({
-                  seasonNumber: season.seasonNumber,
-                  totalEpisodes: season.statistics?.totalEpisodeCount ?? 0,
-                  availableEpisodes: season.statistics?.episodeFileCount ?? 0,
-                  monitored: season.monitored,
-                  observedInService: observedSonarrSeasons.has(
-                    season.seasonNumber
-                  ),
-                })),
-              });
-              return result.completedRequests;
-            }
+            () =>
+              withDvrIdentityLock('sonarr', server.id, async () => {
+                if (!observation?.isFresh(tmdbId)) return [];
+                const result = await updateIndependentTvDestination({
+                  tmdbId,
+                  tvdbId: sonarrSeries.tvdbId,
+                  serverId: server.id,
+                  externalServiceId: sonarrSeries.id ?? null,
+                  externalServiceSlug: sonarrSeries.titleSlug,
+                  seasons: filteredSeasons.map((season) => ({
+                    seasonNumber: season.seasonNumber,
+                    totalEpisodes: season.statistics?.totalEpisodeCount ?? 0,
+                    availableEpisodes: season.statistics?.episodeFileCount ?? 0,
+                    monitored: season.monitored,
+                    observedInService: observedSonarrSeasons.has(
+                      season.seasonNumber
+                    ),
+                  })),
+                });
+                return result.completedRequests;
+              })
           );
           await notifyAvailableRequests(completedRequests);
         });
@@ -440,7 +451,10 @@ class SonarrScanner
             return [];
           }
 
-          return markMissingTvDestination(destination.mediaId, server.id);
+          return withDvrIdentityLock('sonarr', server.id, async () => {
+            if (!observation?.isFresh(destination.media.tmdbId)) return [];
+            return markMissingTvDestination(destination.mediaId, server.id);
+          });
         }
       );
       await notifyDeclinedRequests(declinedRequests);

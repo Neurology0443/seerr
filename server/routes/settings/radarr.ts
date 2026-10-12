@@ -1,4 +1,5 @@
 import RadarrAPI from '@server/api/servarr/radarr';
+import { MediaType } from '@server/constants/media';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import {
@@ -12,7 +13,9 @@ import {
   hasValidIndependentRequestDestination,
 } from '@server/lib/settings/dvrValidation';
 import logger from '@server/logger';
+import { invalidateDestinationConnectionScans } from '@server/utils/destinationOperationLock';
 import {
+  hasDvrConnectionChanged,
   withDvrIdentityLock,
   withDvrSettingsMutationLock,
 } from '@server/utils/dvrIdentityLock';
@@ -216,6 +219,9 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
       }
 
       settings.radarr[radarrIndex] = updatedRadarr;
+      if (hasDvrConnectionChanged(currentRadarr, updatedRadarr)) {
+        invalidateDestinationConnectionScans(MediaType.MOVIE, serverId);
+      }
       await settings.save();
 
       return res.status(200).json(settings.radarr[radarrIndex]);
@@ -273,6 +279,7 @@ radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
       }
 
       const removed = settings.radarr.splice(radarrIndex, 1);
+      invalidateDestinationConnectionScans(MediaType.MOVIE, serverId);
       await settings.save();
 
       return res.status(200).json(removed[0]);

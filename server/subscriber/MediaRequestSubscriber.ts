@@ -35,6 +35,7 @@ import {
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
+import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
 import { withNestedTransaction } from '@server/utils/nestedTransaction';
 import { isEqual, truncate } from 'lodash';
 import type {
@@ -80,16 +81,21 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
         entity.type,
         entity.media.tmdbId,
         serverId,
-        async () => {
-          if (
-            !(await this.isStillApproved(
-              entity.id,
-              getRepository(MediaRequest).manager
-            ))
+        () =>
+          withDvrIdentityLock(
+            entity.type === MediaType.MOVIE ? 'radarr' : 'sonarr',
+            serverId,
+            async () => {
+              if (
+                !(await this.isStillApproved(
+                  entity.id,
+                  getRepository(MediaRequest).manager
+                ))
+              )
+                return;
+              await send();
+            }
           )
-            return;
-          await send();
-        }
       );
     const runner = manager.queryRunner;
     if (!runner?.isTransactionActive) return run();
@@ -518,16 +524,59 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     independentOverride?: boolean
   ): Promise<void> {
     if (
+      entity.status !== MediaRequestStatus.APPROVED ||
+      entity.type !== MediaType.MOVIE
+    )
+      return;
+    const independent =
+      independentOverride ??
+      entity.creationTarget?.isIndependent ??
+      (await isIndependentRequest(entity, manager));
+    if (independent) {
+      void this.runIndependentArrOperation(
+        entity,
+        entity.serverId,
+        manager,
+        () =>
+          this.sendRadarrRequest(
+            entity,
+            getRepository(MediaRequest).manager,
+            true
+          )
+      ).catch((error: unknown) => {
+        logger.error('Failed to run independent Radarr operation', {
+          label: 'Media Request',
+          requestId: entity.id,
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return;
+    }
+    await this.sendRadarrRequest(entity, manager, false);
+  }
+
+  private async sendRadarrRequest(
+    entity: MediaRequest,
+    manager: EntityManager,
+    independent: boolean
+  ): Promise<void> {
+    if (
       entity.status === MediaRequestStatus.APPROVED &&
       entity.type === MediaType.MOVIE
     ) {
-      const independent =
-        independentOverride ??
-        entity.creationTarget?.isIndependent ??
-        (await isIndependentRequest(entity, manager));
       try {
         const mediaRepository = manager.getRepository(Media);
         const settings = getSettings();
+        if (
+          independent &&
+          !settings.radarr.some(
+            (server) =>
+              server.id === entity.serverId &&
+              server.independentRequestDestination === true
+          )
+        ) {
+          throw new Error('Independent destination is no longer configured.');
+        }
         if (settings.radarr.length === 0 && !settings.radarr[0]) {
           logger.info(
             'No Radarr server configured, skipping request processing',
@@ -730,15 +779,9 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               externalId: radarrMovie.id,
             });
           });
-        const operation = independent
-          ? this.runIndependentArrOperation(
-              entity,
-              radarrSettings.id,
-              manager,
-              sendToArr
-            )
-          : sendToArr();
-        operation.catch(async () => {
+        if (independent && !(await this.isStillApproved(entity.id, manager)))
+          return;
+        const operation = sendToArr().catch(async () => {
           let failedRequest: MediaRequest | null;
           try {
             failedRequest = await this.markFailedIfStillApproved(
@@ -776,6 +819,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             Notification.MEDIA_FAILED
           );
         });
+        if (independent) await operation;
         logger.info('Sent request to Radarr', {
           label: 'Media Request',
           requestId: entity.id,
@@ -835,16 +879,59 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
     independentOverride?: boolean
   ): Promise<void> {
     if (
+      entity.status !== MediaRequestStatus.APPROVED ||
+      entity.type !== MediaType.TV
+    )
+      return;
+    const independent =
+      independentOverride ??
+      entity.creationTarget?.isIndependent ??
+      (await isIndependentRequest(entity, manager));
+    if (independent) {
+      void this.runIndependentArrOperation(
+        entity,
+        entity.serverId,
+        manager,
+        () =>
+          this.sendSonarrRequest(
+            entity,
+            getRepository(MediaRequest).manager,
+            true
+          )
+      ).catch((error: unknown) => {
+        logger.error('Failed to run independent Sonarr operation', {
+          label: 'Media Request',
+          requestId: entity.id,
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return;
+    }
+    await this.sendSonarrRequest(entity, manager, false);
+  }
+
+  private async sendSonarrRequest(
+    entity: MediaRequest,
+    manager: EntityManager,
+    independent: boolean
+  ): Promise<void> {
+    if (
       entity.status === MediaRequestStatus.APPROVED &&
       entity.type === MediaType.TV
     ) {
-      const independent =
-        independentOverride ??
-        entity.creationTarget?.isIndependent ??
-        (await isIndependentRequest(entity, manager));
       try {
         const mediaRepository = manager.getRepository(Media);
         const settings = getSettings();
+        if (
+          independent &&
+          !settings.sonarr.some(
+            (server) =>
+              server.id === entity.serverId &&
+              server.independentRequestDestination === true
+          )
+        ) {
+          throw new Error('Independent destination is no longer configured.');
+        }
         if (settings.sonarr.length === 0 && !settings.sonarr[0]) {
           logger.warn(
             'No Sonarr server configured, skipping request processing',
@@ -1099,15 +1186,9 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
               title: series.name,
             });
           });
-        const operation = independent
-          ? this.runIndependentArrOperation(
-              entity,
-              sonarrSettings.id,
-              manager,
-              sendToArr
-            )
-          : sendToArr();
-        operation.catch(async () => {
+        if (independent && !(await this.isStillApproved(entity.id, manager)))
+          return;
+        const operation = sendToArr().catch(async () => {
           let failedRequest: MediaRequest | null;
           try {
             failedRequest = await this.markFailedIfStillApproved(
@@ -1145,6 +1226,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
             Notification.MEDIA_FAILED
           );
         });
+        if (independent) await operation;
         logger.info('Sent request to Sonarr', {
           label: 'Media Request',
           requestId: entity.id,

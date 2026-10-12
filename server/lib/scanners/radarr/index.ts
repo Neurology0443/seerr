@@ -22,6 +22,7 @@ import {
   beginDestinationScan,
   withDestinationOperationLock,
 } from '@server/utils/destinationOperationLock';
+import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -91,7 +92,16 @@ class RadarrScanner
           radarrA.baseUrl === radarrB.baseUrl
       );
 
-      for (const server of this.servers) {
+      for (const configuredServer of this.servers) {
+        const server =
+          configuredServer.independentRequestDestination === true
+            ? getSettings().radarr.find(
+                (current) =>
+                  current.id === configuredServer.id &&
+                  current.independentRequestDestination === true
+              )
+            : configuredServer;
+        if (!server) continue;
         this.currentServer = server;
         if (server.syncEnabled) {
           this.log(
@@ -106,7 +116,7 @@ class RadarrScanner
 
           destinationScan =
             server.independentRequestDestination === true
-              ? beginDestinationScan(MediaType.MOVIE, server.id)
+              ? beginDestinationScan(MediaType.MOVIE, server.id, server)
               : undefined;
           this.items = await this.radarrApi.getMovies();
 
@@ -241,18 +251,19 @@ class RadarrScanner
             MediaType.MOVIE,
             radarrMovie.tmdbId,
             server.id,
-            async () => {
-              if (!observation?.isFresh(radarrMovie.tmdbId)) return [];
-              const result = await updateIndependentMovieDestination({
-                tmdbId: radarrMovie.tmdbId,
-                serverId: server.id,
-                externalServiceId: radarrMovie.id,
-                externalServiceSlug: radarrMovie.titleSlug,
-                hasFile: radarrMovie.hasFile,
-                monitored: radarrMovie.monitored,
-              });
-              return result.completedRequests;
-            }
+            () =>
+              withDvrIdentityLock('radarr', server.id, async () => {
+                if (!observation?.isFresh(radarrMovie.tmdbId)) return [];
+                const result = await updateIndependentMovieDestination({
+                  tmdbId: radarrMovie.tmdbId,
+                  serverId: server.id,
+                  externalServiceId: radarrMovie.id,
+                  externalServiceSlug: radarrMovie.titleSlug,
+                  hasFile: radarrMovie.hasFile,
+                  monitored: radarrMovie.monitored,
+                });
+                return result.completedRequests;
+              })
           );
           await notifyAvailableRequests(completedRequests);
         });
@@ -356,7 +367,10 @@ class RadarrScanner
             return [];
           }
 
-          return markMissingMovieDestination(destination.mediaId, server.id);
+          return withDvrIdentityLock('radarr', server.id, async () => {
+            if (!observation?.isFresh(destination.media.tmdbId)) return [];
+            return markMissingMovieDestination(destination.mediaId, server.id);
+          });
         }
       );
       await notifyDeclinedRequests(declinedRequests);
