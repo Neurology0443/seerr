@@ -25,6 +25,7 @@ const DiscoverMovieKeyword = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
     firstResultData,
   } = useDiscover<MovieResult, { keywords: TmdbKeyword[] }>(
@@ -60,6 +61,7 @@ const DiscoverMovieKeyword = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

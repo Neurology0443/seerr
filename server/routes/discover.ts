@@ -13,6 +13,7 @@ import type {
   GenreSliderItem,
   WatchlistResponse,
 } from '@server/interfaces/api/discoverInterfaces';
+import { enrichQuickRequestVisibility } from '@server/lib/quickRequestVisibility';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { mapProductionCompany } from '@server/models/Movie';
@@ -168,14 +169,17 @@ discoverRoutes.get('/movies', async (req, res, next) => {
       totalPages: data.total_pages,
       totalResults: data.total_results,
       keywords: keywordData,
-      results: data.results.map((result) =>
-        mapMovieResult(
-          result,
-          media.find(
-            (req) =>
-              req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+      results: await enrichQuickRequestVisibility(
+        data.results.map((result) =>
+          mapMovieResult(
+            result,
+            media.find(
+              (req) =>
+                req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+            )
           )
-        )
+        ),
+        req.user
       ),
     });
   } catch (e) {
@@ -226,14 +230,17 @@ discoverRoutes.get<{ language: string }>(
         totalPages: data.total_pages,
         totalResults: data.total_results,
         language,
-        results: data.results.map((result) =>
-          mapMovieResult(
-            result,
-            media.find(
-              (req) =>
-                req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+        results: await enrichQuickRequestVisibility(
+          data.results.map((result) =>
+            mapMovieResult(
+              result,
+              media.find(
+                (req) =>
+                  req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+              )
             )
-          )
+          ),
+          req.user
         ),
       });
     } catch (e) {
@@ -288,14 +295,17 @@ discoverRoutes.get<{ genreId: string }>(
         totalPages: data.total_pages,
         totalResults: data.total_results,
         genre,
-        results: data.results.map((result) =>
-          mapMovieResult(
-            result,
-            media.find(
-              (req) =>
-                req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+        results: await enrichQuickRequestVisibility(
+          data.results.map((result) =>
+            mapMovieResult(
+              result,
+              media.find(
+                (req) =>
+                  req.tmdbId === result.id && req.mediaType === MediaType.MOVIE
+              )
             )
-          )
+          ),
+          req.user
         ),
       });
     } catch (e) {
@@ -340,14 +350,17 @@ discoverRoutes.get<{ studioId: string }>(
         totalPages: data.total_pages,
         totalResults: data.total_results,
         studio: mapProductionCompany(studio),
-        results: data.results.map((result) =>
-          mapMovieResult(
-            result,
-            media.find(
-              (med) =>
-                med.tmdbId === result.id && med.mediaType === MediaType.MOVIE
+        results: await enrichQuickRequestVisibility(
+          data.results.map((result) =>
+            mapMovieResult(
+              result,
+              media.find(
+                (med) =>
+                  med.tmdbId === result.id && med.mediaType === MediaType.MOVIE
+              )
             )
-          )
+          ),
+          req.user
         ),
       });
     } catch (e) {
@@ -393,14 +406,17 @@ discoverRoutes.get('/movies/upcoming', async (req, res, next) => {
       page: data.page,
       totalPages: data.total_pages,
       totalResults: data.total_results,
-      results: data.results.map((result) =>
-        mapMovieResult(
-          result,
-          media.find(
-            (med) =>
-              med.tmdbId === result.id && med.mediaType === MediaType.MOVIE
+      results: await enrichQuickRequestVisibility(
+        data.results.map((result) =>
+          mapMovieResult(
+            result,
+            media.find(
+              (med) =>
+                med.tmdbId === result.id && med.mediaType === MediaType.MOVIE
+            )
           )
-        )
+        ),
+        req.user
       ),
     });
   } catch (e) {
@@ -481,13 +497,17 @@ discoverRoutes.get('/tv', async (req, res, next) => {
       totalPages: data.total_pages,
       totalResults: data.total_results,
       keywords: keywordData,
-      results: data.results.map((result) =>
-        mapTvResult(
-          result,
-          media.find(
-            (med) => med.tmdbId === result.id && med.mediaType === MediaType.TV
+      results: await enrichQuickRequestVisibility(
+        data.results.map((result) =>
+          mapTvResult(
+            result,
+            media.find(
+              (med) =>
+                med.tmdbId === result.id && med.mediaType === MediaType.TV
+            )
           )
-        )
+        ),
+        req.user
       ),
     });
   } catch (e) {
@@ -538,14 +558,17 @@ discoverRoutes.get<{ language: string }>(
         totalPages: data.total_pages,
         totalResults: data.total_results,
         language,
-        results: data.results.map((result) =>
-          mapTvResult(
-            result,
-            media.find(
-              (med) =>
-                med.tmdbId === result.id && med.mediaType === MediaType.TV
+        results: await enrichQuickRequestVisibility(
+          data.results.map((result) =>
+            mapTvResult(
+              result,
+              media.find(
+                (med) =>
+                  med.tmdbId === result.id && med.mediaType === MediaType.TV
+              )
             )
-          )
+          ),
+          req.user
         ),
       });
     } catch (e) {
@@ -600,14 +623,17 @@ discoverRoutes.get<{ genreId: string }>(
         totalPages: data.total_pages,
         totalResults: data.total_results,
         genre,
-        results: data.results.map((result) =>
-          mapTvResult(
-            result,
-            media.find(
-              (med) =>
-                med.tmdbId === result.id && med.mediaType === MediaType.TV
+        results: await enrichQuickRequestVisibility(
+          data.results.map((result) =>
+            mapTvResult(
+              result,
+              media.find(
+                (med) =>
+                  med.tmdbId === result.id && med.mediaType === MediaType.TV
+              )
             )
-          )
+          ),
+          req.user
         ),
       });
     } catch (e) {
@@ -652,14 +678,17 @@ discoverRoutes.get<{ networkId: string }>(
         totalPages: data.total_pages,
         totalResults: data.total_results,
         network: mapNetwork(network),
-        results: data.results.map((result) =>
-          mapTvResult(
-            result,
-            media.find(
-              (med) =>
-                med.tmdbId === result.id && med.mediaType === MediaType.TV
+        results: await enrichQuickRequestVisibility(
+          data.results.map((result) =>
+            mapTvResult(
+              result,
+              media.find(
+                (med) =>
+                  med.tmdbId === result.id && med.mediaType === MediaType.TV
+              )
             )
-          )
+          ),
+          req.user
         ),
       });
     } catch (e) {
@@ -705,13 +734,17 @@ discoverRoutes.get('/tv/upcoming', async (req, res, next) => {
       page: data.page,
       totalPages: data.total_pages,
       totalResults: data.total_results,
-      results: data.results.map((result) =>
-        mapTvResult(
-          result,
-          media.find(
-            (med) => med.tmdbId === result.id && med.mediaType === MediaType.TV
+      results: await enrichQuickRequestVisibility(
+        data.results.map((result) =>
+          mapTvResult(
+            result,
+            media.find(
+              (med) =>
+                med.tmdbId === result.id && med.mediaType === MediaType.TV
+            )
           )
-        )
+        ),
+        req.user
       ),
     });
   } catch (e) {
@@ -750,12 +783,12 @@ discoverRoutes.get('/trending', async (req, res, next) => {
       all: async () => ({
         data: await tmdb.getAllTrending({ page, language, timeWindow }),
         mapper: (result: any, media?: Media) => {
-          if (isMovie(result)) {
+          if (isCollection(result)) {
+            return mapCollectionResult(result);
+          } else if (isMovie(result)) {
             return mapMovieResult(result, media);
           } else if (isPerson(result)) {
             return mapPersonResult(result);
-          } else if (isCollection(result)) {
-            return mapCollectionResult(result);
           } else {
             return mapTvResult(result, media);
           }
@@ -779,16 +812,24 @@ discoverRoutes.get('/trending', async (req, res, next) => {
       page: data.page,
       totalPages: data.total_pages,
       totalResults: data.total_results,
-      results: data.results.map((result) => {
-        // - If "type" is set (case: "movie" or "tv"), the mediaType must also match.
-        // - If "type" is not set (case: "all"), only filter by tmdbId.
-        const selectedMedia = media.find(
-          (med) =>
-            med.tmdbId === result.id && (type ? med.mediaType === type : true)
-        );
+      results: await enrichQuickRequestVisibility(
+        data.results.map((result) => {
+          // TMDB IDs are unique only within a media type, including in all mode.
+          const resultType =
+            type ??
+            (isPerson(result) || isCollection(result)
+              ? null
+              : isMovie(result)
+                ? MediaType.MOVIE
+                : MediaType.TV);
+          const selectedMedia = media.find(
+            (med) => med.tmdbId === result.id && med.mediaType === resultType
+          );
 
-        return mapper(result, selectedMedia);
-      }),
+          return mapper(result, selectedMedia);
+        }),
+        req.user
+      ),
     });
   } catch (e) {
     logger.debug('Something went wrong retrieving trending items', {
@@ -827,14 +868,17 @@ discoverRoutes.get<{ keywordId: string }>(
         page: data.page,
         totalPages: data.total_pages,
         totalResults: data.total_results,
-        results: data.results.map((result) =>
-          mapMovieResult(
-            result,
-            media.find(
-              (med) =>
-                med.tmdbId === result.id && med.mediaType === MediaType.MOVIE
+        results: await enrichQuickRequestVisibility(
+          data.results.map((result) =>
+            mapMovieResult(
+              result,
+              media.find(
+                (med) =>
+                  med.tmdbId === result.id && med.mediaType === MediaType.MOVIE
+              )
             )
-          )
+          ),
+          req.user
         ),
       });
     } catch (e) {

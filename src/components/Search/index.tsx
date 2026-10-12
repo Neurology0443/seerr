@@ -28,6 +28,7 @@ const Search = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
   } = useDiscover<MovieResult | TvResult | PersonResult>(
     `/api/v1/search`,
@@ -55,6 +56,7 @@ const Search = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

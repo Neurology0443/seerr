@@ -26,6 +26,7 @@ const DiscoverMovieStudio = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
     firstResultData,
   } = useDiscover<MovieResult, { studio: ProductionCompany }>(
@@ -70,6 +71,7 @@ const DiscoverMovieStudio = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

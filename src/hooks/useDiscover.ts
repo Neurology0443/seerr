@@ -179,6 +179,7 @@ const useDiscover = <
     error: error && titles.length ? null : error,
     titles,
     firstResultData: data?.[0],
+    // Bound SWRInfinite mutate revalidates every loaded page, including page 1.
     mutate,
   };
 };

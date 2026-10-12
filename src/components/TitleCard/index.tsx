@@ -39,6 +39,7 @@ interface TitleCardProps {
   userScore?: number;
   mediaType: MediaType;
   status?: MediaStatus;
+  quickRequestable?: boolean;
   canExpand?: boolean;
   inProgress?: boolean;
   isAddedToWatchlist?: number | boolean;
@@ -62,6 +63,7 @@ const TitleCard = ({
   year,
   title,
   status,
+  quickRequestable,
   mediaType,
   isAddedToWatchlist = false,
   inProgress = false,
@@ -90,12 +92,16 @@ const TitleCard = ({
     setCurrentStatus(status);
   }, [status]);
 
-  const requestComplete = useCallback((newStatus?: MediaStatus) => {
-    if (newStatus !== undefined) {
-      setCurrentStatus(newStatus);
-    }
-    setShowRequestModal(false);
-  }, []);
+  const requestComplete = useCallback(
+    (newStatus?: MediaStatus) => {
+      if (newStatus !== undefined) {
+        setCurrentStatus(newStatus);
+      }
+      setShowRequestModal(false);
+      mutateParent?.();
+    },
+    [mutateParent]
+  );
 
   const requestUpdating = useCallback(
     (status: boolean) => setIsUpdating(status),
@@ -312,6 +318,17 @@ const TitleCard = ({
     { type: 'or' }
   );
 
+  const nativeRequestVisibility =
+    !currentStatus ||
+    currentStatus === MediaStatus.UNKNOWN ||
+    currentStatus === MediaStatus.DELETED;
+  const canShowQuickRequest =
+    showRequestButton &&
+    currentStatus !== MediaStatus.BLOCKLISTED &&
+    (mediaType === 'movie' || mediaType === 'tv'
+      ? (quickRequestable ?? nativeRequestVisibility)
+      : nativeRequestVisibility);
+
   const showHideButton = hasPermission([Permission.MANAGE_BLOCKLIST], {
     type: 'or',
   });
@@ -433,6 +450,7 @@ const TitleCard = ({
                       buttonType={'ghost'}
                       className="z-40"
                       buttonSize={'sm'}
+                      data-testid="title-card-blocklist-button"
                       onClick={() => setShowBlocklistModal(true)}
                     >
                       <EyeSlashIcon className={'h-3'} />
@@ -513,12 +531,7 @@ const TitleCard = ({
                 <div className="flex h-full w-full items-end">
                   <div
                     className={`px-2 text-white ${
-                      !showRequestButton ||
-                      (currentStatus &&
-                        currentStatus !== MediaStatus.UNKNOWN &&
-                        currentStatus !== MediaStatus.DELETED)
-                        ? 'pb-2'
-                        : 'pb-11'
+                      !canShowQuickRequest ? 'pb-2' : 'pb-11'
                     }`}
                   >
                     {year && <div className="text-sm font-medium">{year}</div>}
@@ -539,13 +552,7 @@ const TitleCard = ({
                     <div
                       className="whitespace-normal text-xs"
                       style={{
-                        WebkitLineClamp:
-                          !showRequestButton ||
-                          (currentStatus &&
-                            currentStatus !== MediaStatus.UNKNOWN &&
-                            currentStatus !== MediaStatus.DELETED)
-                            ? 5
-                            : 3,
+                        WebkitLineClamp: !canShowQuickRequest ? 5 : 3,
                         display: '-webkit-box',
                         overflow: 'hidden',
                         WebkitBoxOrient: 'vertical',
@@ -559,23 +566,20 @@ const TitleCard = ({
               </Link>
 
               <div className="absolute bottom-0 left-0 right-0 flex justify-between px-2 py-2">
-                {showRequestButton &&
-                  (!currentStatus ||
-                    currentStatus === MediaStatus.UNKNOWN ||
-                    currentStatus === MediaStatus.DELETED) && (
-                    <Button
-                      buttonType="primary"
-                      buttonSize="sm"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        setShowRequestModal(true);
-                      }}
-                      className="h-7 w-full"
-                    >
-                      <ArrowDownTrayIcon />
-                      <span>{intl.formatMessage(globalMessages.request)}</span>
-                    </Button>
-                  )}
+                {canShowQuickRequest && (
+                  <Button
+                    buttonType="primary"
+                    buttonSize="sm"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      setShowRequestModal(true);
+                    }}
+                    className="h-7 w-full"
+                  >
+                    <ArrowDownTrayIcon />
+                    <span>{intl.formatMessage(globalMessages.request)}</span>
+                  </Button>
+                )}
               </div>
             </div>
           </Transition>

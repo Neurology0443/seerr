@@ -21,6 +21,7 @@ const UpcomingMovies = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
   } = useDiscover<MovieResult>('/api/v1/discover/movies/upcoming');
 
@@ -42,6 +43,7 @@ const UpcomingMovies = () => {
         }
         isReachingEnd={isReachingEnd}
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );

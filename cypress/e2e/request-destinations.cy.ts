@@ -121,7 +121,8 @@ const visitMedia = (
   independent = false,
   targetOverrides?: (MovieRequestTarget | TvRequestTarget)[],
   seasonNumbers = [1, 2],
-  isAnime = false
+  isAnime = false,
+  skipVisit = false
 ) => {
   const id = type === 'movie' ? movieId : tvId;
   const media = {
@@ -219,6 +220,7 @@ const visitMedia = (
     `/api/v1/${type}/${id}/request-targets`,
     requestTargets
   ).as('targets');
+  if (skipVisit) return title;
   cy.visit(`/${type}/${id}`);
   cy.wait(['@title', '@targets']);
   if (requests.length > 0) {
@@ -4826,5 +4828,439 @@ describe('Request destinations', () => {
     cy.get('#profile').should('not.be.disabled').and('have.value', '20');
     cy.wait(['@delayedRules', '@delayedRules']);
     cy.get('#profile').should('have.value', '20');
+  });
+
+  describe('Quick Request list visibility', () => {
+    const card = (label = 'Card Movie') =>
+      cy.contains('[data-testid="title-card"]', label);
+    const quick = (label = 'Card Movie') =>
+      card(label).contains('button', /^Request$/);
+    const listItem = (
+      type: 'movie' | 'tv' = 'movie',
+      quickRequestable: boolean | undefined,
+      status = 5,
+      id = type === 'movie' ? movieId : tvId
+    ) => ({
+      id,
+      mediaType: type,
+      title: 'Card Movie',
+      name: 'Card TV',
+      overview: 'Local projection',
+      genreIds: [],
+      releaseDate: '2020-01-01',
+      firstAirDate: '2020-01-01',
+      quickRequestable,
+      mediaInfo: {
+        id: 100,
+        status,
+        status4k: 1,
+        requests: [],
+        seasons: [],
+        issues: [],
+        watchlists: [],
+      },
+    });
+    const page = (results: object[], number = 1) => ({
+      page: number,
+      totalPages: 3,
+      totalResults: 60,
+      results,
+    });
+    const prepare = (type: 'movie' | 'tv' = 'movie') => {
+      const title = visitMedia(
+        type,
+        [],
+        false,
+        true,
+        undefined,
+        [1, 2],
+        false,
+        true
+      );
+      const kind = type === 'movie' ? 'radarr' : 'sonarr';
+      const configured = servers.map((server) => ({
+        ...server,
+        independentRequestDestination: server.id === 2,
+      }));
+      cy.intercept('GET', `/api/v1/service/${kind}`, configured);
+      for (const id of [1, 2])
+        cy.intercept('GET', `/api/v1/service/${kind}/${id}`, {
+          ...details(id),
+          server: configured[id - 1],
+        });
+      cy.intercept(
+        'GET',
+        `/api/v1/${type}/${type === 'movie' ? movieId : tvId}/request-targets`,
+        configured.map((server) => ({
+          serverId: server.id,
+          name: server.name,
+          isDefault: server.isDefault,
+          is4k: false,
+          isIndependent: server.id === 2,
+          status: server.id === 1 ? 5 : 1,
+          requestable: server.id === 2,
+          seasons: [1, 2].map((seasonNumber) => ({
+            seasonNumber,
+            status: server.id === 1 ? 5 : 1,
+            requestable: server.id === 2,
+          })),
+        }))
+      ).as('cardTargets');
+      return title;
+    };
+    const submit = (type: 'movie' | 'tv' = 'movie') => {
+      quick(type === 'movie' ? 'Card Movie' : 'Card TV').click();
+      cy.get('[role="dialog"] #server').should('have.value', '1');
+      cy.get('[data-testid="modal-ok-button"]').should('be.disabled');
+      cy.get('[role="dialog"] #server').select('2');
+      if (type === 'tv')
+        cy.contains('[role="dialog"] tbody tr', 'Season 2')
+          .find('[role="checkbox"]')
+          .click();
+      cy.get('[data-testid="modal-ok-button"]')
+        .should('not.be.disabled')
+        .click();
+    };
+    for (const type of ['movie', 'tv'] as const) {
+      for (const projected of [true, false, undefined]) {
+        it(`${type} uses projection ${projected} and the controlled native fallback without render-time targets`, () => {
+          cy.intercept(
+            'GET',
+            '/api/v1/search?*',
+            page([listItem(type, projected, projected === undefined ? 1 : 5)])
+          ).as('cards');
+          cy.intercept('GET', '/api/v1/*/*/request-targets', []).as(
+            'renderTargets'
+          );
+          cy.visit('/search?query=cards');
+          cy.wait('@cards');
+          const label = type === 'movie' ? 'Card Movie' : 'Card TV';
+          card(label)
+            .find('[role="link"]')
+            .focus()
+            .trigger('keydown', { key: 'Enter' });
+          if (projected !== false) quick(label).should('be.visible');
+          else
+            card(label)
+              .contains('button', /^Request$/)
+              .should('not.exist');
+          cy.scrollTo('bottom', { ensureScrollable: false });
+          cy.get('@renderTargets.all').should('have.length', 0);
+        });
+      }
+      it(`${type} never shows Quick Request with missing permissions even during projection failure`, () => {
+        cy.intercept('GET', '/api/v1/auth/me', { ...admin, permissions: 0 });
+        cy.intercept(
+          'GET',
+          '/api/v1/search?*',
+          page([listItem(type, undefined, 1)])
+        );
+        cy.visit('/search?query=cards');
+        card(type === 'movie' ? 'Card Movie' : 'Card TV')
+          .contains('button', /^Request$/)
+          .should('not.exist');
+      });
+    }
+    it('keeps non-Advanced cards restricted to the default even when another target is requestable', () => {
+      cy.intercept('GET', '/api/v1/auth/me', { ...admin, permissions: 32 });
+      cy.intercept(
+        'GET',
+        '/api/v1/search?*',
+        page([listItem('movie', false, 1)])
+      );
+      cy.visit('/search?query=cards');
+      card()
+        .contains('button', /^Request$/)
+        .should('not.exist');
+    });
+    it('non-Advanced users open the existing modal without gaining destination selection', () => {
+      prepare();
+      cy.intercept('GET', '/api/v1/auth/me', { ...admin, permissions: 32 });
+      cy.intercept('GET', `/api/v1/movie/${movieId}/request-targets`, [
+        {
+          serverId: 1,
+          name: 'FR',
+          isDefault: true,
+          is4k: false,
+          isIndependent: false,
+          status: 1,
+          requestable: true,
+        },
+      ]);
+      cy.intercept(
+        'GET',
+        '/api/v1/search?*',
+        page([listItem('movie', true, 1)])
+      );
+      cy.visit('/search?query=cards');
+      quick().click();
+      cy.get('[role="dialog"] #server').should('not.exist');
+      cy.get('[data-testid="modal-ok-button"]').should('not.be.disabled');
+      cy.get('[data-testid="modal-cancel-button"]').click();
+    });
+    for (const projected of [true, undefined]) {
+      it(`local Blocklist immediately overrides stale projection ${projected} before any list response refresh`, () => {
+        prepare();
+        cy.intercept(
+          'GET',
+          '/api/v1/search?*',
+          page([listItem('movie', projected, 1)])
+        ).as('cards');
+        cy.intercept('POST', '/api/v1/blocklist', {
+          statusCode: 201,
+          body: {},
+        }).as('block');
+        cy.visit('/search?query=cards');
+        cy.wait('@cards');
+        card().trigger('mouseover');
+        quick().should('be.visible');
+        // Hold every revalidation response, so local state alone must hide it.
+        let release: (() => void) | undefined;
+        cy.intercept(
+          'GET',
+          '/api/v1/search?*',
+          (req) =>
+            new Promise<void>((resolve) => {
+              release = () => {
+                req.reply(page([listItem('movie', projected, 1)]));
+                resolve();
+              };
+            })
+        ).as('heldList');
+        card()
+          .find('[role="link"]')
+          .focus()
+          .trigger('keydown', { key: 'Enter' });
+        card().find('[data-testid="title-card-blocklist-button"]').click();
+        cy.contains('[role="dialog"] button', /^Blocklist$/).click();
+        cy.wait('@block');
+        card()
+          .contains('button', /^Request$/)
+          .should('not.exist');
+        cy.then(() => release?.());
+      });
+      it(`known Blocklist suppresses projection ${projected}`, () => {
+        cy.intercept(
+          'GET',
+          '/api/v1/search?*',
+          page([listItem('movie', projected, 6)])
+        );
+        cy.visit('/search?query=cards');
+        card()
+          .contains('button', /^Request$/)
+          .should('not.exist');
+      });
+    }
+    for (const type of ['movie', 'tv'] as const) {
+      for (const remaining of [false, true]) {
+        it(`${type} successful independent request refreshes its owning loaded page; another destination requestable=${remaining}`, () => {
+          prepare(type);
+          let requested = false;
+          const filler = Array.from({ length: 20 }, (_, i) => ({
+            ...listItem('movie', false, 5, 100000 + i),
+            title: `Filler ${i}`,
+          }));
+          cy.intercept('GET', '/api/v1/search?*', (req) => {
+            const number = Number(new URL(req.url).searchParams.get('page'));
+            req.reply(
+              page(
+                number === 2
+                  ? [listItem(type, requested ? remaining : true)]
+                  : number === 1
+                    ? filler
+                    : [],
+                number
+              )
+            );
+          }).as('owningList');
+          cy.intercept('POST', '/api/v1/request', (req) => {
+            requested = true;
+            req.reply({
+              statusCode: 201,
+              body: createdRequest(type, 2, type === 'tv' ? [2] : []),
+            });
+          }).as('cardCreate');
+          cy.visit('/search?query=cards');
+          const label = type === 'movie' ? 'Card Movie' : 'Card TV';
+          card(label).scrollIntoView().trigger('mouseover');
+          submit(type);
+          cy.wait('@cardCreate');
+          cy.get('[role="dialog"]').should('not.exist');
+          card(label).trigger('mouseover');
+          if (remaining) quick(label).should('be.visible');
+          else
+            card(label)
+              .contains('button', /^Request$/)
+              .should('not.exist');
+          card(label).find('.bg-green-500\\/80').should('exist');
+          cy.get('@owningList.all').should((calls) => {
+            const pages = (
+              calls as unknown as { request: { url: string } }[]
+            ).map((call) => new URL(call.request.url).searchParams.get('page'));
+            expect(
+              pages.filter((number) => number === '2').length
+            ).to.be.greaterThan(1);
+            expect(
+              pages.filter((number) => number === '1').length
+            ).to.be.greaterThan(1);
+          });
+        });
+      }
+    }
+    it('refreshes the owning slider while another independent slider keeps its cached card and native badges', () => {
+      prepare();
+      let requested = false;
+      const initial = () => page([listItem('movie', !requested)]);
+      cy.intercept('GET', '/api/v1/discover/trending*', (req) =>
+        req.reply(initial())
+      ).as('sliderA');
+      cy.intercept(
+        'GET',
+        '/api/v1/discover/movies*',
+        page([listItem('movie', true)])
+      ).as('sliderB');
+      cy.intercept('POST', '/api/v1/request', (req) => {
+        requested = true;
+        req.reply({ statusCode: 201, body: createdRequest('movie', 2) });
+      }).as('cardCreate');
+      cy.visit('/');
+      cy.contains('.slider-header', 'Trending')
+        .next('[data-testid="media-slider"]')
+        .find('[data-testid="title-card"]')
+        .first()
+        .trigger('mouseover')
+        .contains('button', /^Request$/)
+        .click();
+      cy.get('#server').select('2');
+      cy.contains('[role="dialog"] button', /^Request$/).click();
+      cy.wait('@cardCreate');
+      cy.contains('.slider-header', 'Trending')
+        .next('[data-testid="media-slider"]')
+        .find('[data-testid="title-card"]')
+        .first()
+        .contains('button', /^Request$/)
+        .should('not.exist');
+      cy.contains('.slider-header', 'Popular Movies')
+        .next('[data-testid="media-slider"]')
+        .find('[data-testid="title-card"]')
+        .first()
+        .contains('button', /^Request$/)
+        .should('exist');
+      cy.contains('.slider-header', 'Trending')
+        .next('[data-testid="media-slider"]')
+        .find('.bg-green-500\\/80')
+        .should('exist');
+      cy.contains('.slider-header', 'Trending')
+        .next('[data-testid="media-slider"]')
+        .find('[data-testid="title-card-title"]')
+        .first()
+        .click();
+      cy.location('pathname').should('eq', `/movie/${movieId}`);
+    });
+    it('keeps native modal touch opening and cancellation without refreshing the list', () => {
+      prepare();
+      cy.viewport('iphone-6');
+      cy.intercept(
+        'GET',
+        '/api/v1/search?*',
+        page([listItem('movie', true)])
+      ).as('cards');
+      cy.visit('/search?query=cards');
+      card().find('[role="link"]').click();
+      quick().click();
+      cy.contains('[role="dialog"] button', /^Cancel$/).click();
+      cy.get('[role="dialog"]').should('not.exist');
+      cy.get('@cards.all').should('have.length', 3);
+    });
+    for (const code of [201, 500]) {
+      it(`obsolete card creation ${code} cannot clear newer loading state or refresh the owning list`, () => {
+        prepare();
+        let releaseOld: (() => void) | undefined;
+        let releaseNew: (() => void) | undefined;
+        let count = 0;
+        cy.intercept(
+          'GET',
+          '/api/v1/search?*',
+          page([listItem('movie', true)])
+        ).as('cards');
+        cy.intercept(
+          'POST',
+          '/api/v1/request',
+          (req) =>
+            new Promise<void>((resolve) => {
+              const release = () => {
+                req.reply({
+                  statusCode: code,
+                  body:
+                    code === 201
+                      ? createdRequest('movie', 2)
+                      : { message: 'Old failure' },
+                });
+                resolve();
+              };
+              if (++count === 1) releaseOld = release;
+              else releaseNew = release;
+            })
+        ).as('heldCreate');
+        cy.visit('/search?query=cards');
+        card().trigger('mouseover');
+        submit();
+        cy.wrap(null).should(() => expect(releaseOld).to.be.a('function'));
+        cy.get('[data-testid="modal-cancel-button"]').click();
+        card().trigger('mouseover');
+        submit();
+        cy.wrap(null).should(() => expect(releaseNew).to.be.a('function'));
+        cy.then(() => releaseOld?.());
+        cy.wait('@heldCreate');
+        cy.get('[role="dialog"]').should('exist');
+        card().find('.bg-gray-800\\/75').should('be.visible');
+        cy.get('@cards.all').should('have.length', 3);
+        cy.get('[data-testid="modal-cancel-button"]').click();
+        cy.then(() => releaseNew?.());
+      });
+    }
+    it('preserves collection native visibility regardless of a movie/tv projection', () => {
+      cy.intercept(
+        'GET',
+        '/api/v1/search?*',
+        page([
+          {
+            id: 123,
+            mediaType: 'collection',
+            title: 'Card Collection',
+            quickRequestable: false,
+          },
+        ])
+      );
+      cy.visit('/search?query=cards');
+      card('Card Collection').trigger('mouseover');
+      quick('Card Collection').should('be.visible');
+    });
+    for (const status of [1, 6]) {
+      it(`TmdbTitleCard retains detail loading and native fallback with status ${status}`, () => {
+        const title = prepare();
+        cy.intercept('GET', `/api/v1/movie/${movieId}`, {
+          ...title,
+          mediaInfo: { ...title.mediaInfo, status },
+        }).as('detailCard');
+        cy.intercept('GET', '/api/v1/discover/watchlist*', {
+          page: 1,
+          totalPages: 1,
+          totalResults: 1,
+          results: [{ tmdbId: movieId, mediaType: 'movie', ratingKey: '1' }],
+        });
+        cy.visit('/discover/watchlist');
+        cy.wait('@detailCard');
+        card('Correction Movie').trigger('mouseover');
+        cy.get('@cardTargets.all').should('have.length', 0);
+        if (status === 1) {
+          quick('Correction Movie').click();
+          cy.get('[role="dialog"]').should('exist');
+        } else
+          card('Correction Movie')
+            .contains('button', /^Request$/)
+            .should('not.exist');
+      });
+    }
   });
 });

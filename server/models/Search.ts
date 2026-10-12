@@ -28,6 +28,7 @@ interface SearchResult {
 
 export interface MovieResult extends SearchResult {
   mediaType: 'movie';
+  quickRequestable?: boolean;
   title: string;
   originalTitle: string;
   releaseDate: string;
@@ -38,6 +39,7 @@ export interface MovieResult extends SearchResult {
 
 export interface TvResult extends SearchResult {
   mediaType: 'tv';
+  quickRequestable?: boolean;
   name: string;
   originalName: string;
   originCountry: string[];

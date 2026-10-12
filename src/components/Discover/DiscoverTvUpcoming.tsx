@@ -21,6 +21,7 @@ const DiscoverTvUpcoming = () => {
     isReachingEnd,
     titles,
     fetchMore,
+    mutate,
     error,
   } = useDiscover<TvResult>('/api/v1/discover/tv/upcoming');
 
@@ -42,6 +43,7 @@ const DiscoverTvUpcoming = () => {
           isLoadingInitialData || (isLoadingMore && (titles?.length ?? 0) > 0)
         }
         onScrollBottom={fetchMore}
+        mutateParent={mutate}
       />
     </>
   );
