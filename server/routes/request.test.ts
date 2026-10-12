@@ -1739,6 +1739,78 @@ describe('PUT /request/:requestId (quota)', () => {
 });
 
 describe('GET /request/:requestId', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`restricts the exact independent ${type} management URL in detail and list responses`, async () => {
+      const servers = [
+        {
+          id: 501,
+          name: 'Exact',
+          independentRequestDestination: true,
+          externalUrl: 'https://exact.example',
+        },
+      ];
+      if (type === MediaType.MOVIE) configureRadarr(servers);
+      else configureSonarr(servers);
+      const requestedBy = await getRepository(User).findOneOrFail({
+        where: { email: 'demo@seerr.dev' },
+      });
+      const media = await getRepository(Media).save(
+        new Media({
+          mediaType: type,
+          tmdbId: 50100,
+          tvdbId: type === MediaType.TV ? 50101 : undefined,
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+      const req = await getRepository(MediaRequest).save(
+        new MediaRequest({
+          media,
+          type,
+          status: MediaRequestStatus.COMPLETED,
+          requestedBy,
+          serverId: 501,
+          is4k: false,
+        })
+      );
+      await getRepository(MediaDestinationStatus).upsert(
+        {
+          mediaId: media.id,
+          serverId: 501,
+          status: MediaStatus.PROCESSING,
+          externalServiceId: 12,
+          externalServiceSlug: 'exact',
+        },
+        ['mediaId', 'serverId']
+      );
+      for (const [email, authorized] of [
+        ['demo@seerr.dev', false],
+        ['admin@seerr.dev', true],
+      ] as const) {
+        const agent = await loginAs(email, 'test1234');
+        const detail = await agent.get(`/request/${req.id}`);
+        const list = await agent.get('/request');
+        assert.equal(detail.status, 200);
+        assert.equal(list.status, 200);
+        const listed = list.body.results.find(
+          (candidate: { id: number }) => candidate.id === req.id
+        );
+        assert.ok(listed);
+        for (const target of [detail.body.target, listed.target]) {
+          assert.equal(target.serverId, 501);
+          assert.equal(target.name, 'Exact');
+          assert.equal(target.status, MediaStatus.PROCESSING);
+          assert.equal(target.canRemove, authorized);
+          assert.equal(Object.hasOwn(target, 'serviceUrl'), authorized);
+          if (authorized)
+            assert.equal(
+              target.serviceUrl,
+              `https://exact.example/${type === MediaType.MOVIE ? 'movie' : 'series'}/exact`
+            );
+        }
+      }
+    });
+  }
+
   it('omits notification settings from requestedBy and modifiedBy', async () => {
     const pending = await seedRequest();
     await seedUserSettings('demo@seerr.dev');
@@ -1788,6 +1860,7 @@ describe('GET /request/:requestId', () => {
     assert.deepStrictEqual(response.body.target, {
       serverId: 301,
       name: 'French',
+      canRemove: true,
       is4k: false,
       isIndependent: true,
       deleted: false,
@@ -2010,7 +2083,7 @@ describe('GET /request target-aware list and count', () => {
     );
   });
 
-  it('guards independent removal while preserving native canRemove', async (t) => {
+  it('allows independent removal by exact identity and guards deleted targets while preserving native canRemove', async (t) => {
     mockProfiles(t);
     configureRadarr([
       { id: 331, independentRequestDestination: true },
@@ -2049,19 +2122,41 @@ describe('GET /request target-aware list and count', () => {
       })
     );
 
-    const response = await (
-      await loginAs('admin@seerr.dev', 'test1234')
-    ).get('/request?filter=available');
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const response = await admin.get('/request?filter=available');
 
     assert.strictEqual(response.status, 200);
     assert.strictEqual(
       response.body.results.find(
         (candidate: { id: number }) => candidate.id === independent.id
       ).canRemove,
-      false
+      true
     );
     assert.strictEqual(
       response.body.results.find(
+        (candidate: { id: number }) => candidate.id === native.id
+      ).canRemove,
+      true
+    );
+    const destinationRepo = getRepository(MediaDestinationStatus);
+    const destination = await destinationRepo.findOneByOrFail({
+      mediaId: independent.media.id,
+      serverId: 331,
+    });
+    assert.equal(destination.externalServiceId, null);
+    await destinationRepo.update(destination.id, {
+      status: MediaStatus.DELETED,
+    });
+    const deletedResponse = await admin.get('/request');
+    assert.equal(deletedResponse.status, 200);
+    const deletedTarget = deletedResponse.body.results.find(
+      (candidate: { id: number }) => candidate.id === independent.id
+    );
+    assert.equal(deletedTarget.canRemove, false);
+    assert.equal(deletedTarget.target.canRemove, false);
+    assert.equal(deletedTarget.target.status, MediaStatus.DELETED);
+    assert.equal(
+      deletedResponse.body.results.find(
         (candidate: { id: number }) => candidate.id === native.id
       ).canRemove,
       true
@@ -3496,18 +3591,34 @@ describe('POST /request, override rules and requester choices', () => {
           MediaRequestSubscriber.prototype as unknown as {
             applyArrSuccessIfStillApproved: () => Promise<boolean>;
           };
+        let signalArrSuccess!: () => void;
+        const arrSuccess = new Promise<void>((resolve) => {
+          signalArrSuccess = resolve;
+        });
         t.mock.method(
           subscriberInternals,
           'applyArrSuccessIfStillApproved',
-          async () => false
+          async () => {
+            signalArrSuccess();
+            return false;
+          }
         );
+        const manager = getRepository(MediaRequest).manager;
+        // Dispatch revalidates persisted approval before sending to Arr.
+        // Avoid triggering a second subscriber dispatch while preparing it.
+        await manager
+          .createQueryBuilder()
+          .update(MediaRequest)
+          .set({ status: MediaRequestStatus.APPROVED })
+          .where('id = :id', { id: persisted.id })
+          .callListeners(false)
+          .execute();
         persisted.status = MediaRequestStatus.APPROVED;
         const subscriber = new MediaRequestSubscriber();
-        const manager = getRepository(MediaRequest).manager;
         if (mediaType === MediaType.MOVIE)
           await subscriber.sendToRadarr(persisted, manager, independent);
         else await subscriber.sendToSonarr(persisted, manager, independent);
-        await nextTurn();
+        await arrSuccess;
         assert.equal(arrPayloads.length, 1);
         assert.equal(arrPayloads[0].qualityProfileId, 8);
         assert.equal(arrPayloads[0].rootFolderPath, '/second');
@@ -3710,5 +3821,80 @@ describe('DELETE /request/:requestId, orphaned season status reset', () => {
     const updated = await mediaRepo.findOneOrFail({ where: { id: media.id } });
     assert.strictEqual(updated.seasons[0].status, MediaStatus.UNKNOWN);
     assert.strictEqual(updated.seasons[0].status4k, MediaStatus.PROCESSING);
+  });
+});
+
+describe('request removal compatibility projection', () => {
+  it('exposes exact independent canRemove at both target and legacy list levels', async (t) => {
+    t.mock.method(
+      axios,
+      'create',
+      () =>
+        ({
+          interceptors: { request: { use: () => 0 } },
+          get: async () => ({ data: [] }),
+        }) as unknown as AxiosInstance
+    );
+    configureRadarr([
+      { id: 311, independentRequestDestination: true, name: 'EN' },
+    ]);
+    const created = await seedRequest(MediaRequestStatus.COMPLETED);
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ serverId: 311 })
+      .where('id = :id', { id: created.id })
+      .callListeners(false)
+      .execute();
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: created.media.id,
+        serverId: 311,
+        status: MediaStatus.AVAILABLE,
+        externalServiceId: 12,
+      })
+    );
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const eligible = await admin.get('/request?filter=all');
+    assert.equal(eligible.status, 200);
+    const row = eligible.body.results.find(
+      (r: { id: number }) => r.id === created.id
+    );
+    assert.equal(row.canRemove, true);
+    assert.equal(row.target.canRemove, true);
+    assert.equal(
+      (await admin.get(`/request/${created.id}`)).body.target.canRemove,
+      true
+    );
+    getSettings().radarr = [];
+    const removed = await admin.get('/request?filter=all');
+    const removedRow = removed.body.results.find(
+      (r: { id: number }) => r.id === created.id
+    );
+    assert.equal(removedRow.target.deleted, true);
+    assert.equal(removedRow.target.canRemove, false);
+    assert.equal(removedRow.canRemove, false);
+  });
+
+  it('retains legacy native removal eligibility', async (t) => {
+    t.mock.method(
+      axios,
+      'create',
+      () =>
+        ({
+          interceptors: { request: { use: () => 0 } },
+          get: async () => ({ data: [] }),
+        }) as unknown as AxiosInstance
+    );
+    configureRadarr([{ id: 1 }]);
+    const created = await seedRequest(MediaRequestStatus.COMPLETED);
+    await getRepository(Media).update(created.media.id, { serviceId: 1 });
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const response = await admin.get('/request?filter=all');
+    assert.equal(
+      response.body.results.find((r: { id: number }) => r.id === created.id)
+        .canRemove,
+      true
+    );
   });
 });

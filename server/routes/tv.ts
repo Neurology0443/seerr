@@ -14,6 +14,7 @@ import { enrichQuickRequestVisibility } from '@server/lib/quickRequestVisibility
 import {
   classifyActiveRequestTargets,
   getConfiguredRequestTargetState,
+  getRequestTargetState,
   serializeMediaRequest,
 } from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
@@ -64,49 +65,70 @@ tvRoutes.get<{ id: string }, TvRequestTarget[]>(
         mediaRepository.manager
       );
 
-      const targets = settings.sonarr.map((server) => {
-        const destination = destinations.find(
-          (candidate) => candidate.serverId === server.id
-        );
-        const seasons = seasonNumbers.map((seasonNumber) => {
-          const state = getConfiguredRequestTargetState({
+      const targets = await Promise.all(
+        settings.sonarr.map(async (server) => {
+          const destination = destinations.find(
+            (candidate) => candidate.serverId === server.id
+          );
+          const seasons = seasonNumbers.map((seasonNumber) => {
+            const state = getConfiguredRequestTargetState({
+              server,
+              destinationStatus: destinationSeasons.find(
+                (season) =>
+                  season.destinationStatusId === destination?.id &&
+                  season.seasonNumber === seasonNumber
+              )?.status,
+              nativeStatus: media?.seasons?.find(
+                (season) => season.seasonNumber === seasonNumber
+              )?.[server.is4k ? 'status4k' : 'status'],
+              activeRequests,
+              seasonNumber,
+            });
+
+            return {
+              seasonNumber,
+              status: state.status,
+              requestable: state.requestable,
+            };
+          });
+          const parentState = getConfiguredRequestTargetState({
+            media: media ?? undefined,
             server,
-            destinationStatus: destinationSeasons.find(
-              (season) =>
-                season.destinationStatusId === destination?.id &&
-                season.seasonNumber === seasonNumber
-            )?.status,
-            nativeStatus: media?.seasons?.find(
-              (season) => season.seasonNumber === seasonNumber
-            )?.[server.is4k ? 'status4k' : 'status'],
+            destinationStatus: destination?.status,
             activeRequests,
-            seasonNumber,
           });
 
+          const management =
+            media && server.independentRequestDestination === true
+              ? await getRequestTargetState(
+                  {
+                    type: media.mediaType,
+                    serverId: server.id,
+                    is4k: Boolean(server.is4k),
+                    media,
+                  },
+                  mediaRepository.manager,
+                  req.user
+                )
+              : null;
           return {
-            seasonNumber,
-            status: state.status,
-            requestable: state.requestable,
+            ...(parentState.isIndependent
+              ? {
+                  canRemove: management?.canRemove ?? false,
+                  serviceUrl: management?.serviceUrl,
+                }
+              : {}),
+            serverId: server.id,
+            name: server.name,
+            is4k: Boolean(server.is4k),
+            isDefault: Boolean(server.isDefault),
+            isIndependent: parentState.isIndependent,
+            status: parentState.status,
+            requestable: seasons.some((season) => season.requestable),
+            seasons,
           };
-        });
-        const parentState = getConfiguredRequestTargetState({
-          media: media ?? undefined,
-          server,
-          destinationStatus: destination?.status,
-          activeRequests,
-        });
-
-        return {
-          serverId: server.id,
-          name: server.name,
-          is4k: Boolean(server.is4k),
-          isDefault: Boolean(server.isDefault),
-          isIndependent: parentState.isIndependent,
-          status: parentState.status,
-          requestable: seasons.some((season) => season.requestable),
-          seasons,
-        };
-      });
+        })
+      );
 
       return res.status(200).json(targets);
     } catch (e) {
@@ -156,7 +178,7 @@ tvRoutes.get('/:id', async (req, res, next) => {
     if (data.mediaInfo) {
       data.mediaInfo.requests = await Promise.all(
         data.mediaInfo.requests.map((request) =>
-          serializeMediaRequest(request, getRepository(Media).manager)
+          serializeMediaRequest(request, getRepository(Media).manager, req.user)
         )
       );
     }

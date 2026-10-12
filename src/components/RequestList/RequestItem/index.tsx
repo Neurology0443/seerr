@@ -52,6 +52,8 @@ const messages = defineMessages('components.RequestList.RequestItem', {
   tvdbid: 'TheTVDB ID',
   unknowntitle: 'Unknown Title',
   removearr: 'Remove from {arr}',
+  removeDestinationConfirm:
+    'Remove this {mediaType} and its files from {arr} destination "{name}"?',
   removemediaerror: 'Something went wrong while removing the media.',
   profileName: 'Profile',
 });
@@ -330,6 +332,8 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
       refreshInterval: requestRefreshInterval,
     });
 
+  const removalTarget = requestData?.target ?? request.target;
+
   const [isRetrying, setRetrying] = useState(false);
   const [updatingType, setUpdatingType] = useState<
     'approve' | 'decline' | null
@@ -368,13 +372,17 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
   };
 
   const deleteMediaFile = async () => {
-    if (request.media) {
+    if (request.media && hasPermission(Permission.MANAGE_REQUESTS)) {
       try {
         await axios.delete(
-          `/api/v1/media/${request.media.id}/file?is4k=${request.is4k}`
+          `/api/v1/media/${request.media.id}/file?${removalTarget?.isIndependent ? `serverId=${removalTarget.serverId}` : `is4k=${request.is4k}`}`
         );
       } catch (e) {
-        if (!axios.isAxiosError(e) || e.response?.status !== 404) {
+        if (
+          removalTarget?.isIndependent ||
+          !axios.isAxiosError(e) ||
+          e.response?.status !== 404
+        ) {
           addToast(intl.formatMessage(messages.removemediaerror), {
             autoDismiss: true,
             appearance: 'error',
@@ -384,6 +392,11 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
         }
       }
       revalidateList();
+      revalidateRequestData({
+        mediaType: request.type,
+        tmdbId: request.media.tmdbId,
+        requestId: request.id,
+      });
     }
   };
 
@@ -729,20 +742,42 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                   <TrashIcon />
                   <span>{intl.formatMessage(messages.deleterequest)}</span>
                 </ConfirmButton>
-                {request.canRemove && (
-                  <ConfirmButton
-                    onClick={() => deleteMediaFile()}
-                    confirmText={intl.formatMessage(globalMessages.areyousure)}
-                    className="w-full"
-                  >
-                    <TrashIcon />
-                    <span>
-                      {intl.formatMessage(messages.removearr, {
-                        arr: request.type === 'movie' ? 'Radarr' : 'Sonarr',
-                      })}
-                    </span>
-                  </ConfirmButton>
-                )}
+                {(removalTarget?.isIndependent
+                  ? removalTarget.canRemove
+                  : request.canRemove) &&
+                  !removalTarget?.deleted && (
+                    <ConfirmButton
+                      onClick={() => deleteMediaFile()}
+                      confirmText={
+                        removalTarget?.isIndependent
+                          ? intl.formatMessage(
+                              messages.removeDestinationConfirm,
+                              {
+                                mediaType:
+                                  request.type === 'movie' ? 'movie' : 'series',
+                                arr:
+                                  request.type === 'movie'
+                                    ? 'Radarr'
+                                    : 'Sonarr',
+                                name: removalTarget.name,
+                              }
+                            )
+                          : intl.formatMessage(globalMessages.areyousure)
+                      }
+                      className={
+                        removalTarget?.isIndependent
+                          ? 'min-h-20 w-full'
+                          : 'w-full'
+                      }
+                    >
+                      <TrashIcon />
+                      <span>
+                        {intl.formatMessage(messages.removearr, {
+                          arr: request.type === 'movie' ? 'Radarr' : 'Sonarr',
+                        })}
+                      </span>
+                    </ConfirmButton>
+                  )}
               </>
             )}
           {requestData.status === MediaRequestStatus.PENDING &&

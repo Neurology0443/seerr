@@ -12,6 +12,7 @@ import { enrichQuickRequestVisibility } from '@server/lib/quickRequestVisibility
 import {
   classifyActiveRequestTargets,
   getConfiguredRequestTargetState,
+  getRequestTargetState,
   serializeMediaRequest,
 } from '@server/lib/requestTargetState';
 import { getSettings } from '@server/lib/settings';
@@ -44,26 +45,47 @@ movieRoutes.get<{ id: string }, MovieRequestTarget[]>(
         mediaRepository.manager
       );
 
-      const targets = getSettings().radarr.map((server) => {
-        const state = getConfiguredRequestTargetState({
-          media: media ?? undefined,
-          server,
-          destinationStatus: destinations.find(
-            (destination) => destination.serverId === server.id
-          )?.status,
-          activeRequests,
-        });
+      const targets = await Promise.all(
+        getSettings().radarr.map(async (server) => {
+          const state = getConfiguredRequestTargetState({
+            media: media ?? undefined,
+            server,
+            destinationStatus: destinations.find(
+              (destination) => destination.serverId === server.id
+            )?.status,
+            activeRequests,
+          });
 
-        return {
-          serverId: server.id,
-          name: server.name,
-          is4k: Boolean(server.is4k),
-          isDefault: Boolean(server.isDefault),
-          isIndependent: state.isIndependent,
-          status: state.status,
-          requestable: state.requestable,
-        };
-      });
+          const management =
+            media && server.independentRequestDestination === true
+              ? await getRequestTargetState(
+                  {
+                    type: media.mediaType,
+                    serverId: server.id,
+                    is4k: Boolean(server.is4k),
+                    media,
+                  },
+                  mediaRepository.manager,
+                  req.user
+                )
+              : null;
+          return {
+            ...(state.isIndependent
+              ? {
+                  canRemove: management?.canRemove ?? false,
+                  serviceUrl: management?.serviceUrl,
+                }
+              : {}),
+            serverId: server.id,
+            name: server.name,
+            is4k: Boolean(server.is4k),
+            isDefault: Boolean(server.isDefault),
+            isIndependent: state.isIndependent,
+            status: state.status,
+            requestable: state.requestable,
+          };
+        })
+      );
 
       return res.status(200).json(targets);
     } catch (e) {
@@ -110,7 +132,7 @@ movieRoutes.get('/:id', async (req, res, next) => {
     if (data.mediaInfo) {
       data.mediaInfo.requests = await Promise.all(
         data.mediaInfo.requests.map((request) =>
-          serializeMediaRequest(request, getRepository(Media).manager)
+          serializeMediaRequest(request, getRepository(Media).manager, req.user)
         )
       );
     }

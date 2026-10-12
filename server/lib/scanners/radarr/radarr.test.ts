@@ -10,13 +10,27 @@ import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import MediaRequest from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
+import * as destinationAvailability from '@server/lib/destinationAvailability';
+import { persistConfirmedDestinationRemoval } from '@server/lib/destinationRemoval';
+import { Notification } from '@server/lib/notifications';
 import { radarrScanner } from '@server/lib/scanners/radarr';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import mediaRoutes from '@server/routes/media';
+import settingsRoutes from '@server/routes/settings/radarr';
 import { setupTestDb } from '@server/test/db';
+import {
+  removalSnapshot,
+  seedRemoval,
+} from '@server/test/fixtures/destinationRemoval';
 import { runWithMockTimers } from '@server/test/runWithMockTimers';
+import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
+import * as dvrIdentityLocks from '@server/utils/dvrIdentityLock';
+import axios, { type AxiosInstance } from 'axios';
+import express from 'express';
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it, mock } from 'node:test';
+import request from 'supertest';
 
 let getMoviesImpl: () => Promise<RadarrMovie[]> = async () => [];
 Object.defineProperty(RadarrAPI.prototype, 'getMovies', {
@@ -729,6 +743,474 @@ describe('Radarr Scanner', () => {
   });
 
   describe('independent destination scanning', () => {
+    it('clears previous endpoint availability before an empty scan and rebuilds it only from fresh observations', async (t) => {
+      const { media } = await seedRemoval(MediaType.MOVIE);
+      const settings = getSettings();
+      const connectionA = { ...settings.radarr[1] };
+      settings.radarr = [connectionA];
+      t.mock.method(settings, 'save', async () => undefined);
+      const before = await removalSnapshot();
+      const notifications = sendNotificationMock.mock.callCount();
+      const app = express();
+      app.use(express.json());
+      app.use('/settings', settingsRoutes);
+      assert.equal(
+        (
+          await request(app)
+            .put('/settings/2')
+            .send({ ...connectionA, hostname: 'replacement' })
+        ).status,
+        200
+      );
+      const invalidated = await removalSnapshot();
+      assert.deepEqual(invalidated.media, before.media);
+      assert.deepEqual(invalidated.destinations[0], before.destinations[0]);
+      assert.deepEqual(invalidated.requests, before.requests);
+      assert.deepEqual(invalidated.seasonRequests, before.seasonRequests);
+      assert.equal(invalidated.destinations[1].status, MediaStatus.UNKNOWN);
+      assert.equal(invalidated.destinations[1].externalServiceId, null);
+      assert.equal(invalidated.destinations[1].externalServiceSlug, null);
+
+      getMoviesImpl = async () => [];
+      await runWithMockTimers(() => radarrScanner.run());
+      assert.deepEqual(await removalSnapshot(), invalidated);
+      assert.equal(sendNotificationMock.mock.callCount(), notifications);
+
+      getMoviesImpl = async () => [
+        fakeRadarrMovie({
+          id: 42,
+          tmdbId: media.tmdbId,
+          titleSlug: 'replacement-media',
+        }),
+      ];
+      await runWithMockTimers(() => radarrScanner.run());
+      const fresh = await removalSnapshot();
+      assert.deepEqual(fresh.media, before.media);
+      assert.deepEqual(fresh.destinations[0], before.destinations[0]);
+      assert.equal(fresh.destinations[1].status, MediaStatus.AVAILABLE);
+      assert.equal(fresh.destinations[1].externalServiceId, 42);
+      assert.equal(
+        fresh.destinations[1].externalServiceSlug,
+        'replacement-media'
+      );
+
+      assert.equal(fresh.requests[2].status, MediaRequestStatus.COMPLETED);
+    });
+
+    for (const cleanup of [false, true]) {
+      for (const restored of [false, true]) {
+        it(
+          `rejects superseded connection observations and allows a fresh scan (cleanup: ${cleanup}, restored: ${restored})`,
+          { timeout: 10000 },
+          async (t) => {
+            const { media, destinations, requests } = await seedRemoval(
+              MediaType.MOVIE
+            );
+            const settings = getSettings();
+            const connectionA = { ...settings.radarr[1] };
+            settings.radarr = [connectionA];
+            t.mock.method(settings, 'save', async () => undefined);
+            await getRepository(MediaRequest).delete(requests[1].id);
+            await getRepository(MediaDestinationStatus).update(
+              destinations[1].id,
+              { status: MediaStatus.PROCESSING }
+            );
+
+            const before = await removalSnapshot();
+            const notifications = sendNotificationMock.mock.callCount();
+            let captured!: () => void;
+            let release!: () => void;
+            const fetched = new Promise<void>((resolve) => {
+              captured = resolve;
+            });
+            const resumed = new Promise<void>((resolve) => {
+              release = resolve;
+            });
+            t.after(() => release());
+            const inventory = cleanup
+              ? [fakeRadarrMovie({ id: 999, tmdbId: 999 })]
+              : [fakeRadarrMovie({ id: 42, tmdbId: media.tmdbId })];
+            getMoviesImpl = async () => {
+              captured();
+              await resumed;
+              return inventory;
+            };
+            const scanning = runWithMockTimers(() => radarrScanner.run());
+            await fetched;
+            const app = express();
+            app.use(express.json());
+            app.use('/settings', settingsRoutes);
+            assert.equal(
+              (
+                await request(app)
+                  .put('/settings/2')
+                  .send({
+                    ...connectionA,
+                    hostname: 'connection-b',
+                    apiKey: 'key-b',
+                  })
+              ).status,
+              200
+            );
+            if (restored)
+              assert.equal(
+                (await request(app).put('/settings/2').send(connectionA))
+                  .status,
+                200
+              );
+            const invalidated = await removalSnapshot();
+            release();
+            await scanning;
+            assert.deepEqual(await removalSnapshot(), invalidated);
+            assert.equal(
+              invalidated.destinations[1].status,
+              MediaStatus.UNKNOWN
+            );
+            assert.equal(invalidated.destinations[1].externalServiceId, null);
+            assert.deepEqual(invalidated.requests, before.requests);
+            assert.deepEqual(invalidated.seasonRequests, before.seasonRequests);
+            assert.equal(sendNotificationMock.mock.callCount(), notifications);
+            getMoviesImpl = async () => inventory;
+            await runWithMockTimers(() => radarrScanner.run());
+            const after = await removalSnapshot();
+            assert.deepEqual(
+              after.media.find((row) => row.id === media.id),
+              before.media.find((row) => row.id === media.id)
+            );
+            assert.deepEqual(after.destinations[0], before.destinations[0]);
+            assert.equal(
+              after.requests[0].status,
+              cleanup
+                ? MediaRequestStatus.APPROVED
+                : MediaRequestStatus.COMPLETED
+            );
+            if (cleanup)
+              assert.equal(after.destinations[1].status, MediaStatus.UNKNOWN);
+            else assert.equal(after.destinations[1].externalServiceId, 42);
+            assert.equal(
+              sendNotificationMock.mock.callCount(),
+              notifications + (cleanup ? 0 : 1)
+            );
+          }
+        );
+      }
+    }
+
+    it(
+      'rejects orphan reconciliation when the connection changes during exact lookup',
+      { timeout: 10000 },
+      async (t) => {
+        const { media, destinations, requests } = await seedRemoval(
+          MediaType.MOVIE
+        );
+        const settings = getSettings();
+        const connectionA = { ...settings.radarr[1] };
+        settings.radarr = [connectionA];
+        t.mock.method(settings, 'save', async () => undefined);
+        await getRepository(MediaDestinationStatus).update(destinations[1].id, {
+          status: MediaStatus.PROCESSING,
+        });
+        getMoviesImpl = async () => [fakeRadarrMovie({ id: 999, tmdbId: 999 })];
+        let lookedUp!: () => void;
+        let release!: () => void;
+        const entered = new Promise<void>((resolve) => {
+          lookedUp = resolve;
+        });
+        const resumed = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        t.after(() => release());
+        getLibraryMoviesByTmdbIdImpl = async () => {
+          lookedUp();
+          await resumed;
+          return [];
+        };
+        const notifications = sendNotificationMock.mock.callCount();
+        const scanning = runWithMockTimers(() => radarrScanner.run());
+        await entered;
+        const before = await removalSnapshot();
+        const app = express();
+        app.use(express.json());
+        app.use('/settings', settingsRoutes);
+        assert.equal(
+          (
+            await request(app)
+              .put('/settings/2')
+              .send({ ...connectionA, apiKey: 'connection-b' })
+          ).status,
+          200
+        );
+        release();
+        await scanning;
+        assert.deepEqual(await removalSnapshot(), before);
+        assert.equal(sendNotificationMock.mock.callCount(), notifications);
+        assert.equal(
+          (
+            await getRepository(MediaRequest).findOneByOrFail({
+              id: requests[0].id,
+            })
+          ).status,
+          MediaRequestStatus.APPROVED
+        );
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              mediaId: media.id,
+              serverId: 2,
+            })
+          ).externalServiceId,
+          12
+        );
+      }
+    );
+
+    it(
+      'keeps scanner freshness validation and persistence atomic with connection replacement',
+      { timeout: 10000 },
+      async (t) => {
+        const { media } = await seedRemoval(MediaType.MOVIE);
+        const settings = getSettings();
+        const connectionA = { ...settings.radarr[1] };
+        settings.radarr = [connectionA];
+        t.mock.method(settings, 'save', async () => undefined);
+
+        getMoviesImpl = async () => [
+          fakeRadarrMovie({ id: 42, tmdbId: media.tmdbId }),
+        ];
+        let writing!: () => void;
+        let release!: () => void;
+        const entered = new Promise<void>((resolve) => {
+          writing = resolve;
+        });
+        const resumed = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        t.after(() => release());
+        const originalUpdate =
+          destinationAvailability.updateIndependentMovieDestination;
+        t.mock.method(
+          destinationAvailability,
+          'updateIndependentMovieDestination',
+          async (...args: Parameters<typeof originalUpdate>) => {
+            writing();
+            await resumed;
+            assert.equal(settings.radarr[0].hostname, connectionA.hostname);
+            const result = await originalUpdate(...args);
+            assert.equal(result.destination.externalServiceId, 42);
+            return result;
+          }
+        );
+        const scanning = runWithMockTimers(() => radarrScanner.run());
+        await entered;
+        let attempted!: () => void;
+        const queued = new Promise<void>((resolve) => {
+          attempted = resolve;
+        });
+        const originalLock = dvrIdentityLocks.withDvrIdentityLock;
+        t.mock.method(
+          dvrIdentityLocks,
+          'withDvrIdentityLock',
+          (...args: Parameters<typeof originalLock>) => {
+            attempted();
+            return originalLock(...args);
+          }
+        );
+        const app = express();
+        app.use(express.json());
+        app.use('/settings', settingsRoutes);
+        let settled = false;
+        const changing = request(app)
+          .put('/settings/2')
+          .send({ ...connectionA, hostname: 'connection-b' })
+          .then((res) => {
+            settled = true;
+            return res;
+          });
+        await queued;
+        assert.equal(settled, false);
+        release();
+        await scanning;
+        assert.equal((await changing).status, 200);
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              mediaId: media.id,
+              serverId: 2,
+            })
+          ).externalServiceId,
+          null
+        );
+        assert.equal(settings.radarr[0].hostname, 'connection-b');
+      }
+    );
+
+    it('commits reconciliation and releases the destination before notification delivery and explicit removal', async (t) => {
+      const { media, destinations, requests } = await seedRemoval(
+        MediaType.MOVIE
+      );
+      configureRadarr([{ id: 2, independentRequestDestination: true }]);
+      await getRepository(MediaRequest).delete(requests[1].id);
+      await getRepository(MediaDestinationStatus).update(destinations[1].id, {
+        status: MediaStatus.PROCESSING,
+      });
+
+      getMoviesImpl = async () => [fakeRadarrMovie({ id: 999, tmdbId: 999 })];
+      let entered!: () => void;
+      let release!: () => void;
+      const notifying = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const delivered = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      t.after(() => release());
+      const notify = t.mock.method(
+        MediaRequest,
+        'sendNotification',
+        async (
+          declined: MediaRequest,
+          _media: Media,
+          notification: Notification
+        ) => {
+          assert.equal(notification, Notification.MEDIA_DECLINED);
+          assert.equal(declined.id, requests[0].id);
+          assert.equal(
+            (
+              await getRepository(MediaRequest).findOneByOrFail({
+                id: declined.id,
+              })
+            ).status,
+            MediaRequestStatus.DECLINED
+          );
+          assert.equal(
+            (
+              await getRepository(MediaDestinationStatus).findOneByOrFail({
+                id: destinations[1].id,
+              })
+            ).status,
+            MediaStatus.UNKNOWN
+          );
+          assert.equal(
+            getRepository(Media).manager.queryRunner?.isTransactionActive ??
+              false,
+            false
+          );
+          entered();
+          await delivered;
+          throw new Error('notification delivery failed');
+        }
+      );
+      t.mock.method(
+        axios,
+        'create',
+        () =>
+          ({
+            interceptors: {
+              request: { use: () => 0 },
+              response: { use: () => 0 },
+            },
+            get: async () => ({ data: { id: 12, tmdbId: 550, tvdbId: 1234 } }),
+            delete: async () => ({}),
+          }) as unknown as AxiosInstance
+      );
+      const app = express();
+      app.use(async (req, _res, next) => {
+        req.user = await getRepository(User).findOneByOrFail({ id: 1 });
+        next();
+      });
+      app.use('/media', mediaRoutes);
+      const scanning = runWithMockTimers(() => radarrScanner.run());
+      await notifying;
+      try {
+        assert.equal(
+          (await request(app).delete(`/media/${media.id}/file?serverId=2`))
+            .status,
+          204
+        );
+        const removed = await getRepository(
+          MediaDestinationStatus
+        ).findOneByOrFail({ id: destinations[1].id });
+        assert.equal(removed.status, MediaStatus.DELETED);
+        assert.equal(removed.externalServiceId, null);
+      } finally {
+        release();
+      }
+      await scanning;
+      assert.equal(notify.mock.callCount(), 1);
+      assert.equal(
+        (
+          await getRepository(MediaRequest).findOneByOrFail({
+            id: requests[0].id,
+          })
+        ).status,
+        MediaRequestStatus.DECLINED
+      );
+      await runWithMockTimers(() => radarrScanner.run());
+      assert.equal(notify.mock.callCount(), 1);
+    });
+
+    it('rejects inventory fetched before removal, but allows fresh exact rediscovery', async () => {
+      const { media } = await seedRemoval();
+      configureRadarr([
+        { id: 2, hostname: 'radarr-en', independentRequestDestination: true },
+      ]);
+      const initialNotifications = sendNotificationMock.mock.callCount();
+      const before = await removalSnapshot();
+      let captured!: () => void;
+      const inventoryCaptured = new Promise<void>((resolve) => {
+        captured = resolve;
+      });
+      let resume!: () => void;
+      const resumed = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      getMoviesImpl = async () => {
+        const inventory = [fakeRadarrMovie({ id: 12, tmdbId: media.tmdbId })];
+        captured();
+        await resumed;
+        return inventory;
+      };
+      const scanning = runWithMockTimers(() => radarrScanner.run());
+      await inventoryCaptured;
+      try {
+        await withDestinationOperationLock(
+          MediaType.MOVIE,
+          media.tmdbId,
+          2,
+          () =>
+            persistConfirmedDestinationRemoval(
+              media.id,
+              2,
+              getRepository(Media).manager
+            )
+        );
+      } finally {
+        resume();
+      }
+      await scanning;
+      assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
+      const after = await removalSnapshot();
+      assert.equal(after.destinations[1].status, MediaStatus.DELETED);
+      assert.equal(after.destinations[1].externalServiceId, null);
+      assert.equal(after.destinations[1].externalServiceSlug, null);
+      assert.deepEqual(after.media, before.media);
+      assert.deepEqual(after.destinations[0], before.destinations[0]);
+      assert.equal(after.requests[0].status, MediaRequestStatus.DECLINED);
+      getMoviesImpl = async () => [
+        fakeRadarrMovie({
+          id: 42,
+          tmdbId: media.tmdbId,
+          titleSlug: 're-added',
+        }),
+      ];
+      await runWithMockTimers(() => radarrScanner.run());
+      const fresh = await removalSnapshot();
+      assert.equal(fresh.destinations[1].status, MediaStatus.AVAILABLE);
+      assert.equal(fresh.destinations[1].externalServiceId, 42);
+      assert.equal(fresh.destinations[1].externalServiceSlug, 're-added');
+      assert.equal(fresh.requests[0].status, MediaRequestStatus.DECLINED);
+    });
+
     it('scans canonically equivalent native configurations separately under upstream raw deduplication', async () => {
       configureRadarr([
         { id: 8, hostname: 'localhost', port: 7878, baseUrl: '' },

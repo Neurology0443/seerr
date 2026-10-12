@@ -117,3 +117,124 @@ describe('RadarrAPI getMovieByTmdbId', () => {
     });
   });
 });
+
+describe('RadarrAPI exact destination removal', () => {
+  afterEach(() => mock.restoreAll());
+
+  it('uses and verifies the preferred record before deleting files', async () => {
+    const api = buildRadarr();
+    const get = mock.method(getAxios(api), 'get', async () => ({
+      data: { id: 7, tmdbId: 550 },
+    }));
+    const del = mock.method(getAxios(api), 'delete', async () => ({}));
+    await api.removeMovieFromDestination(550, 7);
+    assert.equal(get.mock.calls[0].arguments[0], '/movie/7');
+    assert.deepEqual(del.mock.calls[0].arguments, [
+      '/movie/7',
+      { params: { deleteFiles: true, addImportExclusion: false } },
+    ]);
+  });
+
+  it('rejects a stale linkage to another identity without deleting', async () => {
+    const api = buildRadarr();
+    mock.method(getAxios(api), 'get', async () => ({
+      data: { id: 7, tmdbId: 999 },
+    }));
+    const del = mock.method(getAxios(api), 'delete', async () => ({}));
+    await assert.rejects(
+      () => api.removeMovieFromDestination(550, 7),
+      /identity mismatch/
+    );
+    assert.equal(del.mock.callCount(), 0);
+  });
+
+  it('confirms absence using the library after a stale record returns 404', async () => {
+    const api = buildRadarr();
+    const get = mock.method(getAxios(api), 'get', async (url: string) => {
+      if (url === '/movie/7') throw { response: { status: 404 } };
+      return { data: [] };
+    });
+    const del = mock.method(getAxios(api), 'delete', async () => ({}));
+    await api.removeMovieFromDestination(550, 7);
+    assert.equal(get.mock.callCount(), 2);
+    assert.deepEqual(get.mock.calls[1].arguments, [
+      '/movie',
+      { params: { tmdbId: 550 } },
+    ]);
+    assert.equal(del.mock.callCount(), 0);
+  });
+
+  it('uses an authoritative library record when no linkage remains', async () => {
+    const api = buildRadarr();
+    mock.method(getAxios(api), 'get', async () => ({
+      data: [{ id: 9, tmdbId: 550 }],
+    }));
+    const del = mock.method(getAxios(api), 'delete', async () => ({}));
+    await api.removeMovieFromDestination(550, null);
+    assert.equal(del.mock.calls[0].arguments[0], '/movie/9');
+  });
+
+  it('accepts a DELETE 404 only after record identity is verified', async () => {
+    const api = buildRadarr();
+    mock.method(getAxios(api), 'get', async () => ({
+      data: { id: 7, tmdbId: 550 },
+    }));
+    mock.method(getAxios(api), 'delete', async () => {
+      throw { response: { status: 404 } };
+    });
+    await assert.doesNotReject(() => api.removeMovieFromDestination(550, 7));
+  });
+
+  for (const data of [
+    undefined,
+    null,
+    {},
+    [{ id: 0, tmdbId: 550 }],
+    [{ id: 7 }],
+    [
+      { id: 7, tmdbId: 550 },
+      { id: 8, tmdbId: 550 },
+    ],
+  ]) {
+    it(`rejects inconclusive library results ${JSON.stringify(data)}`, async () => {
+      const api = buildRadarr();
+      mock.method(getAxios(api), 'get', async () => ({ data }));
+      const del = mock.method(getAxios(api), 'delete', async () => ({}));
+      await assert.rejects(() => api.removeMovieFromDestination(550, null));
+      assert.equal(del.mock.callCount(), 0);
+    });
+  }
+
+  for (const failure of [
+    { code: 'ETIMEDOUT' },
+    { code: 'ECONNRESET' },
+    ...[401, 403, 404, 500, 503].map((status) => ({ response: { status } })),
+  ]) {
+    it(`propagates failed library lookups ${JSON.stringify(failure)}`, async () => {
+      const api = buildRadarr();
+      mock.method(getAxios(api), 'get', async () => {
+        throw failure;
+      });
+      const del = mock.method(getAxios(api), 'delete', async () => ({}));
+      await assert.rejects(() => api.removeMovieFromDestination(550, null));
+      assert.equal(del.mock.callCount(), 0);
+    });
+  }
+
+  for (const failure of [
+    { code: 'ETIMEDOUT' },
+    { code: 'ECONNRESET' },
+    ...[401, 403, 500].map((status) => ({ response: { status } })),
+  ]) {
+    it(`propagates DELETE failures ${JSON.stringify(failure)}`, async () => {
+      const api = buildRadarr();
+      mock.method(getAxios(api), 'get', async () => ({
+        data: { id: 7, tmdbId: 550 },
+      }));
+      mock.method(getAxios(api), 'delete', async () => {
+        throw failure;
+      });
+      await assert.rejects(() => api.removeMovieFromDestination(550, 7));
+    });
+  }
+});

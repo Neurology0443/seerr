@@ -7,6 +7,9 @@ import Tooltip from '@app/components/Common/Tooltip';
 import DownloadBlock from '@app/components/DownloadBlock';
 import IssueBlock from '@app/components/IssueBlock';
 import RequestBlock from '@app/components/RequestBlock';
+import useRequestTargets, {
+  revalidateRequestData,
+} from '@app/hooks/useRequestTargets';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
@@ -59,6 +62,11 @@ const messages = defineMessages('components.ManageSlideOver', {
   manageModalClearMedia: 'Clear Data',
   manageModalClearMediaWarning:
     '* This will irreversibly remove all data for this {mediaType}, including any requests. If this item exists in your {mediaServerName} library, the media information will be recreated during the next scan.',
+  manageModalClearDestinationWarning:
+    'This also purges multi-destination tracking data. Clear Data does not delete media files from Radarr/Sonarr.',
+  removeDestinationConfirm:
+    'Remove this {mediaType} and its files from {arr} destination "{name}"?',
+  standard: 'Standard',
   manageModalRemoveMediaWarning:
     '* This will irreversibly remove this {mediaType} from {arr}, including all files.',
   openarr: 'Open in {arr}',
@@ -114,6 +122,7 @@ const ManageSlideOver = ({
   const intl = useIntl();
   const { addToast } = useToasts();
   const settings = useSettings();
+  const { targets } = useRequestTargets(mediaType, data.id);
   const { data: watchData } = useSWR<MediaWatchDataResponse>(
     settings.currentSettings.mediaServerType === MediaServerType.PLEX &&
       data.mediaInfo &&
@@ -143,14 +152,18 @@ const ManageSlideOver = ({
     }
   };
 
-  const deleteMediaFile = async (is4k = false) => {
-    if (data.mediaInfo) {
+  const deleteMediaFile = async (is4k = false, serverId?: number) => {
+    if (data.mediaInfo && hasPermission(Permission.MANAGE_REQUESTS)) {
       try {
         await axios.delete(
-          `/api/v1/media/${data.mediaInfo.id}/file?is4k=${is4k}`
+          `/api/v1/media/${data.mediaInfo.id}/file?${serverId !== undefined ? `serverId=${serverId}` : `is4k=${is4k}`}`
         );
       } catch (e) {
-        if (!axios.isAxiosError(e) || e.response?.status !== 404) {
+        if (
+          serverId !== undefined ||
+          !axios.isAxiosError(e) ||
+          e.response?.status !== 404
+        ) {
           addToast(intl.formatMessage(messages.removemediaerror), {
             appearance: 'error',
             autoDismiss: true,
@@ -158,6 +171,9 @@ const ManageSlideOver = ({
           revalidate();
           return;
         }
+      }
+      if (serverId !== undefined) {
+        revalidateRequestData({ mediaType, tmdbId: data.id });
       }
       revalidate();
       onClose();
@@ -673,6 +689,67 @@ const ManageSlideOver = ({
               </div>
             </div>
           )}
+        {hasPermission(Permission.MANAGE_REQUESTS) &&
+          targets
+            ?.filter(
+              (target) =>
+                target.isIndependent &&
+                (target.status !== MediaStatus.UNKNOWN ||
+                  target.serviceUrl ||
+                  target.canRemove)
+            )
+            .map((target) => (
+              <div key={target.serverId} data-testid="manage-destination">
+                <h3 className="mb-2 text-xl font-bold">
+                  {target.name} (
+                  {target.is4k ? '4K' : intl.formatMessage(messages.standard)})
+                </h3>
+                <div className="space-y-2">
+                  {target.serviceUrl && (
+                    <a
+                      href={target.serviceUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="block"
+                    >
+                      <Button buttonType="ghost" className="w-full">
+                        <ServerIcon />
+                        <span>
+                          {intl.formatMessage(messages.openarr, {
+                            arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+                          })}
+                        </span>
+                      </Button>
+                    </a>
+                  )}
+                  {target.canRemove && (
+                    <ConfirmButton
+                      onClick={() => deleteMediaFile(false, target.serverId)}
+                      confirmText={intl.formatMessage(
+                        messages.removeDestinationConfirm,
+                        {
+                          mediaType: intl.formatMessage(
+                            mediaType === 'movie'
+                              ? messages.movie
+                              : messages.tvshow
+                          ),
+                          arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+                          name: target.name,
+                        }
+                      )}
+                      className="min-h-20 w-full"
+                    >
+                      <TrashIcon />
+                      <span>
+                        {intl.formatMessage(messages.removearr, {
+                          arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+                        })}
+                      </span>
+                    </ConfirmButton>
+                  )}
+                </div>
+              </div>
+            ))}
         {hasPermission(Permission.ADMIN) &&
           data?.mediaInfo &&
           data.mediaInfo.status !== MediaStatus.BLOCKLISTED && (
@@ -738,7 +815,10 @@ const ManageSlideOver = ({
                               MediaServerType.PLEX
                             ? 'Plex'
                             : 'Jellyfin',
-                    })}
+                    })}{' '}
+                    {intl.formatMessage(
+                      messages.manageModalClearDestinationWarning
+                    )}
                   </div>
                 </div>
               </div>

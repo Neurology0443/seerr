@@ -15,6 +15,7 @@ import {
   findIndependentDestinationCandidates,
   markMissingTvDestination,
   notifyAvailableRequests,
+  notifyDeclinedRequests,
   updateIndependentTvDestination,
 } from '@server/lib/destinationAvailability';
 import type {
@@ -26,6 +27,11 @@ import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { findAmbiguousIndependentDvrServerIds } from '@server/lib/settings/dvrValidation';
+import {
+  beginDestinationScan,
+  withDestinationOperationLock,
+} from '@server/utils/destinationOperationLock';
+import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -62,6 +68,7 @@ class SonarrScanner
   }
 
   public async run(): Promise<void> {
+    let destinationScan: ReturnType<typeof beginDestinationScan> | undefined;
     const settings = getSettings();
     const sessionId = this.startRun();
     this.scannedTvdbIds.clear();
@@ -94,7 +101,16 @@ class SonarrScanner
           sonarrA.baseUrl === sonarrB.baseUrl
       );
 
-      for (const server of this.servers) {
+      for (const configuredServer of this.servers) {
+        const server =
+          configuredServer.independentRequestDestination === true
+            ? getSettings().sonarr.find(
+                (current) =>
+                  current.id === configuredServer.id &&
+                  current.independentRequestDestination === true
+              )
+            : configuredServer;
+        if (!server) continue;
         this.currentServer = server;
         if (server.syncEnabled) {
           this.log(
@@ -107,6 +123,10 @@ class SonarrScanner
             url: SonarrAPI.buildUrl(server, '/api/v3'),
           });
 
+          destinationScan =
+            server.independentRequestDestination === true
+              ? beginDestinationScan(MediaType.TV, server.id, server)
+              : undefined;
           this.items = await this.sonarrApi.getSeries();
 
           const server4k = this.enable4kShow && server.is4k;
@@ -133,13 +153,23 @@ class SonarrScanner
             );
           }
 
-          await this.loop(this.processSonarrSeries.bind(this), { sessionId });
+          const observation = destinationScan;
+          await this.loop(
+            (series) => this.processSonarrSeries(series, observation),
+            { sessionId }
+          );
           if (
             server.independentRequestDestination === true &&
             this.items.length > 0
           ) {
-            await this.cleanupIndependentOrphanedShows(server, this.items);
+            await this.cleanupIndependentOrphanedShows(
+              server,
+              this.items,
+              observation
+            );
           }
+          destinationScan?.close();
+          destinationScan = undefined;
         } else {
           this.log(`Sync not enabled. Skipping Sonarr server: ${server.name}`);
         }
@@ -204,11 +234,16 @@ class SonarrScanner
     } catch (e) {
       this.log('Scan interrupted', 'error', { errorMessage: e.message });
     } finally {
+      destinationScan?.close();
       this.endRun(sessionId);
     }
   }
 
-  private async processSonarrSeries(sonarrSeries: SonarrSeries) {
+  private async processSonarrSeries(
+    sonarrSeries: SonarrSeries,
+    observation?: ReturnType<typeof beginDestinationScan>
+  ) {
+    const server = this.currentServer;
     const server4k = this.enable4kShow && this.currentServer.is4k;
     if (this.currentServer.independentRequestDestination !== true) {
       if (server4k) {
@@ -287,22 +322,34 @@ class SonarrScanner
         });
       }
 
-      if (this.currentServer.independentRequestDestination === true) {
+      if (server.independentRequestDestination === true) {
         await this.asyncLock.dispatch(tmdbId, async () => {
-          const { completedRequests } = await updateIndependentTvDestination({
+          const completedRequests = await withDestinationOperationLock(
+            MediaType.TV,
             tmdbId,
-            tvdbId: sonarrSeries.tvdbId,
-            serverId: this.currentServer.id,
-            externalServiceId: sonarrSeries.id ?? null,
-            externalServiceSlug: sonarrSeries.titleSlug,
-            seasons: filteredSeasons.map((season) => ({
-              seasonNumber: season.seasonNumber,
-              totalEpisodes: season.statistics?.totalEpisodeCount ?? 0,
-              availableEpisodes: season.statistics?.episodeFileCount ?? 0,
-              monitored: season.monitored,
-              observedInService: observedSonarrSeasons.has(season.seasonNumber),
-            })),
-          });
+            server.id,
+            () =>
+              withDvrIdentityLock('sonarr', server.id, async () => {
+                if (!observation?.isFresh(tmdbId)) return [];
+                const result = await updateIndependentTvDestination({
+                  tmdbId,
+                  tvdbId: sonarrSeries.tvdbId,
+                  serverId: server.id,
+                  externalServiceId: sonarrSeries.id ?? null,
+                  externalServiceSlug: sonarrSeries.titleSlug,
+                  seasons: filteredSeasons.map((season) => ({
+                    seasonNumber: season.seasonNumber,
+                    totalEpisodes: season.statistics?.totalEpisodeCount ?? 0,
+                    availableEpisodes: season.statistics?.episodeFileCount ?? 0,
+                    monitored: season.monitored,
+                    observedInService: observedSonarrSeasons.has(
+                      season.seasonNumber
+                    ),
+                  })),
+                });
+                return result.completedRequests;
+              })
+          );
           await notifyAvailableRequests(completedRequests);
         });
         return;
@@ -360,7 +407,8 @@ class SonarrScanner
 
   private async cleanupIndependentOrphanedShows(
     server: SonarrSettings,
-    series: SonarrSeries[]
+    series: SonarrSeries[],
+    observation?: ReturnType<typeof beginDestinationScan>
   ): Promise<void> {
     const scannedTvdbIds = new Set(series.map((show) => show.tvdbId));
     const candidates = await findIndependentDestinationCandidates(
@@ -379,25 +427,37 @@ class SonarrScanner
       if (!tvdbId || scannedTvdbIds.has(tvdbId)) {
         continue;
       }
-      try {
-        const exactSeries =
-          await this.sonarrApi.getLibrarySeriesByTvdbId(tvdbId);
-        if (!Array.isArray(exactSeries)) {
-          continue;
-        }
-        if (exactSeries.some((show) => show.tvdbId === tvdbId)) {
-          continue;
-        }
-      } catch (e) {
-        this.log(
-          `Could not confirm series ${tvdbId} against independent Sonarr server ${server.name}. Skipping cleanup for it.`,
-          'warn',
-          { errorMessage: e.message }
-        );
-        continue;
-      }
+      const declinedRequests = await withDestinationOperationLock(
+        MediaType.TV,
+        destination.media.tmdbId,
+        server.id,
+        async () => {
+          if (!observation?.isFresh(destination.media.tmdbId)) return [];
+          try {
+            const exactSeries =
+              await this.sonarrApi.getLibrarySeriesByTvdbId(tvdbId);
+            if (!Array.isArray(exactSeries)) {
+              return [];
+            }
+            if (exactSeries.some((show) => show.tvdbId === tvdbId)) {
+              return [];
+            }
+          } catch (e) {
+            this.log(
+              `Could not confirm series ${tvdbId} against independent Sonarr server ${server.name}. Skipping cleanup for it.`,
+              'warn',
+              { errorMessage: e.message }
+            );
+            return [];
+          }
 
-      await markMissingTvDestination(destination.mediaId, server.id);
+          return withDvrIdentityLock('sonarr', server.id, async () => {
+            if (!observation?.isFresh(destination.media.tmdbId)) return [];
+            return markMissingTvDestination(destination.mediaId, server.id);
+          });
+        }
+      );
+      await notifyDeclinedRequests(declinedRequests);
     }
   }
 

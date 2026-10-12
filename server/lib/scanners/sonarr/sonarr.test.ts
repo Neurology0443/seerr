@@ -18,14 +18,27 @@ import MediaRequest from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import * as destinationAvailability from '@server/lib/destinationAvailability';
+import { persistConfirmedDestinationRemoval } from '@server/lib/destinationRemoval';
 import { Notification } from '@server/lib/notifications';
 import { sonarrScanner } from '@server/lib/scanners/sonarr';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import mediaRoutes from '@server/routes/media';
+import settingsRoutes from '@server/routes/settings/sonarr';
 import { setupTestDb } from '@server/test/db';
+import {
+  removalSnapshot,
+  seedRemoval,
+} from '@server/test/fixtures/destinationRemoval';
 import { runWithMockTimers } from '@server/test/runWithMockTimers';
+import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
+import * as dvrIdentityLocks from '@server/utils/dvrIdentityLock';
+import axios, { type AxiosInstance } from 'axios';
+import express from 'express';
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it, mock } from 'node:test';
+import request from 'supertest';
 
 let getSeriesImpl: () => Promise<SonarrSeries[]> = async () => [];
 Object.defineProperty(SonarrAPI.prototype, 'getSeries', {
@@ -210,6 +223,546 @@ function configureSonarr(overrides: Partial<SonarrSettings>[] = [{}]): void {
 }
 
 describe('Sonarr Scanner', () => {
+  it('clears previous endpoint availability before an empty scan and rebuilds it only from fresh observations', async (t) => {
+    const { media, destinations } = await seedRemoval(MediaType.TV);
+    const settings = getSettings();
+    const connectionA = { ...settings.sonarr[1] };
+    settings.sonarr = [connectionA];
+    t.mock.method(settings, 'save', async () => undefined);
+    const before = await removalSnapshot();
+    const notifications = sendNotificationMock.mock.callCount();
+    const app = express();
+    app.use(express.json());
+    app.use('/settings', settingsRoutes);
+    assert.equal(
+      (
+        await request(app)
+          .put('/settings/2')
+          .send({ ...connectionA, hostname: 'replacement' })
+      ).status,
+      200
+    );
+    const invalidated = await removalSnapshot();
+    assert.deepEqual(invalidated.media, before.media);
+    assert.deepEqual(invalidated.destinations[0], before.destinations[0]);
+    assert.deepEqual(invalidated.requests, before.requests);
+    assert.deepEqual(invalidated.seasonRequests, before.seasonRequests);
+    assert.equal(invalidated.destinations[1].status, MediaStatus.UNKNOWN);
+    assert.equal(invalidated.destinations[1].externalServiceId, null);
+    assert.equal(invalidated.destinations[1].externalServiceSlug, null);
+    assert.ok(
+      invalidated.seasons
+        .filter((row) => row.destinationStatusId === destinations[1].id)
+        .every((row) => row.status === MediaStatus.UNKNOWN)
+    );
+    assert.deepEqual(
+      invalidated.seasons.filter(
+        (row) => row.destinationStatusId === destinations[0].id
+      ),
+      before.seasons.filter(
+        (row) => row.destinationStatusId === destinations[0].id
+      )
+    );
+    getSeriesImpl = async () => [];
+    await runWithMockTimers(() => sonarrScanner.run());
+    assert.deepEqual(await removalSnapshot(), invalidated);
+    assert.equal(sendNotificationMock.mock.callCount(), notifications);
+    getTvShowImpl = async () =>
+      fakeTmdbShow(
+        media.tmdbId,
+        [1, 2].map((season_number) => ({
+          id: season_number,
+          season_number,
+          episode_count: 10,
+          name: `Season ${season_number}`,
+          overview: '',
+          air_date: '2024-01-01',
+        }))
+      );
+    getSeriesImpl = async () => [
+      fakeSonarrSeries({
+        id: 42,
+        tvdbId: media.tvdbId,
+        titleSlug: 'replacement-media',
+        seasons: [1, 2].map((seasonNumber) => ({
+          seasonNumber,
+          monitored: true,
+          statistics: {
+            episodeFileCount: 10,
+            totalEpisodeCount: 10,
+            episodeCount: 10,
+            percentOfEpisodes: 100,
+            sizeOnDisk: 0,
+            previousAiring: undefined,
+          },
+        })),
+      }),
+    ];
+    await runWithMockTimers(() => sonarrScanner.run());
+    const fresh = await removalSnapshot();
+    assert.deepEqual(fresh.media, before.media);
+    assert.deepEqual(fresh.destinations[0], before.destinations[0]);
+    assert.equal(fresh.destinations[1].status, MediaStatus.AVAILABLE);
+    assert.equal(fresh.destinations[1].externalServiceId, 42);
+    assert.equal(
+      fresh.destinations[1].externalServiceSlug,
+      'replacement-media'
+    );
+    assert.deepEqual(
+      fresh.seasons.map((row) => [
+        row.id,
+        row.destinationStatusId,
+        row.seasonNumber,
+      ]),
+      before.seasons.map((row) => [
+        row.id,
+        row.destinationStatusId,
+        row.seasonNumber,
+      ])
+    );
+    assert.ok(
+      fresh.seasons
+        .filter((row) => row.destinationStatusId === destinations[1].id)
+        .every((row) => row.status === MediaStatus.AVAILABLE)
+    );
+    assert.equal(fresh.requests[2].status, MediaRequestStatus.COMPLETED);
+  });
+
+  for (const cleanup of [false, true]) {
+    for (const restored of [false, true]) {
+      it(
+        `rejects superseded connection observations and allows a fresh scan (cleanup: ${cleanup}, restored: ${restored})`,
+        { timeout: 10000 },
+        async (t) => {
+          const { media, destinations, requests } = await seedRemoval(
+            MediaType.TV
+          );
+          const settings = getSettings();
+          const connectionA = { ...settings.sonarr[1] };
+          settings.sonarr = [connectionA];
+          t.mock.method(settings, 'save', async () => undefined);
+          await getRepository(MediaRequest).delete(requests[1].id);
+          await getRepository(MediaDestinationStatus).update(
+            destinations[1].id,
+            {
+              status: MediaStatus.PROCESSING,
+            }
+          );
+          await getRepository(MediaDestinationSeasonStatus).update(
+            { destinationStatusId: destinations[1].id },
+            { status: MediaStatus.PROCESSING }
+          );
+          getShowByTvdbIdImpl = async ({ tvdbId }) =>
+            fakeTmdbShow(tvdbId === 999 ? 999 : media.tmdbId);
+          getTvShowImpl = async ({ tvId }) => fakeTmdbShow(tvId);
+          const before = await removalSnapshot();
+          const notifications = sendNotificationMock.mock.callCount();
+          let captured!: () => void;
+          let release!: () => void;
+          const fetched = new Promise<void>((resolve) => {
+            captured = resolve;
+          });
+          const resumed = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          t.after(() => release());
+          const inventory = cleanup
+            ? [fakeSonarrSeries({ id: 999, tvdbId: 999 })]
+            : [fakeSonarrSeries({ id: 42, tvdbId: media.tvdbId })];
+          getSeriesImpl = async () => {
+            captured();
+            await resumed;
+            return inventory;
+          };
+          const scanning = runWithMockTimers(() => sonarrScanner.run());
+          await fetched;
+          const app = express();
+          app.use(express.json());
+          app.use('/settings', settingsRoutes);
+          assert.equal(
+            (
+              await request(app)
+                .put('/settings/2')
+                .send({
+                  ...connectionA,
+                  hostname: 'connection-b',
+                  apiKey: 'key-b',
+                })
+            ).status,
+            200
+          );
+          if (restored)
+            assert.equal(
+              (await request(app).put('/settings/2').send(connectionA)).status,
+              200
+            );
+          const invalidated = await removalSnapshot();
+          release();
+          await scanning;
+          assert.deepEqual(await removalSnapshot(), invalidated);
+          assert.equal(invalidated.destinations[1].status, MediaStatus.UNKNOWN);
+          assert.equal(invalidated.destinations[1].externalServiceId, null);
+          assert.deepEqual(invalidated.requests, before.requests);
+          assert.deepEqual(invalidated.seasonRequests, before.seasonRequests);
+          assert.equal(sendNotificationMock.mock.callCount(), notifications);
+          getSeriesImpl = async () => inventory;
+          await runWithMockTimers(() => sonarrScanner.run());
+          const after = await removalSnapshot();
+          assert.deepEqual(
+            after.media.find((row) => row.id === media.id),
+            before.media.find((row) => row.id === media.id)
+          );
+          assert.deepEqual(after.destinations[0], before.destinations[0]);
+          assert.equal(
+            after.requests[0].status,
+            cleanup ? MediaRequestStatus.APPROVED : MediaRequestStatus.COMPLETED
+          );
+          if (cleanup)
+            assert.equal(after.destinations[1].status, MediaStatus.UNKNOWN);
+          else assert.equal(after.destinations[1].externalServiceId, 42);
+          assert.equal(
+            sendNotificationMock.mock.callCount(),
+            notifications + (cleanup ? 0 : 1)
+          );
+        }
+      );
+    }
+  }
+
+  it(
+    'rejects orphan reconciliation when the connection changes during exact lookup',
+    { timeout: 10000 },
+    async (t) => {
+      const { media, destinations, requests } = await seedRemoval(MediaType.TV);
+      const settings = getSettings();
+      const connectionA = { ...settings.sonarr[1] };
+      settings.sonarr = [connectionA];
+      t.mock.method(settings, 'save', async () => undefined);
+      await getRepository(MediaDestinationStatus).update(destinations[1].id, {
+        status: MediaStatus.PROCESSING,
+      });
+      getSeriesImpl = async () => [fakeSonarrSeries({ id: 999, tvdbId: 999 })];
+      getShowByTvdbIdImpl = async () => fakeTmdbShow(999);
+      getTvShowImpl = async ({ tvId }) => fakeTmdbShow(tvId);
+      let lookedUp!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        lookedUp = resolve;
+      });
+      const resumed = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      t.after(() => release());
+      getLibrarySeriesByTvdbIdImpl = async () => {
+        lookedUp();
+        await resumed;
+        return [];
+      };
+      const notifications = sendNotificationMock.mock.callCount();
+      const scanning = runWithMockTimers(() => sonarrScanner.run());
+      await entered;
+      const before = await removalSnapshot();
+      const app = express();
+      app.use(express.json());
+      app.use('/settings', settingsRoutes);
+      assert.equal(
+        (
+          await request(app)
+            .put('/settings/2')
+            .send({ ...connectionA, apiKey: 'connection-b' })
+        ).status,
+        200
+      );
+      release();
+      await scanning;
+      assert.deepEqual(await removalSnapshot(), before);
+      assert.equal(sendNotificationMock.mock.callCount(), notifications);
+      assert.equal(
+        (
+          await getRepository(MediaRequest).findOneByOrFail({
+            id: requests[0].id,
+          })
+        ).status,
+        MediaRequestStatus.APPROVED
+      );
+      assert.equal(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            mediaId: media.id,
+            serverId: 2,
+          })
+        ).externalServiceId,
+        12
+      );
+    }
+  );
+
+  it(
+    'keeps scanner freshness validation and persistence atomic with connection replacement',
+    { timeout: 10000 },
+    async (t) => {
+      const { media } = await seedRemoval(MediaType.TV);
+      const settings = getSettings();
+      const connectionA = { ...settings.sonarr[1] };
+      settings.sonarr = [connectionA];
+      t.mock.method(settings, 'save', async () => undefined);
+      getShowByTvdbIdImpl = async ({ tvdbId }) =>
+        fakeTmdbShow(tvdbId === 999 ? 999 : media.tmdbId);
+      getTvShowImpl = async ({ tvId }) => fakeTmdbShow(tvId);
+      getSeriesImpl = async () => [
+        fakeSonarrSeries({ id: 42, tvdbId: media.tvdbId }),
+      ];
+      let writing!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        writing = resolve;
+      });
+      const resumed = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      t.after(() => release());
+      const originalUpdate =
+        destinationAvailability.updateIndependentTvDestination;
+      t.mock.method(
+        destinationAvailability,
+        'updateIndependentTvDestination',
+        async (...args: Parameters<typeof originalUpdate>) => {
+          writing();
+          await resumed;
+          assert.equal(settings.sonarr[0].hostname, connectionA.hostname);
+          const result = await originalUpdate(...args);
+          assert.equal(result.destination.externalServiceId, 42);
+          return result;
+        }
+      );
+      const scanning = runWithMockTimers(() => sonarrScanner.run());
+      await entered;
+      let attempted!: () => void;
+      const queued = new Promise<void>((resolve) => {
+        attempted = resolve;
+      });
+      const originalLock = dvrIdentityLocks.withDvrIdentityLock;
+      t.mock.method(
+        dvrIdentityLocks,
+        'withDvrIdentityLock',
+        (...args: Parameters<typeof originalLock>) => {
+          attempted();
+          return originalLock(...args);
+        }
+      );
+      const app = express();
+      app.use(express.json());
+      app.use('/settings', settingsRoutes);
+      let settled = false;
+      const changing = request(app)
+        .put('/settings/2')
+        .send({ ...connectionA, hostname: 'connection-b' })
+        .then((res) => {
+          settled = true;
+          return res;
+        });
+      await queued;
+      assert.equal(settled, false);
+      release();
+      await scanning;
+      assert.equal((await changing).status, 200);
+      assert.equal(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            mediaId: media.id,
+            serverId: 2,
+          })
+        ).externalServiceId,
+        null
+      );
+      assert.equal(settings.sonarr[0].hostname, 'connection-b');
+    }
+  );
+
+  it('commits reconciliation and releases the destination before notification delivery and explicit removal', async (t) => {
+    const { media, destinations, requests } = await seedRemoval(MediaType.TV);
+    configureSonarr([{ id: 2, independentRequestDestination: true }]);
+    await getRepository(MediaRequest).delete(requests[1].id);
+    await getRepository(MediaDestinationStatus).update(destinations[1].id, {
+      status: MediaStatus.PROCESSING,
+    });
+    await getRepository(MediaDestinationSeasonStatus).update(
+      { destinationStatusId: destinations[1].id },
+      { status: MediaStatus.PROCESSING }
+    );
+    getSeriesImpl = async () => [fakeSonarrSeries({ id: 999, tvdbId: 999 })];
+    getShowByTvdbIdImpl = async () => fakeTmdbShow(999);
+    getTvShowImpl = async () => fakeTmdbShow(999);
+    let entered!: () => void;
+    let release!: () => void;
+    const notifying = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const delivered = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    t.after(() => release());
+    const notify = t.mock.method(
+      MediaRequest,
+      'sendNotification',
+      async (
+        declined: MediaRequest,
+        _media: Media,
+        notification: Notification
+      ) => {
+        assert.equal(notification, Notification.MEDIA_DECLINED);
+        assert.equal(declined.id, requests[0].id);
+        assert.equal(
+          (
+            await getRepository(MediaRequest).findOneByOrFail({
+              id: declined.id,
+            })
+          ).status,
+          MediaRequestStatus.DECLINED
+        );
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              id: destinations[1].id,
+            })
+          ).status,
+          MediaStatus.UNKNOWN
+        );
+        assert.equal(
+          getRepository(Media).manager.queryRunner?.isTransactionActive ??
+            false,
+          false
+        );
+        entered();
+        await delivered;
+        throw new Error('notification delivery failed');
+      }
+    );
+    t.mock.method(
+      axios,
+      'create',
+      () =>
+        ({
+          interceptors: {
+            request: { use: () => 0 },
+            response: { use: () => 0 },
+          },
+          get: async () => ({ data: { id: 12, tmdbId: 550, tvdbId: 1234 } }),
+          delete: async () => ({}),
+        }) as unknown as AxiosInstance
+    );
+    const app = express();
+    app.use(async (req, _res, next) => {
+      req.user = await getRepository(User).findOneByOrFail({ id: 1 });
+      next();
+    });
+    app.use('/media', mediaRoutes);
+    const scanning = runWithMockTimers(() => sonarrScanner.run());
+    await notifying;
+    try {
+      assert.equal(
+        (await request(app).delete(`/media/${media.id}/file?serverId=2`))
+          .status,
+        204
+      );
+      const removed = await getRepository(
+        MediaDestinationStatus
+      ).findOneByOrFail({ id: destinations[1].id });
+      assert.equal(removed.status, MediaStatus.DELETED);
+      assert.equal(removed.externalServiceId, null);
+    } finally {
+      release();
+    }
+    await scanning;
+    assert.equal(notify.mock.callCount(), 1);
+    assert.equal(
+      (
+        await getRepository(MediaRequest).findOneByOrFail({
+          id: requests[0].id,
+        })
+      ).status,
+      MediaRequestStatus.DECLINED
+    );
+    await runWithMockTimers(() => sonarrScanner.run());
+    assert.equal(notify.mock.callCount(), 1);
+  });
+
+  it('rejects stale inventory and season observations after removal, but allows fresh rediscovery', async () => {
+    const { media, destinations } = await seedRemoval(MediaType.TV);
+    configureSonarr([
+      { id: 2, hostname: 'sonarr-en', independentRequestDestination: true },
+    ]);
+    getTvShowImpl = async () => fakeTmdbShow(media.tmdbId);
+    const initialNotifications = sendNotificationMock.mock.callCount();
+    const before = await removalSnapshot();
+    let captured!: () => void;
+    const inventoryCaptured = new Promise<void>((resolve) => {
+      captured = resolve;
+    });
+    let resume!: () => void;
+    const resumed = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    getSeriesImpl = async () => {
+      const inventory = [fakeSonarrSeries({ id: 12, tvdbId: media.tvdbId })];
+      captured();
+      await resumed;
+      return inventory;
+    };
+    const scanning = runWithMockTimers(() => sonarrScanner.run());
+    await inventoryCaptured;
+    try {
+      await withDestinationOperationLock(MediaType.TV, media.tmdbId, 2, () =>
+        persistConfirmedDestinationRemoval(
+          media.id,
+          2,
+          getRepository(Media).manager
+        )
+      );
+    } finally {
+      resume();
+    }
+    await scanning;
+    assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
+    const after = await removalSnapshot();
+    assert.equal(after.destinations[1].status, MediaStatus.DELETED);
+    assert.equal(after.destinations[1].externalServiceId, null);
+    assert.equal(after.destinations[1].externalServiceSlug, null);
+    assert.ok(
+      after.seasons
+        .filter((season) => season.destinationStatusId === destinations[1].id)
+        .every((season) => season.status === MediaStatus.DELETED)
+    );
+    assert.deepEqual(
+      after.seasons.filter(
+        (season) => season.destinationStatusId === destinations[0].id
+      ),
+      before.seasons.filter(
+        (season) => season.destinationStatusId === destinations[0].id
+      )
+    );
+    assert.deepEqual(after.media, before.media);
+    assert.deepEqual(after.destinations[0], before.destinations[0]);
+    assert.equal(after.requests[0].status, MediaRequestStatus.DECLINED);
+    getSeriesImpl = async () => [
+      fakeSonarrSeries({ id: 42, tvdbId: media.tvdbId, titleSlug: 're-added' }),
+    ];
+    await runWithMockTimers(() => sonarrScanner.run());
+    const fresh = await removalSnapshot();
+    assert.equal(fresh.destinations[1].status, MediaStatus.PARTIALLY_AVAILABLE);
+    assert.equal(fresh.destinations[1].externalServiceId, 42);
+    assert.equal(fresh.destinations[1].externalServiceSlug, 're-added');
+    assert.equal(
+      fresh.seasons.find(
+        (season) =>
+          season.destinationStatusId === destinations[1].id &&
+          season.seasonNumber === 1
+      )?.status,
+      MediaStatus.AVAILABLE
+    );
+    assert.equal(fresh.requests[0].status, MediaRequestStatus.DECLINED);
+  });
+
   beforeEach(() => {
     getSeriesImpl = async () => [];
     getLibrarySeriesByTvdbIdImpl = async () => [];

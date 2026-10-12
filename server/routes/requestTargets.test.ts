@@ -397,3 +397,96 @@ describe('GET /tv/:id/request-targets', () => {
     );
   });
 });
+
+describe('management projection without requests', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`exposes exact ${type} links and eligibility for scanner-discovered destinations`, async () => {
+      const servers = [
+        radarr(1, {
+          independentRequestDestination: true,
+          name: 'FR',
+          externalUrl: 'https://fr.example',
+        }),
+        radarr(2, {
+          independentRequestDestination: true,
+          name: 'EN',
+          externalUrl: 'https://en.example',
+          is4k: true,
+        }),
+      ];
+      if (type === MediaType.MOVIE) getSettings().radarr = servers;
+      else getSettings().sonarr = servers as unknown as SonarrSettings[];
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 550,
+          tvdbId: type === MediaType.TV ? 1234 : undefined,
+          mediaType: type,
+        })
+      );
+      await getRepository(MediaDestinationStatus).save(
+        servers.map(
+          (server) =>
+            new MediaDestinationStatus({
+              mediaId: media.id,
+              serverId: server.id,
+              status: MediaStatus.AVAILABLE,
+              externalServiceId: server.id === 1 ? 11 : null,
+              externalServiceSlug: `exact-${server.id}`,
+            })
+        )
+      );
+      const admin = await login();
+      const response = await admin.get(`/${type}/550/request-targets`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(
+        response.body.map((target: MovieRequestTarget) => [
+          target.name,
+          target.canRemove,
+          target.serviceUrl,
+        ]),
+        [
+          [
+            'FR',
+            true,
+            `https://fr.example/${type === MediaType.MOVIE ? 'movie' : 'series'}/exact-1`,
+          ],
+          [
+            'EN',
+            true,
+            `https://en.example/${type === MediaType.MOVIE ? 'movie' : 'series'}/exact-2`,
+          ],
+        ]
+      );
+      assert.equal(await getRepository(MediaRequest).count(), 0);
+      await getRepository(User).update(1, { permissions: 32 });
+      const viewerResponse = await admin.get(`/${type}/550/request-targets`);
+      assert.equal(viewerResponse.status, 200);
+      assert.ok(
+        viewerResponse.body.every(
+          (target: MovieRequestTarget) => target.canRemove === false
+        )
+      );
+      assert.ok(
+        viewerResponse.body.every(
+          (target: MovieRequestTarget) => !Object.hasOwn(target, 'serviceUrl')
+        )
+      );
+      assert.deepEqual(
+        viewerResponse.body.map((target: MovieRequestTarget) => [
+          target.serverId,
+          target.name,
+          target.status,
+          target.isIndependent,
+          target.requestable,
+        ]),
+        response.body.map((target: MovieRequestTarget) => [
+          target.serverId,
+          target.name,
+          target.status,
+          target.isIndependent,
+          target.requestable,
+        ])
+      );
+    });
+  }
+});

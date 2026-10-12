@@ -3,7 +3,11 @@ import type { TestContext } from 'node:test';
 import { before, beforeEach, describe, it, mock } from 'node:test';
 
 import ExternalAPI from '@server/api/externalapi';
-import { MediaRequestStatus, MediaType } from '@server/constants/media';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
@@ -12,17 +16,25 @@ import { MediaRequest } from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
 import { Permission } from '@server/lib/permissions';
 import { RequestTargetError } from '@server/lib/requestTarget';
+import { getRequestTargetState } from '@server/lib/requestTargetState';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
 import {
+  removalSnapshot,
+  seedRemoval,
+} from '@server/test/fixtures/destinationRemoval';
+import { beginDestinationScan } from '@server/utils/destinationOperationLock';
+import {
   dvrIdentityKey,
   withDvrIdentityLock,
 } from '@server/utils/dvrIdentityLock';
+import axios from 'axios';
 import type { Express } from 'express';
 import express from 'express';
 import request from 'supertest';
+import { UpdateQueryBuilder } from 'typeorm';
 import radarrRoutes from './radarr';
 import sonarrRoutes from './sonarr';
 
@@ -53,7 +65,11 @@ const externalApiGetMock = mock.method(
   }
 ).mock;
 
-mock.method(MediaRequest, 'sendNotification', async () => undefined);
+const notificationMock = mock.method(
+  MediaRequest,
+  'sendNotification',
+  async () => undefined
+);
 
 setupTestDb();
 
@@ -629,6 +645,281 @@ for (const kind of ['radarr', 'sonarr'] as const) {
         roleLookupCount
       );
     });
+
+    for (const [field, value] of [
+      ['hostname', 'replacement'],
+      ['port', 9999],
+      ['useSsl', true],
+      ['baseUrl', '/replacement'],
+      ['apiKey', 'new-key'],
+    ] as const) {
+      it(`invalidates active observations for a ${field} change, including restoration`, async (t) => {
+        mockSettingsSave(t);
+        const current = serverFixture(kind, 14, {
+          independentRequestDestination: true,
+          syncEnabled: true,
+        });
+        setServers(kind, [current]);
+        const type = kind === 'radarr' ? MediaType.MOVIE : MediaType.TV;
+        const old = beginDestinationScan(type, 14, current);
+        const other = beginDestinationScan(type, 15);
+        const otherType = beginDestinationScan(
+          type === MediaType.MOVIE ? MediaType.TV : MediaType.MOVIE,
+          14
+        );
+        t.after(() => {
+          old.close();
+          other.close();
+          otherType.close();
+        });
+        assert.equal(old.isFresh(550), true);
+        assert.equal(
+          (
+            await request(app)
+              .put(`/${kind}/14`)
+              .send(serverPayload(current, { [field]: value }))
+          ).status,
+          200
+        );
+        assert.equal(old.isFresh(550), false);
+        assert.equal(old.isFresh(551), false);
+        assert.equal(other.isFresh(550), true);
+        assert.equal(otherType.isFresh(550), true);
+        const fresh = beginDestinationScan(type, 14, getServers(kind)[0]);
+        t.after(() => fresh.close());
+        assert.equal(fresh.isFresh(550), true);
+        assert.equal(
+          (await request(app).put(`/${kind}/14`).send(serverPayload(current)))
+            .status,
+          200
+        );
+        assert.equal(old.isFresh(550), false);
+        assert.equal(fresh.isFresh(550), false);
+        const restored = beginDestinationScan(type, 14, getServers(kind)[0]);
+        t.after(() => restored.close());
+        assert.equal(restored.isFresh(550), true);
+      });
+    }
+
+    it('keeps active observations valid after non-connection settings changes', async (t) => {
+      mockSettingsSave(t);
+      const current = serverFixture(kind, 14, {
+        independentRequestDestination: true,
+        syncEnabled: true,
+      });
+      setServers(kind, [current]);
+      const scan = beginDestinationScan(
+        kind === 'radarr' ? MediaType.MOVIE : MediaType.TV,
+        14,
+        current
+      );
+      t.after(() => scan.close());
+      assert.equal(
+        (
+          await request(app)
+            .put(`/${kind}/14`)
+            .send(
+              serverPayload(current, {
+                name: 'Renamed',
+                activeDirectory: '/other',
+              })
+            )
+        ).status,
+        200
+      );
+      assert.equal(scan.isFresh(550), true);
+    });
+
+    for (const [field, value, invalidates] of [
+      ['hostname', 'replacement', true],
+      ['port', 9999, true],
+      ['useSsl', true, true],
+      ['baseUrl', '/replacement', true],
+      ['apiKey', 'rotated-key', false],
+      ['name', 'Renamed', false],
+      ['activeDirectory', '/other', false],
+      ['hostname', ' SERVER-2 ', false],
+      ['baseUrl', '/', false],
+    ] as const) {
+      it(`invalidates only persisted ${kind} endpoint state for ${field}=${value}`, async (t) => {
+        const type = mediaTypeForKind(kind);
+        const { media, destinations, requests } = await seedRemoval(type);
+        // Radarr and Sonarr IDs occupy separate namespaces.
+        const otherMedia = await getRepository(Media).save(
+          new Media({
+            mediaType:
+              type === MediaType.MOVIE ? MediaType.TV : MediaType.MOVIE,
+            tmdbId: 777,
+            status: MediaStatus.AVAILABLE,
+          }),
+          { listeners: false }
+        );
+        await getRepository(MediaDestinationStatus).save(
+          new MediaDestinationStatus({
+            mediaId: otherMedia.id,
+            serverId: 2,
+            status: MediaStatus.AVAILABLE,
+            externalServiceId: 99,
+            externalServiceSlug: 'other-type',
+          })
+        );
+        mockSettingsSave(t);
+        const network = t.mock.method(axios, 'create', () => {
+          throw new Error('Settings must not contact Arr');
+        });
+        const before = await removalSnapshot();
+        const notifications = notificationMock.mock.callCount();
+        const current = getServers(kind)[1];
+        const observation = beginDestinationScan(type, 2, current);
+        t.after(() => observation.close());
+        assert.equal(
+          (
+            await request(app)
+              .put(`/${kind}/2`)
+              .send(serverPayload(current, { [field]: value }))
+          ).status,
+          200
+        );
+        const after = await removalSnapshot();
+        assert.deepEqual(after.media, before.media);
+        assert.deepEqual(after.requests, before.requests);
+        assert.deepEqual(after.seasonRequests, before.seasonRequests);
+        assert.equal(network.mock.callCount(), 0);
+        assert.equal(notificationMock.mock.callCount(), notifications);
+        for (const destination of before.destinations) {
+          const updated = after.destinations.find(
+            (row) => row.id === destination.id
+          )!;
+          if (invalidates && destination.id === destinations[1].id) {
+            assert.equal(updated.status, MediaStatus.UNKNOWN);
+            assert.equal(updated.externalServiceId, null);
+            assert.equal(updated.externalServiceSlug, null);
+            assert.equal(updated.mediaId, destination.mediaId);
+            assert.equal(updated.serverId, destination.serverId);
+          } else assert.deepEqual(updated, destination);
+        }
+        for (const season of before.seasons) {
+          const updated = after.seasons.find((row) => row.id === season.id)!;
+          if (
+            invalidates &&
+            season.destinationStatusId === destinations[1].id
+          ) {
+            assert.equal(updated.status, MediaStatus.UNKNOWN);
+            assert.equal(
+              updated.destinationStatusId,
+              season.destinationStatusId
+            );
+            assert.equal(updated.seasonNumber, season.seasonNumber);
+          } else assert.deepEqual(updated, season);
+        }
+        const target = await getRequestTargetState(
+          requests[2],
+          getRepository(MediaRequest).manager,
+          await getRepository(User).findOneByOrFail({ id: 1 })
+        );
+        assert.equal(
+          target?.status,
+          invalidates ? MediaStatus.UNKNOWN : MediaStatus.AVAILABLE
+        );
+        assert.equal(target?.serviceUrl === undefined, invalidates);
+        assert.equal(target?.canRemove, !invalidates);
+        assert.equal(
+          observation.isFresh(media.tmdbId),
+          !['hostname', 'port', 'useSsl', 'baseUrl', 'apiKey'].includes(field)
+        );
+      });
+    }
+
+    for (const failure of kind === 'sonarr'
+      ? ['destination', 'season', 'settings']
+      : ['destination', 'settings']) {
+      it(`keeps endpoint replacement safe after a ${failure} failure`, async (t) => {
+        const { media, destinations } = await seedRemoval(
+          mediaTypeForKind(kind)
+        );
+        const settings = getSettings();
+        const originalServers = getServers(kind).map((server) => ({
+          ...server,
+        }));
+        const before = await removalSnapshot();
+        const notifications = notificationMock.mock.callCount();
+        const observation = beginDestinationScan(
+          mediaTypeForKind(kind),
+          2,
+          originalServers[1]
+        );
+        t.after(() => observation.close());
+        const save = t.mock.method(settings, 'save', async () => {
+          if (failure === 'settings') {
+            const destination = await getRepository(
+              MediaDestinationStatus
+            ).findOneByOrFail({ id: destinations[1].id });
+            assert.equal(destination.status, MediaStatus.UNKNOWN);
+            assert.equal(destination.externalServiceId, null);
+            throw new Error('injected settings persistence failure');
+          }
+        });
+        if (failure !== 'settings') {
+          const originalExecute = UpdateQueryBuilder.prototype.execute;
+          t.mock.method(
+            UpdateQueryBuilder.prototype,
+            'execute',
+            async function (
+              this: UpdateQueryBuilder<MediaDestinationStatus>,
+              ...args: Parameters<typeof originalExecute>
+            ) {
+              if (
+                this.expressionMap.mainAlias?.target ===
+                (failure === 'season'
+                  ? MediaDestinationSeasonStatus
+                  : MediaDestinationStatus)
+              )
+                throw new Error('injected database invalidation failure');
+              return originalExecute.apply(this, args);
+            }
+          );
+        }
+        const response = await request(app)
+          .put(`/${kind}/2`)
+          .send(
+            serverPayload(originalServers[1], {
+              hostname: 'replacement',
+              isDefault: true,
+            })
+          );
+        assert.equal(response.status, 500);
+        assert.deepEqual(getServers(kind), originalServers);
+        assert.equal(notificationMock.mock.callCount(), notifications);
+        const after = await removalSnapshot();
+        if (failure !== 'settings') {
+          assert.deepEqual(after, before);
+          assert.equal(save.mock.callCount(), 0);
+          assert.equal(observation.isFresh(media.tmdbId), true);
+        } else {
+          assert.deepEqual(after.media, before.media);
+          assert.deepEqual(after.requests, before.requests);
+          assert.deepEqual(after.seasonRequests, before.seasonRequests);
+          assert.deepEqual(after.destinations[0], before.destinations[0]);
+          assert.equal(after.destinations[1].status, MediaStatus.UNKNOWN);
+          assert.equal(after.destinations[1].externalServiceId, null);
+          assert.equal(after.destinations[1].externalServiceSlug, null);
+          assert.ok(
+            after.seasons
+              .filter((row) => row.destinationStatusId === destinations[1].id)
+              .every((row) => row.status === MediaStatus.UNKNOWN)
+          );
+          assert.deepEqual(
+            after.seasons.filter(
+              (row) => row.destinationStatusId === destinations[0].id
+            ),
+            before.seasons.filter(
+              (row) => row.destinationStatusId === destinations[0].id
+            )
+          );
+          assert.equal(observation.isFresh(media.tmdbId), false);
+        }
+      });
+    }
 
     it('uses the server identity lock for role changes', async (t) => {
       mockSettingsSave(t);

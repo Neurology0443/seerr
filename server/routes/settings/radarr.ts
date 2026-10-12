@@ -1,4 +1,6 @@
 import RadarrAPI from '@server/api/servarr/radarr';
+import { MediaType } from '@server/constants/media';
+import { invalidateIndependentDestinationState } from '@server/lib/destinationAvailability';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import {
@@ -12,7 +14,10 @@ import {
   hasValidIndependentRequestDestination,
 } from '@server/lib/settings/dvrValidation';
 import logger from '@server/logger';
+import { invalidateDestinationConnectionScans } from '@server/utils/destinationOperationLock';
 import {
+  hasDvrConnectionChanged,
+  hasDvrEndpointChanged,
   withDvrIdentityLock,
   withDvrSettingsMutationLock,
 } from '@server/utils/dvrIdentityLock';
@@ -131,7 +136,7 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
 
     const serverId = Number(req.params.id);
 
-    const update = async (identityLocked = false): Promise<unknown> => {
+    const update = async (): Promise<unknown> => {
       const settings = getSettings();
       const radarrIndex = settings.radarr.findIndex((r) => r.id === serverId);
 
@@ -182,10 +187,6 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
         currentIndependentRequestDestination;
       const is4kRoleChanged = updatedRadarr.is4k !== currentRadarr.is4k;
 
-      if ((independentRoleChanged || is4kRoleChanged) && !identityLocked) {
-        return withDvrIdentityLock('radarr', serverId, () => update(true));
-      }
-
       if (
         (independentRoleChanged || is4kRoleChanged) &&
         (await isDvrServerHistoricallyUsed('radarr', currentRadarr.id))
@@ -206,6 +207,16 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
         }
       }
 
+      const endpointChanged =
+        currentRadarr.independentRequestDestination === true &&
+        hasDvrEndpointChanged(currentRadarr, updatedRadarr);
+      const previousServers = endpointChanged
+        ? settings.radarr.map((server) => ({ ...server }))
+        : undefined;
+      if (endpointChanged) {
+        await invalidateIndependentDestinationState(MediaType.MOVIE, serverId);
+      }
+
       // If we are setting this as the default, clear any previous defaults for the same type first
       // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
       // and are the default
@@ -220,12 +231,24 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
       }
 
       settings.radarr[radarrIndex] = updatedRadarr;
-      await settings.save();
+      if (hasDvrConnectionChanged(currentRadarr, updatedRadarr)) {
+        invalidateDestinationConnectionScans(MediaType.MOVIE, serverId);
+      }
+      try {
+        await settings.save();
+      } catch (error) {
+        // DB invalidation is already committed. Restoring the old configuration
+        // is safe; its availability will be rebuilt without restoring stale IDs.
+        if (previousServers) settings.radarr = previousServers;
+        throw error;
+      }
 
       return res.status(200).json(settings.radarr[radarrIndex]);
     };
 
-    return withDvrSettingsMutationLock('radarr', update);
+    return withDvrIdentityLock('radarr', serverId, () =>
+      withDvrSettingsMutationLock('radarr', update)
+    );
   }
 );
 
@@ -258,8 +281,8 @@ radarrRoutes.get<{ id: string }>('/:id/profiles', async (req, res, next) => {
 radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   const serverId = Number(req.params.id);
 
-  return withDvrSettingsMutationLock('radarr', () =>
-    withDvrIdentityLock('radarr', serverId, async () => {
+  return withDvrIdentityLock('radarr', serverId, () =>
+    withDvrSettingsMutationLock('radarr', async () => {
       const settings = getSettings();
       const radarrIndex = settings.radarr.findIndex((r) => r.id === serverId);
 
@@ -275,6 +298,7 @@ radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
       }
 
       const removed = settings.radarr.splice(radarrIndex, 1);
+      invalidateDestinationConnectionScans(MediaType.MOVIE, serverId);
       await settings.save();
 
       return res.status(200).json(removed[0]);

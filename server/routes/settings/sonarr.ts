@@ -1,4 +1,6 @@
 import SonarrAPI from '@server/api/servarr/sonarr';
+import { MediaType } from '@server/constants/media';
+import { invalidateIndependentDestinationState } from '@server/lib/destinationAvailability';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import {
@@ -12,7 +14,10 @@ import {
   hasValidIndependentRequestDestination,
 } from '@server/lib/settings/dvrValidation';
 import logger from '@server/logger';
+import { invalidateDestinationConnectionScans } from '@server/utils/destinationOperationLock';
 import {
+  hasDvrConnectionChanged,
+  hasDvrEndpointChanged,
   withDvrIdentityLock,
   withDvrSettingsMutationLock,
 } from '@server/utils/dvrIdentityLock';
@@ -128,7 +133,7 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
 
   const serverId = Number(req.params.id);
 
-  const update = async (identityLocked = false): Promise<unknown> => {
+  const update = async (): Promise<unknown> => {
     const settings = getSettings();
     const sonarrIndex = settings.sonarr.findIndex((r) => r.id === serverId);
 
@@ -176,10 +181,6 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
       currentIndependentRequestDestination;
     const is4kRoleChanged = updatedSonarr.is4k !== currentSonarr.is4k;
 
-    if ((independentRoleChanged || is4kRoleChanged) && !identityLocked) {
-      return withDvrIdentityLock('sonarr', serverId, () => update(true));
-    }
-
     if (
       (independentRoleChanged || is4kRoleChanged) &&
       (await isDvrServerHistoricallyUsed('sonarr', currentSonarr.id))
@@ -200,6 +201,16 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
       }
     }
 
+    const endpointChanged =
+      currentSonarr.independentRequestDestination === true &&
+      hasDvrEndpointChanged(currentSonarr, updatedSonarr);
+    const previousServers = endpointChanged
+      ? settings.sonarr.map((server) => ({ ...server }))
+      : undefined;
+    if (endpointChanged) {
+      await invalidateIndependentDestinationState(MediaType.TV, serverId);
+    }
+
     // If we are setting this as the default, clear any previous defaults for the same type first
     // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
     // and are the default
@@ -212,19 +223,31 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
     }
 
     settings.sonarr[sonarrIndex] = updatedSonarr;
-    await settings.save();
+    if (hasDvrConnectionChanged(currentSonarr, updatedSonarr)) {
+      invalidateDestinationConnectionScans(MediaType.TV, serverId);
+    }
+    try {
+      await settings.save();
+    } catch (error) {
+      // DB invalidation is already committed. Restoring the old configuration
+      // is safe; its availability will be rebuilt without restoring stale IDs.
+      if (previousServers) settings.sonarr = previousServers;
+      throw error;
+    }
 
     return res.status(200).json(settings.sonarr[sonarrIndex]);
   };
 
-  return withDvrSettingsMutationLock('sonarr', update);
+  return withDvrIdentityLock('sonarr', serverId, () =>
+    withDvrSettingsMutationLock('sonarr', update)
+  );
 });
 
 sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   const serverId = Number(req.params.id);
 
-  return withDvrSettingsMutationLock('sonarr', () =>
-    withDvrIdentityLock('sonarr', serverId, async () => {
+  return withDvrIdentityLock('sonarr', serverId, () =>
+    withDvrSettingsMutationLock('sonarr', async () => {
       const settings = getSettings();
       const sonarrIndex = settings.sonarr.findIndex((r) => r.id === serverId);
 
@@ -240,6 +263,7 @@ sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
       }
 
       const removed = settings.sonarr.splice(sonarrIndex, 1);
+      invalidateDestinationConnectionScans(MediaType.TV, serverId);
       await settings.save();
 
       return res.status(200).json(removed[0]);

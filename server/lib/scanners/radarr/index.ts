@@ -7,6 +7,7 @@ import {
   findIndependentDestinationCandidates,
   markMissingMovieDestination,
   notifyAvailableRequests,
+  notifyDeclinedRequests,
   updateIndependentMovieDestination,
 } from '@server/lib/destinationAvailability';
 import type {
@@ -17,6 +18,11 @@ import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { findAmbiguousIndependentDvrServerIds } from '@server/lib/settings/dvrValidation';
+import {
+  beginDestinationScan,
+  withDestinationOperationLock,
+} from '@server/utils/destinationOperationLock';
+import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -53,6 +59,7 @@ class RadarrScanner
   }
 
   public async run(): Promise<void> {
+    let destinationScan: ReturnType<typeof beginDestinationScan> | undefined;
     const settings = getSettings();
     const sessionId = this.startRun();
     this.scannedTmdbIds.clear();
@@ -85,7 +92,16 @@ class RadarrScanner
           radarrA.baseUrl === radarrB.baseUrl
       );
 
-      for (const server of this.servers) {
+      for (const configuredServer of this.servers) {
+        const server =
+          configuredServer.independentRequestDestination === true
+            ? getSettings().radarr.find(
+                (current) =>
+                  current.id === configuredServer.id &&
+                  current.independentRequestDestination === true
+              )
+            : configuredServer;
+        if (!server) continue;
         this.currentServer = server;
         if (server.syncEnabled) {
           this.log(
@@ -98,6 +114,10 @@ class RadarrScanner
             url: RadarrAPI.buildUrl(server, '/api/v3'),
           });
 
+          destinationScan =
+            server.independentRequestDestination === true
+              ? beginDestinationScan(MediaType.MOVIE, server.id, server)
+              : undefined;
           this.items = await this.radarrApi.getMovies();
 
           const server4k = this.enable4kMovie && server.is4k;
@@ -124,13 +144,23 @@ class RadarrScanner
             );
           }
 
-          await this.loop(this.processRadarrMovie.bind(this), { sessionId });
+          const observation = destinationScan;
+          await this.loop(
+            (movie) => this.processRadarrMovie(movie, observation),
+            { sessionId }
+          );
           if (
             server.independentRequestDestination === true &&
             this.items.length > 0
           ) {
-            await this.cleanupIndependentOrphanedMovies(server, this.items);
+            await this.cleanupIndependentOrphanedMovies(
+              server,
+              this.items,
+              observation
+            );
           }
+          destinationScan?.close();
+          destinationScan = undefined;
         } else {
           this.log(`Sync not enabled. Skipping Radarr server: ${server.name}`);
         }
@@ -195,11 +225,16 @@ class RadarrScanner
     } catch (e) {
       this.log('Scan interrupted', 'error', { errorMessage: e.message });
     } finally {
+      destinationScan?.close();
       this.endRun(sessionId);
     }
   }
 
-  private async processRadarrMovie(radarrMovie: RadarrMovie): Promise<void> {
+  private async processRadarrMovie(
+    radarrMovie: RadarrMovie,
+    observation?: ReturnType<typeof beginDestinationScan>
+  ): Promise<void> {
+    const server = this.currentServer;
     const server4k = this.enable4kMovie && this.currentServer.is4k;
     if (this.currentServer.independentRequestDestination !== true) {
       if (server4k) {
@@ -212,15 +247,23 @@ class RadarrScanner
     try {
       if (this.currentServer.independentRequestDestination === true) {
         await this.asyncLock.dispatch(radarrMovie.tmdbId, async () => {
-          const { completedRequests } = await updateIndependentMovieDestination(
-            {
-              tmdbId: radarrMovie.tmdbId,
-              serverId: this.currentServer.id,
-              externalServiceId: radarrMovie.id,
-              externalServiceSlug: radarrMovie.titleSlug,
-              hasFile: radarrMovie.hasFile,
-              monitored: radarrMovie.monitored,
-            }
+          const completedRequests = await withDestinationOperationLock(
+            MediaType.MOVIE,
+            radarrMovie.tmdbId,
+            server.id,
+            () =>
+              withDvrIdentityLock('radarr', server.id, async () => {
+                if (!observation?.isFresh(radarrMovie.tmdbId)) return [];
+                const result = await updateIndependentMovieDestination({
+                  tmdbId: radarrMovie.tmdbId,
+                  serverId: server.id,
+                  externalServiceId: radarrMovie.id,
+                  externalServiceSlug: radarrMovie.titleSlug,
+                  hasFile: radarrMovie.hasFile,
+                  monitored: radarrMovie.monitored,
+                });
+                return result.completedRequests;
+              })
           );
           await notifyAvailableRequests(completedRequests);
         });
@@ -281,7 +324,8 @@ class RadarrScanner
 
   private async cleanupIndependentOrphanedMovies(
     server: RadarrSettings,
-    movies: RadarrMovie[]
+    movies: RadarrMovie[],
+    observation?: ReturnType<typeof beginDestinationScan>
   ): Promise<void> {
     const scannedTmdbIds = new Set(movies.map((movie) => movie.tmdbId));
     const candidates = await findIndependentDestinationCandidates(
@@ -294,28 +338,42 @@ class RadarrScanner
       if (scannedTmdbIds.has(destination.media.tmdbId)) {
         continue;
       }
-      try {
-        const exactMovies = await this.radarrApi.getLibraryMoviesByTmdbId(
-          destination.media.tmdbId
-        );
-        if (!Array.isArray(exactMovies)) {
-          continue;
-        }
-        if (
-          exactMovies.some((movie) => movie.tmdbId === destination.media.tmdbId)
-        ) {
-          continue;
-        }
-      } catch (e) {
-        this.log(
-          `Could not confirm movie ${destination.media.tmdbId} against independent Radarr server ${server.name}. Skipping cleanup for it.`,
-          'warn',
-          { errorMessage: e.message }
-        );
-        continue;
-      }
+      const declinedRequests = await withDestinationOperationLock(
+        MediaType.MOVIE,
+        destination.media.tmdbId,
+        server.id,
+        async () => {
+          if (!observation?.isFresh(destination.media.tmdbId)) return [];
+          try {
+            const exactMovies = await this.radarrApi.getLibraryMoviesByTmdbId(
+              destination.media.tmdbId
+            );
+            if (!Array.isArray(exactMovies)) {
+              return [];
+            }
+            if (
+              exactMovies.some(
+                (movie) => movie.tmdbId === destination.media.tmdbId
+              )
+            ) {
+              return [];
+            }
+          } catch (e) {
+            this.log(
+              `Could not confirm movie ${destination.media.tmdbId} against independent Radarr server ${server.name}. Skipping cleanup for it.`,
+              'warn',
+              { errorMessage: e.message }
+            );
+            return [];
+          }
 
-      await markMissingMovieDestination(destination.mediaId, server.id);
+          return withDvrIdentityLock('radarr', server.id, async () => {
+            if (!observation?.isFresh(destination.media.tmdbId)) return [];
+            return markMissingMovieDestination(destination.mediaId, server.id);
+          });
+        }
+      );
+      await notifyDeclinedRequests(declinedRequests);
     }
   }
 
