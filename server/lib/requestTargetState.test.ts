@@ -230,6 +230,7 @@ describe('getRequestTargetState', () => {
     assert.deepStrictEqual(independentTarget, {
       serverId: 21,
       name: 'Deleted Radarr server (#21)',
+      canRemove: false,
       downloadStatus: [],
       is4k: false,
       isIndependent: true,
@@ -705,5 +706,73 @@ describe('independent request serialization', () => {
     assert.equal(serialized.target?.serviceUrl, undefined);
     assert.equal(serialized.target?.downloadStatus, undefined);
     assert.equal(progress.mock.callCount(), 0);
+  });
+});
+
+describe('exact independent management eligibility', () => {
+  it('requires management permission, exact valid linkage and existing nondeleted state', async () => {
+    getSettings().radarr = [
+      radarr(2, {
+        independentRequestDestination: true,
+        is4k: true,
+        externalUrl: 'https://en.example/',
+      }),
+    ];
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 550,
+        mediaType: MediaType.MOVIE,
+        status: MediaStatus.AVAILABLE,
+        serviceId: 2,
+        externalServiceId: 99,
+      })
+    );
+    const manager = getRepository(Media).manager;
+    const admin = await getRepository(User).findOneByOrFail({ id: 1 });
+    const viewer = await getRepository(User).findOneByOrFail({ id: 2 });
+    const req = { type: MediaType.MOVIE, serverId: 2, is4k: false, media };
+    assert.equal(
+      (await getRequestTargetState(req, manager, admin))?.canRemove,
+      false
+    );
+    const destination = await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 2,
+        status: MediaStatus.AVAILABLE,
+        externalServiceId: 12,
+        externalServiceSlug: 'exact',
+      })
+    );
+    const target = await getRequestTargetState(req, manager, admin);
+    assert.equal(target?.canRemove, true);
+    assert.equal(target?.is4k, true);
+    assert.equal(target?.serviceUrl, 'https://en.example/movie/exact');
+    assert.equal(
+      (await getRequestTargetState(req, manager, viewer))?.canRemove,
+      false
+    );
+    for (const linkage of [null, 0, -1]) {
+      await getRepository(MediaDestinationStatus).update(destination.id, {
+        externalServiceId: linkage,
+      });
+      assert.equal(
+        (await getRequestTargetState(req, manager, admin))?.canRemove,
+        false
+      );
+    }
+    await getRepository(MediaDestinationStatus).update(destination.id, {
+      externalServiceId: 12,
+      status: MediaStatus.DELETED,
+    });
+    assert.equal(
+      (await getRequestTargetState(req, manager, admin))?.canRemove,
+      false
+    );
+    getSettings().radarr = [];
+    const deleted = await getRequestTargetState(req, manager, admin);
+    assert.equal(deleted?.deleted, true);
+    assert.equal(deleted?.canRemove, false);
+    assert.equal(deleted?.serviceUrl, undefined);
   });
 });

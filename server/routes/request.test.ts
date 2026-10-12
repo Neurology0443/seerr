@@ -1788,6 +1788,7 @@ describe('GET /request/:requestId', () => {
     assert.deepStrictEqual(response.body.target, {
       serverId: 301,
       name: 'French',
+      canRemove: false,
       is4k: false,
       isIndependent: true,
       deleted: false,
@@ -3710,5 +3711,80 @@ describe('DELETE /request/:requestId, orphaned season status reset', () => {
     const updated = await mediaRepo.findOneOrFail({ where: { id: media.id } });
     assert.strictEqual(updated.seasons[0].status, MediaStatus.UNKNOWN);
     assert.strictEqual(updated.seasons[0].status4k, MediaStatus.PROCESSING);
+  });
+});
+
+describe('request removal compatibility projection', () => {
+  it('exposes exact independent canRemove at both target and legacy list levels', async (t) => {
+    t.mock.method(
+      axios,
+      'create',
+      () =>
+        ({
+          interceptors: { request: { use: () => 0 } },
+          get: async () => ({ data: [] }),
+        }) as unknown as AxiosInstance
+    );
+    configureRadarr([
+      { id: 311, independentRequestDestination: true, name: 'EN' },
+    ]);
+    const created = await seedRequest(MediaRequestStatus.COMPLETED);
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update(MediaRequest)
+      .set({ serverId: 311 })
+      .where('id = :id', { id: created.id })
+      .callListeners(false)
+      .execute();
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: created.media.id,
+        serverId: 311,
+        status: MediaStatus.AVAILABLE,
+        externalServiceId: 12,
+      })
+    );
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const eligible = await admin.get('/request?filter=all');
+    assert.equal(eligible.status, 200);
+    const row = eligible.body.results.find(
+      (r: { id: number }) => r.id === created.id
+    );
+    assert.equal(row.canRemove, true);
+    assert.equal(row.target.canRemove, true);
+    assert.equal(
+      (await admin.get(`/request/${created.id}`)).body.target.canRemove,
+      true
+    );
+    getSettings().radarr = [];
+    const removed = await admin.get('/request?filter=all');
+    const removedRow = removed.body.results.find(
+      (r: { id: number }) => r.id === created.id
+    );
+    assert.equal(removedRow.target.deleted, true);
+    assert.equal(removedRow.target.canRemove, false);
+    assert.equal(removedRow.canRemove, false);
+  });
+
+  it('retains legacy native removal eligibility', async (t) => {
+    t.mock.method(
+      axios,
+      'create',
+      () =>
+        ({
+          interceptors: { request: { use: () => 0 } },
+          get: async () => ({ data: [] }),
+        }) as unknown as AxiosInstance
+    );
+    configureRadarr([{ id: 1 }]);
+    const created = await seedRequest(MediaRequestStatus.COMPLETED);
+    await getRepository(Media).update(created.media.id, { serviceId: 1 });
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const response = await admin.get('/request?filter=all');
+    assert.equal(
+      response.body.results.find((r: { id: number }) => r.id === created.id)
+        .canRemove,
+      true
+    );
   });
 });

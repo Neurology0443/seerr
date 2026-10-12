@@ -429,6 +429,69 @@ class SonarrAPI extends ServarrBase<{
 
     return newSeasons;
   }
+  // Independent removal: verify the preferred linkage before any destructive call.
+  public removeSeriesFromDestination = async (
+    tvdbId: number,
+    externalServiceId?: number | null
+  ): Promise<void> => {
+    if (!Number.isSafeInteger(tvdbId) || tvdbId <= 0) {
+      throw new Error('Invalid tvdbId for exact removal');
+    }
+    let record: SonarrSeries | undefined;
+    if (externalServiceId != null) {
+      if (!Number.isSafeInteger(externalServiceId) || externalServiceId <= 0) {
+        throw new Error('Invalid Arr record linkage');
+      }
+      try {
+        record = await this.getSeriesById(externalServiceId);
+        if (!record) throw new Error('Inconclusive Arr record lookup');
+      } catch (e) {
+        if (e?.cause?.response?.status !== 404) throw e;
+        // A missing linkage alone is insufficient: confirm against the library.
+      }
+      if (
+        record &&
+        (record.id !== externalServiceId || record.tvdbId !== tvdbId)
+      ) {
+        throw new Error('Arr record identity mismatch');
+      }
+    }
+    if (!record) {
+      const records = await this.getLibrarySeriesByTvdbId(tvdbId);
+      if (
+        !Array.isArray(records) ||
+        records.some(
+          (item) =>
+            !item ||
+            !Number.isSafeInteger(item.id) ||
+            (item.id ?? 0) <= 0 ||
+            !Number.isSafeInteger(item.tvdbId) ||
+            item.tvdbId <= 0
+        )
+      ) {
+        throw new Error('Inconclusive Arr library lookup');
+      }
+      const matches = records.filter((item) => item.tvdbId === tvdbId);
+      if (matches.length > 1) throw new Error('Ambiguous Arr record identity');
+      if (matches.length === 0) return;
+      record = matches[0];
+    }
+    if (
+      !Number.isSafeInteger(record.id) ||
+      (record.id ?? 0) <= 0 ||
+      record.tvdbId !== tvdbId
+    ) {
+      throw new Error('Arr record identity mismatch');
+    }
+    try {
+      await this.axios.delete(`/series/${record.id}`, {
+        params: { deleteFiles: true, addImportExclusion: false },
+      });
+    } catch (e) {
+      if (e?.response?.status !== 404) throw e;
+    }
+  };
+
   public removeSeries = async (tvdbId: number): Promise<void> => {
     const { id, title } = await this.getSeriesByTvdbId(tvdbId);
 

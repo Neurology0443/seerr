@@ -32,6 +32,7 @@ export interface MediaRequestTarget {
   deleted: boolean;
   status: MediaStatus;
   serviceUrl?: string;
+  canRemove?: boolean;
   downloadStatus?: DownloadingItem[];
 }
 
@@ -43,6 +44,8 @@ export interface MovieRequestTarget {
   isIndependent: boolean;
   status: MediaStatus;
   requestable: boolean;
+  canRemove?: boolean;
+  serviceUrl?: string;
 }
 
 export interface TvRequestTargetSeason {

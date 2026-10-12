@@ -5,16 +5,22 @@ import TheMovieDb from '@server/api/themoviedb';
 import { MediaStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import Season from '@server/entity/Season';
 import { User } from '@server/entity/User';
 import type {
   MediaResultsResponse,
   MediaWatchDataResponse,
 } from '@server/interfaces/api/mediaInterfaces';
+import { persistConfirmedDestinationRemoval } from '@server/lib/destinationRemoval';
 import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import {
+  withDvrIdentityLock,
+  withDvrSettingsMutationLock,
+} from '@server/utils/dvrIdentityLock';
 import { Router } from 'express';
 import type { FindOneOptions } from 'typeorm';
 import { EntityNotFoundError, In, IsNull, Not } from 'typeorm';
@@ -214,6 +220,103 @@ mediaRoutes.delete(
       const is4k = String(req.query.is4k) === 'true';
       const isMovie = media.mediaType === MediaType.MOVIE;
 
+      if (req.query.serverId !== undefined) {
+        const value = req.query.serverId;
+        if (
+          !(
+            (typeof value === 'string' && /^[1-9]\d*$/.test(value)) ||
+            typeof value === 'number'
+          ) ||
+          !Number.isSafeInteger(Number(value)) ||
+          Number(value) <= 0
+        ) {
+          return next({
+            status: 400,
+            message: 'serverId must be a positive integer.',
+          });
+        }
+        const serverId = Number(value);
+        // Settings updates only take the identity lock for role changes.
+        // Take their mutation lock first as well to freeze connection settings.
+        await withDvrSettingsMutationLock(isMovie ? 'radarr' : 'sonarr', () =>
+          withDvrIdentityLock(
+            isMovie ? 'radarr' : 'sonarr',
+            serverId,
+            async () => {
+              // Resolve inside the identity lock; never fall back to a default.
+              const servers = isMovie
+                ? getSettings().radarr
+                : getSettings().sonarr;
+              const server = servers.find(
+                (candidate) => candidate.id === serverId
+              );
+              if (!server || server.independentRequestDestination !== true) {
+                throw Object.assign(
+                  new Error(
+                    'Independent destination is not configured for this media type.'
+                  ),
+                  { status: 400 }
+                );
+              }
+              const destination = await getRepository(
+                MediaDestinationStatus
+              ).findOne({
+                where: { mediaId: media.id, serverId },
+              });
+              if (
+                !destination ||
+                (destination.externalServiceId != null &&
+                  (!Number.isSafeInteger(destination.externalServiceId) ||
+                    destination.externalServiceId <= 0))
+              ) {
+                throw Object.assign(
+                  new Error('Destination state or Arr linkage is invalid.'),
+                  { status: 400 }
+                );
+              }
+              if (isMovie) {
+                const arr = new RadarrAPI({
+                  apiKey: server.apiKey,
+                  url: RadarrAPI.buildUrl(server, '/api/v3'),
+                });
+                await arr.removeMovieFromDestination(
+                  media.tmdbId,
+                  destination.externalServiceId
+                );
+              } else {
+                let tvdbId = media.tvdbId;
+                if (!tvdbId) {
+                  const series = await new TheMovieDb().getTvShow({
+                    tvId: media.tmdbId,
+                  });
+                  tvdbId = series.external_ids.tvdb_id;
+                }
+                if (!tvdbId || !Number.isSafeInteger(tvdbId) || tvdbId <= 0) {
+                  throw Object.assign(
+                    new Error('TVDB identity is unavailable.'),
+                    { status: 400 }
+                  );
+                }
+                const arr = new SonarrAPI({
+                  apiKey: server.apiKey,
+                  url: SonarrAPI.buildUrl(server, '/api/v3'),
+                });
+                await arr.removeSeriesFromDestination(
+                  tvdbId,
+                  destination.externalServiceId
+                );
+              }
+              await persistConfirmedDestinationRemoval(
+                media.id,
+                serverId,
+                mediaRepository.manager
+              );
+            }
+          )
+        );
+        return res.status(204).send();
+      }
+
       let serviceSettings;
       if (isMovie) {
         serviceSettings = settings.radarr.find(
@@ -254,6 +357,13 @@ mediaRoutes.delete(
         return next({
           status: 409,
           message: `No ${arrName} server configured to delete media files`,
+        });
+      }
+
+      if (serviceSettings.independentRequestDestination === true) {
+        return next({
+          status: 409,
+          message: 'Independent destinations require an explicit serverId.',
         });
       }
 
@@ -300,7 +410,13 @@ mediaRoutes.delete(
         mediaId: req.params.id,
         message: e.message,
       });
-      next({ status: 500, message: 'Failed to delete media file' });
+      next({
+        status: req.query.serverId !== undefined ? (e.status ?? 500) : 500,
+        message:
+          req.query.serverId !== undefined && e.status
+            ? e.message
+            : 'Failed to delete media file',
+      });
     }
   }
 );

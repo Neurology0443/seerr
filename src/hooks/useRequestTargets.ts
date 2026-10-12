@@ -42,7 +42,9 @@ export const revalidateRequestData = ({
         typeof key === 'string' &&
         (key === '/api/v1/request/count' ||
           key.startsWith('/api/v1/request?') ||
-          (requestId !== undefined && key === `/api/v1/request/${requestId}`))
+          (requestId !== undefined
+            ? key === `/api/v1/request/${requestId}`
+            : /^\/api\/v1\/request\/\d+$/.test(key)))
     ),
   ]);
 

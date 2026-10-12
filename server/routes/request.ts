@@ -243,7 +243,8 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
         requests.map(async (r) => {
           const serialized = await serializeMediaRequest(
             r,
-            getRepository(MediaRequest).manager
+            getRepository(MediaRequest).manager,
+            req.user
           );
 
           switch (r.type) {
@@ -280,12 +281,14 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
                 // check if the radarr server for this request is configured
                 canRemove:
                   r.target?.isIndependent === true
-                    ? false
-                    : radarrServers.some(
-                        (server) =>
-                          server.id ===
-                          (r.is4k ? r.media.serviceId4k : r.media.serviceId)
-                      ),
+                    ? r.target.canRemove === true
+                    : r.target?.deleted
+                      ? false
+                      : radarrServers.some(
+                          (server) =>
+                            server.id ===
+                            (r.is4k ? r.media.serviceId4k : r.media.serviceId)
+                        ),
               };
             }
             case MediaType.TV: {
@@ -294,12 +297,14 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
                 // check if the sonarr server for this request is configured
                 canRemove:
                   r.target?.isIndependent === true
-                    ? false
-                    : sonarrServers.some(
-                        (server) =>
-                          server.id ===
-                          (r.is4k ? r.media.serviceId4k : r.media.serviceId)
-                      ),
+                    ? r.target.canRemove === true
+                    : r.target?.deleted
+                      ? false
+                      : sonarrServers.some(
+                          (server) =>
+                            server.id ===
+                            (r.is4k ? r.media.serviceId4k : r.media.serviceId)
+                        ),
               };
             }
           }
@@ -356,7 +361,8 @@ requestRoutes.post<never, MediaRequest, MediaRequestBody>(
         .json(
           await serializeMediaRequest(
             request,
-            getRepository(MediaRequest).manager
+            getRepository(MediaRequest).manager,
+            req.user
           )
         );
     } catch (error) {
@@ -492,7 +498,9 @@ requestRoutes.get('/:requestId', async (req, res, next) => {
 
     return res
       .status(200)
-      .json(await serializeRequestEdit(request, requestRepository.manager));
+      .json(
+        await serializeRequestEdit(request, requestRepository.manager, req.user)
+      );
   } catch (e) {
     logger.debug('Failed to retrieve request.', {
       label: 'API',
@@ -828,7 +836,8 @@ requestRoutes.put<{ requestId: string }>(
                     await requestRepository.findOneOrFail({
                       where: { id: requestId },
                     }),
-                    requestRepository.manager
+                    requestRepository.manager,
+                    req.user
                   )
                 );
               }
@@ -840,7 +849,8 @@ requestRoutes.put<{ requestId: string }>(
               await requestRepository.findOneOrFail({
                 where: { id: requestId },
               }),
-              requestRepository.manager
+              requestRepository.manager,
+              req.user
             )
           );
         });
@@ -1033,7 +1043,8 @@ requestRoutes.post<{
                   .json(
                     await serializeMediaRequest(
                       request,
-                      requestRepository.manager
+                      requestRepository.manager,
+                      req.user
                     )
                   );
               }
@@ -1095,7 +1106,8 @@ requestRoutes.post<{
                 .json(
                   await serializeMediaRequest(
                     request,
-                    requestRepository.manager
+                    requestRepository.manager,
+                    req.user
                   )
                 );
             }
@@ -1176,7 +1188,11 @@ requestRoutes.post<{
         return res
           .status(200)
           .json(
-            await serializeMediaRequest(request, requestRepository.manager)
+            await serializeMediaRequest(
+              request,
+              requestRepository.manager,
+              req.user
+            )
           );
       });
     } catch (e) {

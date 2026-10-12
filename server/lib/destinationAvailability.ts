@@ -801,7 +801,7 @@ export const markMissingMovieDestination = async (
   await notifyDeclinedRequests(declinedRequests);
 };
 
-const notifyDeclinedRequests = async (
+export const notifyDeclinedRequests = async (
   requests: MediaRequest[]
 ): Promise<void> => {
   for (const request of requests) {

@@ -286,6 +286,69 @@ class RadarrAPI extends ServarrBase<{ movieId: number }> {
       );
     }
   }
+  // Independent removal: verify the preferred linkage before any destructive call.
+  public removeMovieFromDestination = async (
+    tmdbId: number,
+    externalServiceId?: number | null
+  ): Promise<void> => {
+    if (!Number.isSafeInteger(tmdbId) || tmdbId <= 0) {
+      throw new Error('Invalid tmdbId for exact removal');
+    }
+    let record: RadarrMovie | undefined;
+    if (externalServiceId != null) {
+      if (!Number.isSafeInteger(externalServiceId) || externalServiceId <= 0) {
+        throw new Error('Invalid Arr record linkage');
+      }
+      try {
+        record = await this.getMovie({ id: externalServiceId });
+        if (!record) throw new Error('Inconclusive Arr record lookup');
+      } catch (e) {
+        if (e?.cause?.response?.status !== 404) throw e;
+        // A missing linkage alone is insufficient: confirm against the library.
+      }
+      if (
+        record &&
+        (record.id !== externalServiceId || record.tmdbId !== tmdbId)
+      ) {
+        throw new Error('Arr record identity mismatch');
+      }
+    }
+    if (!record) {
+      const records = await this.getLibraryMoviesByTmdbId(tmdbId);
+      if (
+        !Array.isArray(records) ||
+        records.some(
+          (item) =>
+            !item ||
+            !Number.isSafeInteger(item.id) ||
+            (item.id ?? 0) <= 0 ||
+            !Number.isSafeInteger(item.tmdbId) ||
+            item.tmdbId <= 0
+        )
+      ) {
+        throw new Error('Inconclusive Arr library lookup');
+      }
+      const matches = records.filter((item) => item.tmdbId === tmdbId);
+      if (matches.length > 1) throw new Error('Ambiguous Arr record identity');
+      if (matches.length === 0) return;
+      record = matches[0];
+    }
+    if (
+      !Number.isSafeInteger(record.id) ||
+      (record.id ?? 0) <= 0 ||
+      record.tmdbId !== tmdbId
+    ) {
+      throw new Error('Arr record identity mismatch');
+    }
+    try {
+      await this.axios.delete(`/movie/${record.id}`, {
+        params: { deleteFiles: true, addImportExclusion: false },
+      });
+    } catch (e) {
+      if (e?.response?.status !== 404) throw e;
+    }
+  };
+
   public removeMovie = async (tmdbId: number): Promise<void> => {
     const { id, title } = await this.getMovieByTmdbId(tmdbId);
 

@@ -1315,6 +1315,10 @@ components:
         serviceUrl:
           type: string
           description: Arr URL for the exact independent destination linkage.
+        canRemove:
+          type: boolean
+          readOnly: true
+          description: Whether the current user can remove the exact configured independent destination.
         downloadStatus:
           type: array
           description: Downloads for the exact independent destination and requested seasons.
@@ -1344,6 +1348,13 @@ components:
           type: number
         requestable:
           type: boolean
+        canRemove:
+          type: boolean
+          readOnly: true
+          description: Exact independent removal eligibility for the current user.
+        serviceUrl:
+          type: string
+          description: Arr URL for the exact independent destination linkage.
       required:
         - serverId
         - name
@@ -7536,7 +7547,7 @@ paths:
   /media/{mediaId}/file:
     delete:
       summary: Delete media file
-      description: Removes a media file from radarr/sonarr. The `ADMIN` permission is required to perform this action.
+      description: Removes media and its files from Radarr/Sonarr. Requires `MANAGE_REQUESTS`. An explicit serverId targets only that independent destination, with no fallback; is4k is ignored in that path.
       tags:
         - media
       parameters:
@@ -7554,6 +7565,13 @@ paths:
           example: false
           schema:
             type: boolean
+        - in: query
+          name: serverId
+          description: Persistent ID of the exact independent Radarr/Sonarr destination.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
       responses:
         '204':
           description: Successfully removed media item

@@ -5,6 +5,7 @@ import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import SeasonRequest from '@server/entity/SeasonRequest';
+import type { User } from '@server/entity/User';
 import type {
   MediaRequestTarget,
   RequestDetailResponse,
@@ -12,6 +13,7 @@ import type {
 import downloadTracker, {
   type DownloadingItem,
 } from '@server/lib/downloadtracker';
+import { Permission } from '@server/lib/permissions';
 import { getRequestDownloadStatus } from '@server/lib/requestDownloadStatus';
 import { getRequestEditRevision } from '@server/lib/requestEditRevision';
 import {
@@ -122,7 +124,8 @@ export const getConfiguredRequestTargetState = ({
 export const getRequestTargetState = async (
   request: Pick<MediaRequest, 'type' | 'serverId' | 'is4k' | 'media'> &
     Partial<Pick<MediaRequest, 'id' | 'seasons'>>,
-  manager: EntityManager
+  manager: EntityManager,
+  user?: Pick<User, 'hasPermission'>
 ): Promise<MediaRequestTarget | null> => {
   if (request.serverId == null) {
     return null;
@@ -187,9 +190,10 @@ export const getRequestTargetState = async (
   return {
     serverId: request.serverId,
     name: getRequestTargetName(request),
-    is4k: request.is4k,
+    is4k: independent && server ? Boolean(server.is4k) : request.is4k,
     isIndependent: independent,
     deleted: !server,
+    ...(!server ? { canRemove: false } : {}),
     status: getEffectiveTargetStatus({
       media,
       is4k: request.is4k,
@@ -197,7 +201,19 @@ export const getRequestTargetState = async (
       destinationStatus: destination?.status,
     }),
     ...(independent
-      ? { downloadStatus, ...(serviceUrl ? { serviceUrl } : {}) }
+      ? {
+          canRemove: Boolean(
+            user?.hasPermission(Permission.MANAGE_REQUESTS) &&
+            request.type === request.media.mediaType &&
+            server?.independentRequestDestination === true &&
+            destination &&
+            destination.status !== MediaStatus.DELETED &&
+            Number.isSafeInteger(destination.externalServiceId) &&
+            (destination.externalServiceId ?? 0) > 0
+          ),
+          downloadStatus,
+          ...(serviceUrl ? { serviceUrl } : {}),
+        }
       : {}),
   };
 };
@@ -207,19 +223,21 @@ export const serializeMediaRequest = async <
     Partial<Pick<MediaRequest, 'id' | 'seasons'>>,
 >(
   request: T,
-  manager: EntityManager
+  manager: EntityManager,
+  user?: Pick<User, 'hasPermission'>
 ): Promise<T & { target: MediaRequestTarget | null }> => ({
   ...request,
-  target: await getRequestTargetState(request, manager),
+  target: await getRequestTargetState(request, manager, user),
 });
 
 // Edit responses must describe persisted state: save() can leave undefined
 // properties on the in-memory entity even though the DB retained its values.
 export const serializeRequestEdit = async (
   request: MediaRequest,
-  manager: EntityManager
+  manager: EntityManager,
+  user?: Pick<User, 'hasPermission'>
 ): Promise<RequestDetailResponse> => ({
-  ...(await serializeMediaRequest(request, manager)),
+  ...(await serializeMediaRequest(request, manager, user)),
   editRevision: getRequestEditRevision(request),
 });
 
