@@ -128,7 +128,7 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
 
   const serverId = Number(req.params.id);
 
-  const update = async (identityLocked = false): Promise<unknown> => {
+  const update = async (): Promise<unknown> => {
     const settings = getSettings();
     const sonarrIndex = settings.sonarr.findIndex((r) => r.id === serverId);
 
@@ -176,10 +176,6 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
       currentIndependentRequestDestination;
     const is4kRoleChanged = updatedSonarr.is4k !== currentSonarr.is4k;
 
-    if ((independentRoleChanged || is4kRoleChanged) && !identityLocked) {
-      return withDvrIdentityLock('sonarr', serverId, () => update(true));
-    }
-
     if (
       (independentRoleChanged || is4kRoleChanged) &&
       (await isDvrServerHistoricallyUsed('sonarr', currentSonarr.id))
@@ -217,14 +213,16 @@ sonarrRoutes.put<{ id: string }>('/:id', async (req, res, next) => {
     return res.status(200).json(settings.sonarr[sonarrIndex]);
   };
 
-  return withDvrSettingsMutationLock('sonarr', update);
+  return withDvrIdentityLock('sonarr', serverId, () =>
+    withDvrSettingsMutationLock('sonarr', update)
+  );
 });
 
 sonarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   const serverId = Number(req.params.id);
 
-  return withDvrSettingsMutationLock('sonarr', () =>
-    withDvrIdentityLock('sonarr', serverId, async () => {
+  return withDvrIdentityLock('sonarr', serverId, () =>
+    withDvrSettingsMutationLock('sonarr', async () => {
       const settings = getSettings();
       const sonarrIndex = settings.sonarr.findIndex((r) => r.id === serverId);
 

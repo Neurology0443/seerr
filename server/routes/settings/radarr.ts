@@ -131,7 +131,7 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
 
     const serverId = Number(req.params.id);
 
-    const update = async (identityLocked = false): Promise<unknown> => {
+    const update = async (): Promise<unknown> => {
       const settings = getSettings();
       const radarrIndex = settings.radarr.findIndex((r) => r.id === serverId);
 
@@ -182,10 +182,6 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
         currentIndependentRequestDestination;
       const is4kRoleChanged = updatedRadarr.is4k !== currentRadarr.is4k;
 
-      if ((independentRoleChanged || is4kRoleChanged) && !identityLocked) {
-        return withDvrIdentityLock('radarr', serverId, () => update(true));
-      }
-
       if (
         (independentRoleChanged || is4kRoleChanged) &&
         (await isDvrServerHistoricallyUsed('radarr', currentRadarr.id))
@@ -225,7 +221,9 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
       return res.status(200).json(settings.radarr[radarrIndex]);
     };
 
-    return withDvrSettingsMutationLock('radarr', update);
+    return withDvrIdentityLock('radarr', serverId, () =>
+      withDvrSettingsMutationLock('radarr', update)
+    );
   }
 );
 
@@ -258,8 +256,8 @@ radarrRoutes.get<{ id: string }>('/:id/profiles', async (req, res, next) => {
 radarrRoutes.delete<{ id: string }>('/:id', async (req, res, next) => {
   const serverId = Number(req.params.id);
 
-  return withDvrSettingsMutationLock('radarr', () =>
-    withDvrIdentityLock('radarr', serverId, async () => {
+  return withDvrIdentityLock('radarr', serverId, () =>
+    withDvrSettingsMutationLock('radarr', async () => {
       const settings = getSettings();
       const radarrIndex = settings.radarr.findIndex((r) => r.id === serverId);
 

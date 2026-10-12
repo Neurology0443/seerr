@@ -13,6 +13,7 @@ import {
   seedRemoval,
 } from '@server/test/fixtures/destinationRemoval';
 import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
+import * as dvrIdentityLocks from '@server/utils/dvrIdentityLock';
 import {
   withDvrIdentityLock,
   withDvrSettingsMutationLock,
@@ -152,8 +153,8 @@ for (const type of [MediaType.MOVIE, MediaType.TV]) {
       await notificationEntered;
       try {
         const kind = type === MediaType.MOVIE ? 'radarr' : 'sonarr';
-        await withDvrSettingsMutationLock(kind, () =>
-          withDvrIdentityLock(kind, 2, async () => undefined)
+        await withDvrIdentityLock(kind, 2, () =>
+          withDvrSettingsMutationLock(kind, async () => undefined)
         );
         await withDestinationOperationLock(
           type,
@@ -187,72 +188,227 @@ for (const type of [MediaType.MOVIE, MediaType.TV]) {
       );
       assert.equal(calls.filter((call) => call.method === 'DELETE').length, 1);
     });
-    it('holds connection settings stable until confirmed removal commits', async () => {
-      const { media } = await seedRemoval(type);
-      const settings = getSettings();
-      const kind = type === MediaType.MOVIE ? 'radarr' : 'sonarr';
-      const originalServer = { ...settings[kind][1] };
-      mock.method(settings, 'save', async () => undefined);
-      mock.method(MediaRequest, 'sendNotification', async () => undefined);
-      let started!: () => void;
-      let release!: () => void;
-      const reached = new Promise<void>((resolve) => {
-        started = resolve;
-      });
-      const remote = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      mock.method(
-        axios,
-        'create',
-        (config: AxiosRequestConfig) =>
-          ({
-            interceptors: {
-              request: { use: () => 0 },
-              response: { use: () => 0 },
-            },
-            get: async () => ({ data: { id: 12, tmdbId: 550, tvdbId: 1234 } }),
-            delete: async () => {
-              assert.equal(config.baseURL, 'http://server-2:7878/api/v3');
-              started();
-              await remote;
-              return {};
-            },
-          }) as unknown as AxiosInstance
+    for (const mutation of ['connection update', 'deletion'] as const) {
+      it(
+        `allows FR removal while EN removal blocks an EN ${mutation}`,
+        { timeout: 10000 },
+        async (t) => {
+          const { media, requests } = await seedRemoval(type);
+          const settings = getSettings();
+          const kind = type === MediaType.MOVIE ? 'radarr' : 'sonarr';
+          const originalServer = { ...settings[kind][1] };
+          // Deletion is allowed once the remaining approved request is declined.
+          await getRepository(MediaRequest).delete(requests[1].id);
+          mock.method(settings, 'save', async () => undefined);
+          mock.method(MediaRequest, 'sendNotification', async () => undefined);
+          let started!: () => void;
+          let release!: () => void;
+          const reached = new Promise<void>((resolve) => {
+            started = resolve;
+          });
+          const remote = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          t.after(() => release());
+          const deletedServers: string[] = [];
+          mock.method(
+            axios,
+            'create',
+            (config: AxiosRequestConfig) =>
+              ({
+                interceptors: {
+                  request: { use: () => 0 },
+                  response: { use: () => 0 },
+                },
+                get: async (path: string) => ({
+                  data: {
+                    id: Number(path.split('/').at(-1)),
+                    tmdbId: 550,
+                    tvdbId: 1234,
+                  },
+                }),
+                delete: async () => {
+                  deletedServers.push(config.baseURL!);
+                  if (config.baseURL === 'http://server-2:7878/api/v3') {
+                    started();
+                    await remote;
+                    assert.equal(
+                      settings[kind][1].hostname,
+                      originalServer.hostname
+                    );
+                  }
+                  return {};
+                },
+              }) as unknown as AxiosInstance
+          );
+          const removing = request(app)
+            .delete(`/media/${media.id}/file?serverId=2`)
+            .then((res) => res);
+          await reached;
+          let attempted!: () => void;
+          const mutationAttempted = new Promise<void>((resolve) => {
+            attempted = resolve;
+          });
+          const originalLock = dvrIdentityLocks.withDvrIdentityLock;
+          mock.method(
+            dvrIdentityLocks,
+            'withDvrIdentityLock',
+            (...args: Parameters<typeof originalLock>) => {
+              if (args[0] === kind && args[1] === 2) attempted();
+              return originalLock(...args);
+            }
+          );
+          let settled = false;
+          const changing = (
+            mutation === 'deletion'
+              ? request(app).delete(`/settings/${kind}/2`)
+              : request(app)
+                  .put(`/settings/${kind}/2`)
+                  .send({ ...originalServer, hostname: 'replacement-instance' })
+          ).then((res) => {
+            settled = true;
+            return res;
+          });
+          await mutationAttempted;
+          try {
+            assert.equal(settled, false);
+            assert.equal(settings[kind][1].hostname, originalServer.hostname);
+            // Neither the pending Arr response nor a queued EN settings mutation
+            // may hold the settings lock needed by FR.
+            assert.equal(
+              (
+                await request(app)
+                  .put(`/settings/${kind}/1`)
+                  .send({ ...settings[kind][0], name: 'French' })
+              ).status,
+              200
+            );
+            assert.equal(
+              (await request(app).delete(`/media/${media.id}/file?serverId=1`))
+                .status,
+              204
+            );
+            assert.deepEqual(deletedServers, [
+              'http://server-2:7878/api/v3',
+              'http://server-1:7878/api/v3',
+            ]);
+            assert.equal(settled, false);
+          } finally {
+            release();
+          }
+          assert.equal((await removing).status, 204);
+          assert.equal((await changing).status, 200);
+          if (mutation === 'deletion')
+            assert.equal(
+              settings[kind].some((server) => server.id === 2),
+              false
+            );
+          else assert.equal(settings[kind][1].hostname, 'replacement-instance');
+          assert.equal(
+            (
+              await getRepository(MediaDestinationStatus).findOneByOrFail({
+                mediaId: media.id,
+                serverId: 2,
+              })
+            ).status,
+            MediaStatus.DELETED
+          );
+        }
       );
-      const removal = request(app)
-        .delete(`/media/${media.id}/file?serverId=2`)
-        .then((res) => res);
-      await reached;
-      let settled = false;
-      const update = request(app)
-        .put(`/settings/${kind}/2`)
-        .send({ ...originalServer, hostname: 'replacement-instance' })
-        .then((res) => {
-          settled = true;
-          return res;
-        });
-      try {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(settled, false);
-        assert.equal(settings[kind][1].hostname, originalServer.hostname);
-      } finally {
-        release();
-      }
-      assert.equal((await removal).status, 204);
-      assert.equal((await update).status, 200);
-      assert.equal(settings[kind][1].hostname, 'replacement-instance');
-      assert.equal(
-        (
-          await getRepository(MediaDestinationStatus).findOneByOrFail({
-            mediaId: media.id,
+    }
+
+    it(
+      'serializes removals of different media on the same server',
+      { timeout: 10000 },
+      async (t) => {
+        const { media } = await seedRemoval(type);
+        const other = await getRepository(Media).save(
+          new Media({ tmdbId: 551, tvdbId: 1235, mediaType: type }),
+          { listeners: false }
+        );
+        await getRepository(MediaDestinationStatus).save(
+          new MediaDestinationStatus({
+            mediaId: other.id,
             serverId: 2,
+            status: MediaStatus.AVAILABLE,
+            externalServiceId: 22,
           })
-        ).status,
-        MediaStatus.DELETED
-      );
-    });
+        );
+        mock.method(MediaRequest, 'sendNotification', async () => undefined);
+        let entered!: () => void;
+        let release!: () => void;
+        const started = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const remote = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        t.after(() => release());
+        const deletions: string[] = [];
+        mock.method(
+          axios,
+          'create',
+          () =>
+            ({
+              interceptors: {
+                request: { use: () => 0 },
+                response: { use: () => 0 },
+              },
+              get: async (path: string) => {
+                const id = Number(path.split('/').at(-1));
+                return {
+                  data: {
+                    id,
+                    tmdbId: id === 12 ? 550 : 551,
+                    tvdbId: id === 12 ? 1234 : 1235,
+                  },
+                };
+              },
+              delete: async (path: string) => {
+                deletions.push(path);
+                if (path.endsWith('/12')) {
+                  entered();
+                  await remote;
+                }
+                return {};
+              },
+            }) as unknown as AxiosInstance
+        );
+        const first = request(app)
+          .delete(`/media/${media.id}/file?serverId=2`)
+          .then((res) => res);
+        await started;
+        let attempted!: () => void;
+        const secondAttempted = new Promise<void>((resolve) => {
+          attempted = resolve;
+        });
+        const originalLock = dvrIdentityLocks.withDvrIdentityLock;
+        mock.method(
+          dvrIdentityLocks,
+          'withDvrIdentityLock',
+          (...args: Parameters<typeof originalLock>) => {
+            attempted();
+            return originalLock(...args);
+          }
+        );
+        const second = request(app)
+          .delete(`/media/${other.id}/file?serverId=2`)
+          .then((res) => res);
+        await secondAttempted;
+        assert.deepEqual(deletions, [
+          type === MediaType.MOVIE ? '/movie/12' : '/series/12',
+        ]);
+        release();
+        assert.equal((await first).status, 204);
+        assert.equal((await second).status, 204);
+        assert.deepEqual(
+          deletions,
+          type === MediaType.MOVIE
+            ? ['/movie/12', '/movie/22']
+            : ['/series/12', '/series/22']
+        );
+      }
+    );
     for (const lookup of ['mismatch', 'inconclusive', 'failed'] as const) {
       it(`does not delete or mutate DB when exact lookup is ${lookup}`, async () => {
         const { media } = await seedRemoval(type);

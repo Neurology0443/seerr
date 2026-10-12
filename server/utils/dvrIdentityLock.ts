@@ -17,6 +17,9 @@ export const withDvrIdentityLock = <T>(
 ): Promise<T> =>
   dvrIdentityLock.dispatch(dvrIdentityKey(kind, serverId), callback);
 
+// Existing-server mutations take identity before settings, so waiting for one
+// server's network operation never holds the settings lock for other servers.
+// Remote Arr operations take identity only; settings protects shared mutations.
 export const withDvrSettingsMutationLock = <T>(
   kind: DvrIdentityKind,
   callback: () => Promise<T>

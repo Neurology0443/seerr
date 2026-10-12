@@ -23,6 +23,7 @@ import { Notification } from '@server/lib/notifications';
 import { sonarrScanner } from '@server/lib/scanners/sonarr';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import mediaRoutes from '@server/routes/media';
 import { setupTestDb } from '@server/test/db';
 import {
   removalSnapshot,
@@ -30,8 +31,11 @@ import {
 } from '@server/test/fixtures/destinationRemoval';
 import { runWithMockTimers } from '@server/test/runWithMockTimers';
 import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
+import axios, { type AxiosInstance } from 'axios';
+import express from 'express';
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it, mock } from 'node:test';
+import request from 'supertest';
 
 let getSeriesImpl: () => Promise<SonarrSeries[]> = async () => [];
 Object.defineProperty(SonarrAPI.prototype, 'getSeries', {
@@ -216,12 +220,121 @@ function configureSonarr(overrides: Partial<SonarrSettings>[] = [{}]): void {
 }
 
 describe('Sonarr Scanner', () => {
+  it('commits reconciliation and releases the destination before notification delivery and explicit removal', async (t) => {
+    const { media, destinations, requests } = await seedRemoval(MediaType.TV);
+    configureSonarr([{ id: 2, independentRequestDestination: true }]);
+    await getRepository(MediaRequest).delete(requests[1].id);
+    await getRepository(MediaDestinationStatus).update(destinations[1].id, {
+      status: MediaStatus.PROCESSING,
+    });
+    await getRepository(MediaDestinationSeasonStatus).update(
+      { destinationStatusId: destinations[1].id },
+      { status: MediaStatus.PROCESSING }
+    );
+    getSeriesImpl = async () => [fakeSonarrSeries({ id: 999, tvdbId: 999 })];
+    getShowByTvdbIdImpl = async () => fakeTmdbShow(999);
+    getTvShowImpl = async () => fakeTmdbShow(999);
+    let entered!: () => void;
+    let release!: () => void;
+    const notifying = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const delivered = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    t.after(() => release());
+    const notify = t.mock.method(
+      MediaRequest,
+      'sendNotification',
+      async (
+        declined: MediaRequest,
+        _media: Media,
+        notification: Notification
+      ) => {
+        assert.equal(notification, Notification.MEDIA_DECLINED);
+        assert.equal(declined.id, requests[0].id);
+        assert.equal(
+          (
+            await getRepository(MediaRequest).findOneByOrFail({
+              id: declined.id,
+            })
+          ).status,
+          MediaRequestStatus.DECLINED
+        );
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              id: destinations[1].id,
+            })
+          ).status,
+          MediaStatus.UNKNOWN
+        );
+        assert.equal(
+          getRepository(Media).manager.queryRunner?.isTransactionActive ??
+            false,
+          false
+        );
+        entered();
+        await delivered;
+        throw new Error('notification delivery failed');
+      }
+    );
+    t.mock.method(
+      axios,
+      'create',
+      () =>
+        ({
+          interceptors: {
+            request: { use: () => 0 },
+            response: { use: () => 0 },
+          },
+          get: async () => ({ data: { id: 12, tmdbId: 550, tvdbId: 1234 } }),
+          delete: async () => ({}),
+        }) as unknown as AxiosInstance
+    );
+    const app = express();
+    app.use(async (req, _res, next) => {
+      req.user = await getRepository(User).findOneByOrFail({ id: 1 });
+      next();
+    });
+    app.use('/media', mediaRoutes);
+    const scanning = runWithMockTimers(() => sonarrScanner.run());
+    await notifying;
+    try {
+      assert.equal(
+        (await request(app).delete(`/media/${media.id}/file?serverId=2`))
+          .status,
+        204
+      );
+      const removed = await getRepository(
+        MediaDestinationStatus
+      ).findOneByOrFail({ id: destinations[1].id });
+      assert.equal(removed.status, MediaStatus.DELETED);
+      assert.equal(removed.externalServiceId, null);
+    } finally {
+      release();
+    }
+    await scanning;
+    assert.equal(notify.mock.callCount(), 1);
+    assert.equal(
+      (
+        await getRepository(MediaRequest).findOneByOrFail({
+          id: requests[0].id,
+        })
+      ).status,
+      MediaRequestStatus.DECLINED
+    );
+    await runWithMockTimers(() => sonarrScanner.run());
+    assert.equal(notify.mock.callCount(), 1);
+  });
+
   it('rejects stale inventory and season observations after removal, but allows fresh rediscovery', async () => {
     const { media, destinations } = await seedRemoval(MediaType.TV);
     configureSonarr([
       { id: 2, hostname: 'sonarr-en', independentRequestDestination: true },
     ]);
     getTvShowImpl = async () => fakeTmdbShow(media.tmdbId);
+    const initialNotifications = sendNotificationMock.mock.callCount();
     const before = await removalSnapshot();
     let captured!: () => void;
     const inventoryCaptured = new Promise<void>((resolve) => {
@@ -251,6 +364,7 @@ describe('Sonarr Scanner', () => {
       resume();
     }
     await scanning;
+    assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
     const after = await removalSnapshot();
     assert.equal(after.destinations[1].status, MediaStatus.DELETED);
     assert.equal(after.destinations[1].externalServiceId, null);

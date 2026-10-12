@@ -411,6 +411,54 @@ const downloading = (
 
 describe('independent request serialization', () => {
   for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`omits the ${type} management URL without permission while preserving destination and download information`, async () => {
+      const server =
+        type === MediaType.MOVIE
+          ? radarr(1, {
+              independentRequestDestination: true,
+              externalUrl: 'https://exact.example',
+            })
+          : sonarr(1, {
+              independentRequestDestination: true,
+              externalUrl: 'https://exact.example',
+            });
+      if (type === MediaType.MOVIE)
+        getSettings().radarr = [server as RadarrSettings];
+      else getSettings().sonarr = [server as SonarrSettings];
+      const { media, request } = await seedRequest({ type });
+      await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 1,
+          status: MediaStatus.PROCESSING,
+          externalServiceId: 12,
+          externalServiceSlug: 'exact',
+        })
+      );
+      const manager = getRepository(MediaRequest).manager;
+      const admin = await getRepository(User).findOneByOrFail({ id: 1 });
+      const viewer = await getRepository(User).findOneByOrFail({ id: 2 });
+      const authorized = await serializeMediaRequest(request, manager, admin);
+      assert.equal(
+        authorized.target?.serviceUrl,
+        `https://exact.example/${type === MediaType.MOVIE ? 'movie' : 'series'}/exact`
+      );
+      assert.equal(authorized.target?.canRemove, true);
+      const expected = { ...authorized.target!, canRemove: false };
+      delete expected.serviceUrl;
+      for (const user of [viewer, undefined]) {
+        const unauthorized = await serializeMediaRequest(
+          request,
+          manager,
+          user
+        );
+        assert.ok(!Object.hasOwn(unauthorized.target!, 'serviceUrl'));
+        assert.deepEqual(unauthorized.target, expected);
+      }
+    });
+  }
+
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
     it(`normalizes ${type} external URLs while preserving proxy paths`, async () => {
       const server =
         type === MediaType.MOVIE
@@ -441,7 +489,8 @@ describe('independent request serialization', () => {
           (
             await getRequestTargetState(
               request,
-              getRepository(MediaRequest).manager
+              getRepository(MediaRequest).manager,
+              await getRepository(User).findOneByOrFail({ id: 1 })
             )
           )?.serviceUrl,
           `${base}/${path}/exact-slug`
@@ -560,8 +609,9 @@ describe('independent request serialization', () => {
       }
     );
     const manager = getRepository(MediaRequest).manager;
-    const fr = (await serializeMediaRequest(french, manager)).target!;
-    const en = (await serializeMediaRequest(english, manager)).target!;
+    const admin = await getRepository(User).findOneByOrFail({ id: 1 });
+    const fr = (await serializeMediaRequest(french, manager, admin)).target!;
+    const en = (await serializeMediaRequest(english, manager, admin)).target!;
     assert.equal(fr.status, MediaStatus.AVAILABLE);
     assert.equal(en.status, MediaStatus.PROCESSING);
     assert.deepEqual(fr.downloadStatus, [downloading('fr')]);
@@ -647,13 +697,15 @@ describe('independent request serialization', () => {
       }
     );
     const manager = getRepository(MediaRequest).manager;
-    const target = await getRequestTargetState(request, manager);
+    const admin = await getRepository(User).findOneByOrFail({ id: 1 });
+    const target = await getRequestTargetState(request, manager, admin);
     assert.deepEqual(target?.downloadStatus, [queue[0], queue[2]]);
     assert.deepEqual(progress.mock.calls[0].arguments, [2, 100]);
     assert.equal(target?.serviceUrl, 'https://en.example/series/show');
     const french = await getRequestTargetState(
       { ...request, serverId: 1 },
-      manager
+      manager,
+      admin
     );
     assert.equal(
       french?.serviceUrl,
@@ -665,7 +717,7 @@ describe('independent request serialization', () => {
     assert.equal(french?.status, MediaStatus.AVAILABLE);
     getSettings().sonarr[1].externalUrl = '';
     assert.equal(
-      (await getRequestTargetState(request, manager))?.serviceUrl,
+      (await getRequestTargetState(request, manager, admin))?.serviceUrl,
       'http://localhost:8989/series/show'
     );
     progress.mock.mockImplementation(() => []);

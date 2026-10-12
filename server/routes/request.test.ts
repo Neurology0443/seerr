@@ -1739,6 +1739,78 @@ describe('PUT /request/:requestId (quota)', () => {
 });
 
 describe('GET /request/:requestId', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`restricts the exact independent ${type} management URL in detail and list responses`, async () => {
+      const servers = [
+        {
+          id: 501,
+          name: 'Exact',
+          independentRequestDestination: true,
+          externalUrl: 'https://exact.example',
+        },
+      ];
+      if (type === MediaType.MOVIE) configureRadarr(servers);
+      else configureSonarr(servers);
+      const requestedBy = await getRepository(User).findOneOrFail({
+        where: { email: 'demo@seerr.dev' },
+      });
+      const media = await getRepository(Media).save(
+        new Media({
+          mediaType: type,
+          tmdbId: 50100,
+          tvdbId: type === MediaType.TV ? 50101 : undefined,
+          status: MediaStatus.AVAILABLE,
+        })
+      );
+      const req = await getRepository(MediaRequest).save(
+        new MediaRequest({
+          media,
+          type,
+          status: MediaRequestStatus.COMPLETED,
+          requestedBy,
+          serverId: 501,
+          is4k: false,
+        })
+      );
+      await getRepository(MediaDestinationStatus).upsert(
+        {
+          mediaId: media.id,
+          serverId: 501,
+          status: MediaStatus.PROCESSING,
+          externalServiceId: 12,
+          externalServiceSlug: 'exact',
+        },
+        ['mediaId', 'serverId']
+      );
+      for (const [email, authorized] of [
+        ['demo@seerr.dev', false],
+        ['admin@seerr.dev', true],
+      ] as const) {
+        const agent = await loginAs(email, 'test1234');
+        const detail = await agent.get(`/request/${req.id}`);
+        const list = await agent.get('/request');
+        assert.equal(detail.status, 200);
+        assert.equal(list.status, 200);
+        const listed = list.body.results.find(
+          (candidate: { id: number }) => candidate.id === req.id
+        );
+        assert.ok(listed);
+        for (const target of [detail.body.target, listed.target]) {
+          assert.equal(target.serverId, 501);
+          assert.equal(target.name, 'Exact');
+          assert.equal(target.status, MediaStatus.PROCESSING);
+          assert.equal(target.canRemove, authorized);
+          assert.equal(Object.hasOwn(target, 'serviceUrl'), authorized);
+          if (authorized)
+            assert.equal(
+              target.serviceUrl,
+              `https://exact.example/${type === MediaType.MOVIE ? 'movie' : 'series'}/exact`
+            );
+        }
+      }
+    });
+  }
+
   it('omits notification settings from requestedBy and modifiedBy', async () => {
     const pending = await seedRequest();
     await seedUserSettings('demo@seerr.dev');

@@ -460,10 +460,32 @@ describe('management projection without requests', () => {
       assert.equal(await getRepository(MediaRequest).count(), 0);
       await getRepository(User).update(1, { permissions: 32 });
       const viewerResponse = await admin.get(`/${type}/550/request-targets`);
+      assert.equal(viewerResponse.status, 200);
       assert.ok(
         viewerResponse.body.every(
           (target: MovieRequestTarget) => target.canRemove === false
         )
+      );
+      assert.ok(
+        viewerResponse.body.every(
+          (target: MovieRequestTarget) => !Object.hasOwn(target, 'serviceUrl')
+        )
+      );
+      assert.deepEqual(
+        viewerResponse.body.map((target: MovieRequestTarget) => [
+          target.serverId,
+          target.name,
+          target.status,
+          target.isIndependent,
+          target.requestable,
+        ]),
+        response.body.map((target: MovieRequestTarget) => [
+          target.serverId,
+          target.name,
+          target.status,
+          target.isIndependent,
+          target.requestable,
+        ])
       );
     });
   }

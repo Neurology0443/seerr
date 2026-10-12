@@ -16,6 +16,7 @@ import {
   markMissingMovieDestination,
   markMissingTvDestination,
   notifyAvailableRequests,
+  notifyDeclinedRequests,
   rollupDestinationTvStatus,
   transitionDestinationSeasonStatus,
   updateIndependentMovieDestination,
@@ -23,6 +24,7 @@ import {
 } from '@server/lib/destinationAvailability';
 import { Notification } from '@server/lib/notifications';
 import { setupTestDb } from '@server/test/db';
+import { seedRemoval } from '@server/test/fixtures/destinationRemoval';
 import assert from 'node:assert/strict';
 import { describe, it, mock } from 'node:test';
 import { Repository, type EntityManager } from 'typeorm';
@@ -90,6 +92,77 @@ const createRequest = async ({
 };
 
 describe('destination availability', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`rolls back ${type} reconciliation without notifying when destination persistence fails`, async (t) => {
+      const { media, destinations, requests } = await seedRemoval(type);
+      await getRepository(MediaRequest).delete(requests[1].id);
+      await getRepository(MediaDestinationStatus).update(destinations[1].id, {
+        status: MediaStatus.PROCESSING,
+      });
+      if (type === MediaType.TV)
+        await getRepository(MediaDestinationSeasonStatus).update(
+          { destinationStatusId: destinations[1].id },
+          { status: MediaStatus.PROCESSING }
+        );
+      const notifications = sendNotificationMock.mock.callCount();
+      const prototype = Repository.prototype as unknown as {
+        save: (...args: unknown[]) => Promise<unknown>;
+        metadata: { target: unknown };
+      };
+      const originalSave = prototype.save;
+      t.mock.method(
+        prototype,
+        'save',
+        async function (this: typeof prototype, ...args: unknown[]) {
+          if (
+            this.metadata.target === MediaDestinationStatus &&
+            (Array.isArray(args[0]) ? args[0] : [args[0]]).some(
+              (destination) =>
+                destination instanceof MediaDestinationStatus &&
+                destination.status === MediaStatus.UNKNOWN
+            )
+          )
+            throw new Error('injected reconciliation failure');
+          return originalSave.apply(this, args);
+        }
+      );
+      const reconcile =
+        type === MediaType.MOVIE
+          ? markMissingMovieDestination
+          : markMissingTvDestination;
+      await assert.rejects(
+        async () => notifyDeclinedRequests(await reconcile(media.id, 2)),
+        /injected reconciliation failure/
+      );
+      assert.equal(sendNotificationMock.mock.callCount(), notifications);
+      assert.equal(
+        (
+          await getRepository(MediaRequest).findOneByOrFail({
+            id: requests[0].id,
+          })
+        ).status,
+        MediaRequestStatus.APPROVED
+      );
+      assert.equal(
+        (
+          await getRepository(MediaDestinationStatus).findOneByOrFail({
+            id: destinations[1].id,
+          })
+        ).status,
+        MediaStatus.PROCESSING
+      );
+      if (type === MediaType.TV) {
+        assert.ok(
+          (
+            await getRepository(MediaDestinationSeasonStatus).findBy({
+              destinationStatusId: destinations[1].id,
+            })
+          ).every((season) => season.status === MediaStatus.PROCESSING)
+        );
+      }
+    });
+  }
+
   it('rolls TV state up without allowing specials to determine the parent', () => {
     assert.strictEqual(
       rollupDestinationTvStatus(MediaStatus.UNKNOWN, [
@@ -695,7 +768,7 @@ describe('destination availability', () => {
     await getRepository(SeasonRequest).save(persistedRequest.seasons[0]);
     const initialNotifications = sendNotificationMock.mock.callCount();
 
-    await markMissingTvDestination(media.id, 26);
+    await notifyDeclinedRequests(await markMissingTvDestination(media.id, 26));
 
     const updatedRequest = await getRepository(MediaRequest).findOneOrFail({
       where: { id: request.id },
@@ -788,7 +861,7 @@ describe('destination availability', () => {
     );
     const initialNotifications = sendNotificationMock.mock.callCount();
 
-    await markMissingTvDestination(media.id, 27);
+    await notifyDeclinedRequests(await markMissingTvDestination(media.id, 27));
 
     assert.strictEqual(
       (await getRepository(MediaRequest).findOneByOrFail({ id: request.id }))
@@ -828,7 +901,7 @@ describe('destination availability', () => {
       sendNotificationMock.mock.mockImplementation(async () => undefined);
     });
 
-    await markMissingTvDestination(media.id, 28);
+    await notifyDeclinedRequests(await markMissingTvDestination(media.id, 28));
 
     assert.strictEqual(
       (await getRepository(MediaRequest).findOneByOrFail({ id: request.id }))
@@ -859,7 +932,12 @@ describe('destination availability', () => {
     const request = await createRequest({ media, serverId: 29 });
     const initialNotifications = sendNotificationMock.mock.callCount();
 
-    await markMissingMovieDestination(media.id, 29);
+    const declined = await markMissingMovieDestination(media.id, 29);
+    assert.equal(sendNotificationMock.mock.callCount(), initialNotifications);
+    await notifyDeclinedRequests(declined);
+    await notifyDeclinedRequests(
+      await markMissingMovieDestination(media.id, 29)
+    );
 
     assert.strictEqual(
       (await getRepository(MediaRequest).findOneByOrFail({ id: request.id }))

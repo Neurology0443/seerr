@@ -7,6 +7,7 @@ import {
   findIndependentDestinationCandidates,
   markMissingMovieDestination,
   notifyAvailableRequests,
+  notifyDeclinedRequests,
   updateIndependentMovieDestination,
 } from '@server/lib/destinationAvailability';
 import type {
@@ -326,25 +327,25 @@ class RadarrScanner
       if (scannedTmdbIds.has(destination.media.tmdbId)) {
         continue;
       }
-      await withDestinationOperationLock(
+      const declinedRequests = await withDestinationOperationLock(
         MediaType.MOVIE,
         destination.media.tmdbId,
         server.id,
         async () => {
-          if (!observation?.isFresh(destination.media.tmdbId)) return;
+          if (!observation?.isFresh(destination.media.tmdbId)) return [];
           try {
             const exactMovies = await this.radarrApi.getLibraryMoviesByTmdbId(
               destination.media.tmdbId
             );
             if (!Array.isArray(exactMovies)) {
-              return;
+              return [];
             }
             if (
               exactMovies.some(
                 (movie) => movie.tmdbId === destination.media.tmdbId
               )
             ) {
-              return;
+              return [];
             }
           } catch (e) {
             this.log(
@@ -352,12 +353,13 @@ class RadarrScanner
               'warn',
               { errorMessage: e.message }
             );
-            return;
+            return [];
           }
 
-          await markMissingMovieDestination(destination.mediaId, server.id);
+          return markMissingMovieDestination(destination.mediaId, server.id);
         }
       );
+      await notifyDeclinedRequests(declinedRequests);
     }
   }
 

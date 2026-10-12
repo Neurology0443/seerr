@@ -176,7 +176,10 @@ export const getRequestTargetState = async (
               MediaType.TV
             );
     }
-    if (destination.externalServiceSlug) {
+    if (
+      destination.externalServiceSlug &&
+      user?.hasPermission(Permission.MANAGE_REQUESTS)
+    ) {
       const path = `/${request.type === MediaType.MOVIE ? 'movie' : 'series'}/${destination.externalServiceSlug}`;
       serviceUrl = server.externalUrl
         ? `${server.externalUrl.replace(/\/+$/, '')}${path}`

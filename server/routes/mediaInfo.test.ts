@@ -327,7 +327,11 @@ for (const { path, tmdbId, mediaType } of routes) {
             canRemove,
             status: MediaStatus.PROCESSING,
             downloadStatus: queue,
-            serviceUrl: `https://en.example/${mediaType === MediaType.MOVIE ? 'movie' : 'series'}/english`,
+            ...(canRemove
+              ? {
+                  serviceUrl: `https://en.example/${mediaType === MediaType.MOVIE ? 'movie' : 'series'}/english`,
+                }
+              : {}),
           });
           assert.equal(res.body.mediaInfo.status, MediaStatus.AVAILABLE);
           assert.ok(!JSON.stringify(res.body).includes(OWNER_EMAIL));

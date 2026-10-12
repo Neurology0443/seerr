@@ -15,6 +15,7 @@ import {
   findIndependentDestinationCandidates,
   markMissingTvDestination,
   notifyAvailableRequests,
+  notifyDeclinedRequests,
   updateIndependentTvDestination,
 } from '@server/lib/destinationAvailability';
 import type {
@@ -415,20 +416,20 @@ class SonarrScanner
       if (!tvdbId || scannedTvdbIds.has(tvdbId)) {
         continue;
       }
-      await withDestinationOperationLock(
+      const declinedRequests = await withDestinationOperationLock(
         MediaType.TV,
         destination.media.tmdbId,
         server.id,
         async () => {
-          if (!observation?.isFresh(destination.media.tmdbId)) return;
+          if (!observation?.isFresh(destination.media.tmdbId)) return [];
           try {
             const exactSeries =
               await this.sonarrApi.getLibrarySeriesByTvdbId(tvdbId);
             if (!Array.isArray(exactSeries)) {
-              return;
+              return [];
             }
             if (exactSeries.some((show) => show.tvdbId === tvdbId)) {
-              return;
+              return [];
             }
           } catch (e) {
             this.log(
@@ -436,12 +437,13 @@ class SonarrScanner
               'warn',
               { errorMessage: e.message }
             );
-            return;
+            return [];
           }
 
-          await markMissingTvDestination(destination.mediaId, server.id);
+          return markMissingTvDestination(destination.mediaId, server.id);
         }
       );
+      await notifyDeclinedRequests(declinedRequests);
     }
   }
 
