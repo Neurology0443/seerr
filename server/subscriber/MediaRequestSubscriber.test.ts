@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import type { TestContext } from 'node:test';
 import { beforeEach, describe, it, mock } from 'node:test';
 
 import type { RadarrMovie } from '@server/api/servarr/radarr';
 import RadarrAPI from '@server/api/servarr/radarr';
+import type { SonarrSeries } from '@server/api/servarr/sonarr';
 import SonarrAPI from '@server/api/servarr/sonarr';
 import TheMovieDb from '@server/api/themoviedb';
 import {
@@ -22,8 +24,13 @@ import notificationManager from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import mediaRoutes from '@server/routes/media';
 import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
+import * as destinationOperations from '@server/utils/destinationOperationLock';
+import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
+import express from 'express';
+import httpRequest from 'supertest';
 import type { EntityManager } from 'typeorm';
 
 const sendNotificationMock = mock.method(
@@ -297,6 +304,439 @@ async function markApprovedWithoutListeners(request: MediaRequest) {
     .execute();
   request.status = MediaRequestStatus.APPROVED;
 }
+
+const removalApp = (admin: User) => {
+  const app = express();
+  app.use((req, _res, next) => {
+    req.user = admin;
+    next();
+  });
+  app.use('/media', mediaRoutes);
+  return app;
+};
+
+// Intercept constructor assignments to arrow methods while keeping each
+// override local to its test, as with the existing TMDB stubs above.
+const stubArrArrowMethod = (
+  t: TestContext,
+  target: object,
+  name: string,
+  implementation: () => Promise<unknown>
+) => {
+  const descriptor = Object.getOwnPropertyDescriptor(target, name);
+  const fn = t.mock.fn(implementation);
+  Object.defineProperty(target, name, {
+    get: () => fn,
+    set() {},
+    configurable: true,
+  });
+  t.after(() => {
+    if (descriptor) Object.defineProperty(target, name, descriptor);
+    else Reflect.deleteProperty(target, name);
+  });
+  return fn;
+};
+
+describe('independent Arr addition and removal coordination', () => {
+  it('starts detached Arr work after commit and cancels work from a rolled-back savepoint', async () => {
+    const req = await seedMovieRequest();
+    await markApprovedWithoutListeners(req);
+    const manager = getRepository(MediaRequest).manager;
+    const subscriber = manager.connection.subscribers.find(
+      (entry) => entry instanceof MediaRequestSubscriber
+    ) as MediaRequestSubscriber;
+    const internals = subscriber as unknown as {
+      runIndependentArrOperation: (
+        entity: MediaRequest,
+        serverId: number,
+        manager: EntityManager,
+        send: () => Promise<void>
+      ) => Promise<void>;
+    };
+    const outerSend = mock.fn(async () => undefined);
+    const innerSend = mock.fn(async () => undefined);
+    let outer!: Promise<void>;
+    let inner!: Promise<void>;
+    await manager.transaction(async (tx) => {
+      outer = internals.runIndependentArrOperation(
+        req,
+        req.serverId,
+        tx,
+        outerSend
+      );
+      await assert.rejects(
+        tx.transaction(async (savepoint) => {
+          inner = internals.runIndependentArrOperation(
+            req,
+            req.serverId,
+            savepoint,
+            innerSend
+          );
+          throw new Error('savepoint rollback');
+        }),
+        /savepoint rollback/
+      );
+      await inner;
+      assert.equal(outerSend.mock.callCount(), 0);
+      assert.equal(innerSend.mock.callCount(), 0);
+    });
+    await outer;
+    assert.equal(outerSend.mock.callCount(), 1);
+    assert.equal(innerSend.mock.callCount(), 0);
+  });
+
+  it('keeps work from a committed savepoint pending until the outer transaction commits', async () => {
+    const req = await seedMovieRequest();
+    await markApprovedWithoutListeners(req);
+    const manager = getRepository(MediaRequest).manager;
+    const subscriber = manager.connection.subscribers.find(
+      (entry) => entry instanceof MediaRequestSubscriber
+    ) as MediaRequestSubscriber;
+    const internals = subscriber as unknown as {
+      runIndependentArrOperation: (
+        entity: MediaRequest,
+        serverId: number,
+        manager: EntityManager,
+        send: () => Promise<void>
+      ) => Promise<void>;
+    };
+    const send = mock.fn(async () => undefined);
+    let operation!: Promise<void>;
+    await assert.rejects(
+      manager.transaction(async (tx) => {
+        await tx.transaction(async (savepoint) => {
+          operation = internals.runIndependentArrOperation(
+            req,
+            req.serverId,
+            savepoint,
+            send
+          );
+        });
+        assert.equal(send.mock.callCount(), 0);
+        throw new Error('outer rollback');
+      }),
+      /outer rollback/
+    );
+    await operation;
+    assert.equal(send.mock.callCount(), 0);
+  });
+
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`waits for in-flight ${type} addition, including its callback, without blocking another destination`, async (t) => {
+      const req =
+        type === MediaType.MOVIE
+          ? await seedMovieRequest()
+          : await seedTvRequest();
+      const repo = getRepository(MediaRequest);
+      await markApprovedWithoutListeners(req);
+      const subscriber = new MediaRequestSubscriber();
+      let started!: () => void;
+      const remoteStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let release!: () => void;
+      const remoteRelease = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let otherStarted!: () => void;
+      const otherRemoteStarted = new Promise<void>((resolve) => {
+        otherStarted = resolve;
+      });
+      let calls = 0;
+      let present = false;
+      let removalStarted = false;
+      const add = async () => {
+        if (++calls === 1) {
+          started();
+          await remoteRelease;
+          present = true;
+        } else otherStarted();
+        return { id: 7007, titleSlug: 'added' };
+      };
+      if (type === MediaType.MOVIE)
+        stubArrArrowMethod(
+          t,
+          RadarrAPI.prototype,
+          'addMovie',
+          async () => (await add()) as RadarrMovie
+        );
+      else
+        t.mock.method(
+          SonarrAPI.prototype,
+          'addSeries',
+          async () => (await add()) as SonarrSeries
+        );
+      const send = (entity: MediaRequest) =>
+        type === MediaType.MOVIE
+          ? subscriber.sendToRadarr(entity, repo.manager)
+          : subscriber.sendToSonarr(entity, repo.manager);
+      await send(req);
+      await remoteStarted;
+      let queued!: () => void;
+      const removalQueued = new Promise<void>((resolve) => {
+        queued = resolve;
+      });
+      const originalLock = destinationOperations.withDestinationOperationLock;
+      t.mock.method(
+        destinationOperations,
+        'withDestinationOperationLock',
+        (...args: Parameters<typeof originalLock>) => {
+          if (
+            args[0] === type &&
+            args[1] === req.media.tmdbId &&
+            args[2] === req.serverId
+          )
+            queued();
+          return originalLock(...args);
+        }
+      );
+      const remove = async () => {
+        removalStarted = true;
+        assert.equal(present, true);
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              mediaId: req.media.id,
+              serverId: req.serverId,
+            })
+          ).externalServiceId,
+          7007
+        );
+        present = false;
+      };
+      if (type === MediaType.MOVIE)
+        stubArrArrowMethod(
+          t,
+          RadarrAPI.prototype,
+          'removeMovieFromDestination',
+          remove
+        );
+      else
+        stubArrArrowMethod(
+          t,
+          SonarrAPI.prototype,
+          'removeSeriesFromDestination',
+          remove
+        );
+      const app = removalApp(
+        await getRepository(User).findOneByOrFail({ id: 1 })
+      );
+      const removing = httpRequest(app)
+        .delete(`/media/${req.media.id}/file?serverId=${req.serverId}`)
+        .then((response) => response);
+      await removalQueued;
+      assert.equal(removalStarted, false);
+      const other = await repo.save(
+        new MediaRequest({
+          media: req.media,
+          type,
+          serverId: req.serverId - 1,
+          is4k: false,
+          requestedBy: req.requestedBy,
+          status: MediaRequestStatus.PENDING,
+          seasons:
+            type === MediaType.TV
+              ? [
+                  new SeasonRequest({
+                    seasonNumber: 1,
+                    status: MediaRequestStatus.PENDING,
+                  }),
+                ]
+              : [],
+        })
+      );
+      await markApprovedWithoutListeners(other);
+      try {
+        await send(other);
+        await otherRemoteStarted;
+        await withDestinationOperationLock(
+          type,
+          req.media.tmdbId,
+          other.serverId,
+          async () => undefined
+        );
+        assert.equal(removalStarted, false);
+        await withDestinationOperationLock(
+          type,
+          req.media.tmdbId + 1,
+          req.serverId,
+          async () => undefined
+        );
+      } finally {
+        release();
+      }
+      assert.equal((await removing).status, 204);
+      assert.equal(present, false);
+      const exact = await getRepository(MediaDestinationStatus).findOneByOrFail(
+        { mediaId: req.media.id, serverId: req.serverId }
+      );
+      assert.equal(exact.status, MediaStatus.DELETED);
+      assert.equal(exact.externalServiceId, null);
+      assert.equal(exact.externalServiceSlug, null);
+      assert.equal(
+        (await repo.findOneByOrFail({ id: req.id })).status,
+        MediaRequestStatus.DECLINED
+      );
+      assert.equal(
+        (await repo.findOneByOrFail({ id: other.id })).status,
+        MediaRequestStatus.APPROVED
+      );
+      assert.equal(
+        (await getRepository(Media).findOneByOrFail({ id: req.media.id }))
+          .status,
+        MediaStatus.AVAILABLE
+      );
+      if (type === MediaType.TV)
+        assert.ok(
+          (
+            await getRepository(MediaDestinationSeasonStatus).findBy({
+              destinationStatusId: exact.id,
+            })
+          ).every((season) => season.status === MediaStatus.DELETED)
+        );
+    });
+
+    it(`skips a queued ${type} addition after removal declines the request`, async (t) => {
+      const req =
+        type === MediaType.MOVIE
+          ? await seedMovieRequest()
+          : await seedTvRequest();
+      const repo = getRepository(MediaRequest);
+      await markApprovedWithoutListeners(req);
+      const subscriber = new MediaRequestSubscriber();
+      let locked!: () => void;
+      const lockReady = new Promise<void>((resolve) => {
+        locked = resolve;
+      });
+      let release!: () => void;
+      const removalReady = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const remove = async () => {
+        locked();
+        await removalReady;
+      };
+      if (type === MediaType.MOVIE)
+        stubArrArrowMethod(
+          t,
+          RadarrAPI.prototype,
+          'removeMovieFromDestination',
+          remove
+        );
+      else
+        stubArrArrowMethod(
+          t,
+          SonarrAPI.prototype,
+          'removeSeriesFromDestination',
+          remove
+        );
+      const app = removalApp(
+        await getRepository(User).findOneByOrFail({ id: 1 })
+      );
+      const removing = httpRequest(app)
+        .delete(`/media/${req.media.id}/file?serverId=${req.serverId}`)
+        .then((response) => response);
+      await lockReady;
+      let finished!: () => void;
+      const additionFinished = new Promise<void>((resolve) => {
+        finished = resolve;
+      });
+      const internals = subscriber as unknown as {
+        runIndependentArrOperation: (
+          ...args: [MediaRequest, number, EntityManager, () => Promise<void>]
+        ) => Promise<void>;
+      };
+      const original = internals.runIndependentArrOperation.bind(subscriber);
+      t.mock.method(
+        internals,
+        'runIndependentArrOperation',
+        async (...args: Parameters<typeof original>) => {
+          try {
+            await original(...args);
+          } finally {
+            finished();
+          }
+        }
+      );
+      const addMovie = stubArrArrowMethod(
+        t,
+        RadarrAPI.prototype,
+        'addMovie',
+        async () => radarrMovie(7008, 'obsolete')
+      );
+      const addSeries = t.mock.method(
+        SonarrAPI.prototype,
+        'addSeries',
+        async () => ({ id: 7008, titleSlug: 'obsolete' }) as SonarrSeries
+      );
+      try {
+        if (type === MediaType.MOVIE)
+          await subscriber.sendToRadarr(req, repo.manager);
+        else await subscriber.sendToSonarr(req, repo.manager);
+      } finally {
+        release();
+      }
+      assert.equal((await removing).status, 204);
+      await additionFinished;
+      assert.equal(addMovie.mock.callCount(), 0);
+      assert.equal(addSeries.mock.callCount(), 0);
+      const exact = await getRepository(MediaDestinationStatus).findOneByOrFail(
+        { mediaId: req.media.id, serverId: req.serverId }
+      );
+      assert.equal(exact.status, MediaStatus.DELETED);
+      assert.equal(exact.externalServiceId, null);
+      assert.equal(exact.externalServiceSlug, null);
+      assert.equal(
+        (await repo.findOneByOrFail({ id: req.id })).status,
+        MediaRequestStatus.DECLINED
+      );
+      const freshRequest = await repo.save(
+        new MediaRequest({
+          media: req.media,
+          type,
+          serverId: req.serverId,
+          is4k: false,
+          requestedBy: req.requestedBy,
+          status: MediaRequestStatus.APPROVED,
+          seasons:
+            type === MediaType.TV
+              ? [
+                  new SeasonRequest({
+                    seasonNumber: 1,
+                    status: MediaRequestStatus.APPROVED,
+                  }),
+                ]
+              : [],
+        })
+      );
+      await withDestinationOperationLock(
+        type,
+        req.media.tmdbId,
+        req.serverId,
+        async () => undefined
+      );
+      assert.equal(
+        type === MediaType.MOVIE
+          ? addMovie.mock.callCount()
+          : addSeries.mock.callCount(),
+        1
+      );
+      assert.equal(
+        (await repo.findOneByOrFail({ id: freshRequest.id })).status,
+        MediaRequestStatus.APPROVED
+      );
+      const rediscovered = await getRepository(
+        MediaDestinationStatus
+      ).findOneByOrFail({ mediaId: req.media.id, serverId: req.serverId });
+      assert.equal(rediscovered.status, MediaStatus.PROCESSING);
+      assert.equal(rediscovered.externalServiceId, 7008);
+      assert.equal(
+        (await repo.findOneByOrFail({ id: req.id })).status,
+        MediaRequestStatus.DECLINED
+      );
+    });
+  }
+});
 
 describe('MediaRequestSubscriber request destinations', () => {
   it('rolls back independent creation when destination preparation fails', async (t) => {
@@ -1093,17 +1533,23 @@ describe('MediaRequestSubscriber request destinations', () => {
       }
     );
     let resolveAdd!: (value: RadarrMovie) => void;
+    let signalAddStarted!: () => void;
+    const addStarted = new Promise<void>((resolve) => {
+      signalAddStarted = resolve;
+    });
     t.mock.method(
       RadarrAPI.prototype,
       'getMovieByTmdbId',
       () =>
         new Promise<RadarrMovie>((resolve) => {
           resolveAdd = resolve;
+          signalAddStarted();
         })
     );
 
     await markApprovedWithoutListeners(request);
     await subscriber.sendToRadarr(request, requestRepository.manager);
+    await addStarted;
     await requestRepository.remove(request);
     resolveAdd(radarrMovie(7002, 'late-movie'));
     await guardFinished;

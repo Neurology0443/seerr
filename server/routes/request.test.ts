@@ -1788,7 +1788,7 @@ describe('GET /request/:requestId', () => {
     assert.deepStrictEqual(response.body.target, {
       serverId: 301,
       name: 'French',
-      canRemove: false,
+      canRemove: true,
       is4k: false,
       isIndependent: true,
       deleted: false,
@@ -2011,7 +2011,7 @@ describe('GET /request target-aware list and count', () => {
     );
   });
 
-  it('guards independent removal while preserving native canRemove', async (t) => {
+  it('allows independent removal by exact identity and guards deleted targets while preserving native canRemove', async (t) => {
     mockProfiles(t);
     configureRadarr([
       { id: 331, independentRequestDestination: true },
@@ -2050,19 +2050,41 @@ describe('GET /request target-aware list and count', () => {
       })
     );
 
-    const response = await (
-      await loginAs('admin@seerr.dev', 'test1234')
-    ).get('/request?filter=available');
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const response = await admin.get('/request?filter=available');
 
     assert.strictEqual(response.status, 200);
     assert.strictEqual(
       response.body.results.find(
         (candidate: { id: number }) => candidate.id === independent.id
       ).canRemove,
-      false
+      true
     );
     assert.strictEqual(
       response.body.results.find(
+        (candidate: { id: number }) => candidate.id === native.id
+      ).canRemove,
+      true
+    );
+    const destinationRepo = getRepository(MediaDestinationStatus);
+    const destination = await destinationRepo.findOneByOrFail({
+      mediaId: independent.media.id,
+      serverId: 331,
+    });
+    assert.equal(destination.externalServiceId, null);
+    await destinationRepo.update(destination.id, {
+      status: MediaStatus.DELETED,
+    });
+    const deletedResponse = await admin.get('/request');
+    assert.equal(deletedResponse.status, 200);
+    const deletedTarget = deletedResponse.body.results.find(
+      (candidate: { id: number }) => candidate.id === independent.id
+    );
+    assert.equal(deletedTarget.canRemove, false);
+    assert.equal(deletedTarget.target.canRemove, false);
+    assert.equal(deletedTarget.target.status, MediaStatus.DELETED);
+    assert.equal(
+      deletedResponse.body.results.find(
         (candidate: { id: number }) => candidate.id === native.id
       ).canRemove,
       true
@@ -3497,18 +3519,34 @@ describe('POST /request, override rules and requester choices', () => {
           MediaRequestSubscriber.prototype as unknown as {
             applyArrSuccessIfStillApproved: () => Promise<boolean>;
           };
+        let signalArrSuccess!: () => void;
+        const arrSuccess = new Promise<void>((resolve) => {
+          signalArrSuccess = resolve;
+        });
         t.mock.method(
           subscriberInternals,
           'applyArrSuccessIfStillApproved',
-          async () => false
+          async () => {
+            signalArrSuccess();
+            return false;
+          }
         );
+        const manager = getRepository(MediaRequest).manager;
+        // Dispatch revalidates persisted approval before sending to Arr.
+        // Avoid triggering a second subscriber dispatch while preparing it.
+        await manager
+          .createQueryBuilder()
+          .update(MediaRequest)
+          .set({ status: MediaRequestStatus.APPROVED })
+          .where('id = :id', { id: persisted.id })
+          .callListeners(false)
+          .execute();
         persisted.status = MediaRequestStatus.APPROVED;
         const subscriber = new MediaRequestSubscriber();
-        const manager = getRepository(MediaRequest).manager;
         if (mediaType === MediaType.MOVIE)
           await subscriber.sendToRadarr(persisted, manager, independent);
         else await subscriber.sendToSonarr(persisted, manager, independent);
-        await nextTurn();
+        await arrSuccess;
         assert.equal(arrPayloads.length, 1);
         assert.equal(arrPayloads[0].qualityProfileId, 8);
         assert.equal(arrPayloads[0].rootFolderPath, '/second');

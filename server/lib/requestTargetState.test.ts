@@ -710,7 +710,61 @@ describe('independent request serialization', () => {
 });
 
 describe('exact independent management eligibility', () => {
-  it('requires management permission, exact valid linkage and existing nondeleted state', async () => {
+  it('allows TV lookup with or without linkage, preserves TMDB fallback and rejects unusable identities', async () => {
+    getSettings().sonarr = [sonarr(2, { independentRequestDestination: true })];
+    const { media, request } = await seedRequest({
+      type: MediaType.TV,
+      serverId: 2,
+    });
+    media.tvdbId = 1234;
+    const repo = getRepository(MediaDestinationStatus);
+    const destination = await repo.save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 2,
+        status: MediaStatus.PROCESSING,
+        externalServiceId: 12,
+      })
+    );
+    const manager = repo.manager;
+    const admin = await getRepository(User).findOneByOrFail({ id: 1 });
+    assert.equal(
+      (await getRequestTargetState(request, manager, admin))?.canRemove,
+      true
+    );
+    await repo.update(destination.id, { externalServiceId: null });
+    assert.equal(
+      (await getRequestTargetState(request, manager, admin))?.canRemove,
+      true
+    );
+    media.tvdbId = undefined;
+    assert.equal(
+      (await getRequestTargetState(request, manager, admin))?.canRemove,
+      true
+    );
+    media.tmdbId = 0;
+    assert.equal(
+      (await getRequestTargetState(request, manager, admin))?.canRemove,
+      false
+    );
+    media.tvdbId = -1;
+    assert.equal(
+      (await getRequestTargetState(request, manager, admin))?.canRemove,
+      false
+    );
+    getSettings().sonarr = [];
+    assert.equal(
+      (await getRequestTargetState(request, manager, admin))?.canRemove,
+      false
+    );
+    getSettings().radarr = [radarr(2, { independentRequestDestination: true })];
+    assert.equal(
+      (await getRequestTargetState(request, manager, admin))?.canRemove,
+      false
+    );
+  });
+
+  it('requires management permission, usable identity and eligible exact state', async () => {
     getSettings().radarr = [
       radarr(2, {
         independentRequestDestination: true,
@@ -752,13 +806,49 @@ describe('exact independent management eligibility', () => {
       (await getRequestTargetState(req, manager, viewer))?.canRemove,
       false
     );
-    for (const linkage of [null, 0, -1]) {
+    await getRepository(MediaDestinationStatus).update(destination.id, {
+      externalServiceId: null,
+    });
+    assert.equal(
+      (await getRequestTargetState(req, manager, admin))?.canRemove,
+      true
+    );
+    for (const linkage of [0, -1]) {
       await getRepository(MediaDestinationStatus).update(destination.id, {
         externalServiceId: linkage,
       });
       assert.equal(
         (await getRequestTargetState(req, manager, admin))?.canRemove,
         false
+      );
+    }
+    for (const status of [
+      MediaStatus.UNKNOWN,
+      MediaStatus.PENDING,
+      MediaStatus.BLOCKLISTED,
+      MediaStatus.DELETED,
+    ]) {
+      await getRepository(MediaDestinationStatus).update(destination.id, {
+        externalServiceId: null,
+        status,
+      });
+      assert.equal(
+        (await getRequestTargetState(req, manager, admin))?.canRemove,
+        false
+      );
+    }
+    for (const status of [
+      MediaStatus.PROCESSING,
+      MediaStatus.PARTIALLY_AVAILABLE,
+      MediaStatus.AVAILABLE,
+    ]) {
+      await getRepository(MediaDestinationStatus).update(destination.id, {
+        externalServiceId: null,
+        status,
+      });
+      assert.equal(
+        (await getRequestTargetState(req, manager, admin))?.canRemove,
+        true
       );
     }
     await getRepository(MediaDestinationStatus).update(destination.id, {

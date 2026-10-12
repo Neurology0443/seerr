@@ -417,7 +417,11 @@ describe('management projection without requests', () => {
       if (type === MediaType.MOVIE) getSettings().radarr = servers;
       else getSettings().sonarr = servers as unknown as SonarrSettings[];
       const media = await getRepository(Media).save(
-        new Media({ tmdbId: 550, mediaType: type })
+        new Media({
+          tmdbId: 550,
+          tvdbId: type === MediaType.TV ? 1234 : undefined,
+          mediaType: type,
+        })
       );
       await getRepository(MediaDestinationStatus).save(
         servers.map(
@@ -426,7 +430,7 @@ describe('management projection without requests', () => {
               mediaId: media.id,
               serverId: server.id,
               status: MediaStatus.AVAILABLE,
-              externalServiceId: 10 + server.id,
+              externalServiceId: server.id === 1 ? 11 : null,
               externalServiceSlug: `exact-${server.id}`,
             })
         )

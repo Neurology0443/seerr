@@ -12,7 +12,11 @@ import {
   removalSnapshot,
   seedRemoval,
 } from '@server/test/fixtures/destinationRemoval';
-import { withDvrIdentityLock } from '@server/utils/dvrIdentityLock';
+import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
+import {
+  withDvrIdentityLock,
+  withDvrSettingsMutationLock,
+} from '@server/utils/dvrIdentityLock';
 import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 import express from 'express';
 import * as OpenApiValidator from 'express-openapi-validator';
@@ -91,7 +95,14 @@ const arrMock = (
           const record = { id: 12, tmdbId: 550, tvdbId: 1234 };
           if (lookup === 'mismatch')
             record[type === MediaType.MOVIE ? 'tmdbId' : 'tvdbId'] = 999;
-          return { data: path.endsWith('/lookup') ? [record] : record };
+          return {
+            data:
+              path.endsWith('/lookup') ||
+              path === '/movie' ||
+              path === '/series'
+                ? [record]
+                : record,
+          };
         },
         delete: async (path: string) => {
           calls.push({ url: config.baseURL, method: 'DELETE', path });
@@ -106,6 +117,63 @@ const arrMock = (
 
 for (const type of [MediaType.MOVIE, MediaType.TV]) {
   describe(`exact ${type} removal`, () => {
+    it('releases DVR and destination locks before slow notifications and preserves success on notification failure', async () => {
+      const { media, requests } = await seedRemoval(type);
+      arrMock(type);
+      let entered!: () => void;
+      const notificationEntered = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let release!: () => void;
+      const notificationReleased = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const notify = mock.method(
+        MediaRequest,
+        'sendNotification',
+        async (declined: MediaRequest) => {
+          assert.equal(declined.id, requests[0].id);
+          const snapshot = await removalSnapshot();
+          assert.equal(snapshot.destinations[1].status, MediaStatus.DELETED);
+          assert.equal(snapshot.destinations[1].externalServiceId, null);
+          assert.equal(
+            getRepository(Media).manager.queryRunner?.isTransactionActive ??
+              false,
+            false
+          );
+          entered();
+          await notificationReleased;
+          throw new Error('notification delivery failed');
+        }
+      );
+      const removing = request(app)
+        .delete(`/media/${media.id}/file?serverId=2`)
+        .then((response) => response);
+      await notificationEntered;
+      try {
+        const kind = type === MediaType.MOVIE ? 'radarr' : 'sonarr';
+        await withDvrSettingsMutationLock(kind, () =>
+          withDvrIdentityLock(kind, 2, async () => undefined)
+        );
+        await withDestinationOperationLock(
+          type,
+          media.tmdbId,
+          2,
+          async () => undefined
+        );
+      } finally {
+        release();
+      }
+      assert.equal((await removing).status, 204);
+      assert.equal(notify.mock.callCount(), 1);
+      assert.equal(
+        (await request(app).delete(`/media/${media.id}/file?serverId=2`))
+          .status,
+        204
+      );
+      assert.equal(notify.mock.callCount(), 1);
+    });
+
     it('accepts the integer query after OpenAPI request coercion', async () => {
       const { media } = await seedRemoval(type);
       const calls = arrMock(type);
@@ -275,12 +343,18 @@ for (const type of [MediaType.MOVIE, MediaType.TV]) {
         const { media } = await seedRemoval(type);
         const before = await removalSnapshot();
         arrMock(type, failure);
+        const notify = mock.method(
+          MediaRequest,
+          'sendNotification',
+          async () => undefined
+        );
         assert.equal(
           (await request(app).delete(`/media/${media.id}/file?serverId=2`))
             .status,
           500
         );
         assert.deepEqual(await removalSnapshot(), before);
+        assert.equal(notify.mock.callCount(), 0);
       });
     }
     it('commits confirmed DELETE 404 absence', async () => {

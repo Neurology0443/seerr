@@ -6,13 +6,17 @@ import {
 import { getRepository } from '@server/datasource';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
-import { completeRequestsForDestination } from '@server/lib/destinationAvailability';
+import {
+  completeRequestsForDestination,
+  notifyDeclinedRequests,
+} from '@server/lib/destinationAvailability';
 import { persistConfirmedDestinationRemoval } from '@server/lib/destinationRemoval';
 import { setupTestDb } from '@server/test/db';
 import {
   removalSnapshot,
   seedRemoval,
 } from '@server/test/fixtures/destinationRemoval';
+import { beginDestinationScan } from '@server/utils/destinationOperationLock';
 import assert from 'node:assert/strict';
 import { afterEach, describe, it, mock } from 'node:test';
 
@@ -20,6 +24,34 @@ setupTestDb();
 afterEach(() => mock.restoreAll());
 
 describe('confirmed destination removal persistence', () => {
+  it('invalidates only active scans for the exact media type, identity and destination', async () => {
+    const { media } = await seedRemoval();
+    const old = beginDestinationScan(MediaType.MOVIE, 2);
+    const other = beginDestinationScan(MediaType.MOVIE, 1);
+    const tv = beginDestinationScan(MediaType.TV, 2);
+    let fresh: ReturnType<typeof beginDestinationScan> | undefined;
+    try {
+      await persistConfirmedDestinationRemoval(
+        media.id,
+        2,
+        getRepository(MediaDestinationStatus).manager
+      );
+      assert.equal(old.isFresh(media.tmdbId), false);
+      assert.equal(old.isFresh(media.tmdbId + 1), true);
+      assert.equal(other.isFresh(media.tmdbId), true);
+      assert.equal(tv.isFresh(media.tmdbId), true);
+      fresh = beginDestinationScan(MediaType.MOVIE, 2);
+      assert.equal(fresh.isFresh(media.tmdbId), true);
+      fresh.close();
+      assert.equal(fresh.isFresh(media.tmdbId), false);
+    } finally {
+      old.close();
+      other.close();
+      tv.close();
+      fresh?.close();
+    }
+  });
+
   it('dispatches only actual declines after the exact removal transaction commits', async () => {
     const { media, requests } = await seedRemoval(MediaType.TV);
     const manager = getRepository(MediaDestinationStatus).manager;
@@ -41,9 +73,17 @@ describe('confirmed destination removal persistence', () => {
         assert.equal(manager.queryRunner?.isTransactionActive ?? false, false);
       }
     );
-    await persistConfirmedDestinationRemoval(media.id, 2, manager);
+    const declined = await persistConfirmedDestinationRemoval(
+      media.id,
+      2,
+      manager
+    );
+    assert.equal(notify.mock.callCount(), 0);
+    await notifyDeclinedRequests(declined);
     assert.equal(notify.mock.callCount(), 1);
-    await persistConfirmedDestinationRemoval(media.id, 2, manager);
+    await notifyDeclinedRequests(
+      await persistConfirmedDestinationRemoval(media.id, 2, manager)
+    );
     assert.equal(notify.mock.callCount(), 1);
   });
 
@@ -59,6 +99,7 @@ describe('confirmed destination removal persistence', () => {
     await manager.query(
       "CREATE TRIGGER fail_destination_removal BEFORE UPDATE ON media_destination_season WHEN NEW.status = 7 BEGIN SELECT RAISE(ABORT, 'test persistence failure'); END"
     );
+    const observation = beginDestinationScan(MediaType.TV, 2);
     try {
       await assert.rejects(
         () => persistConfirmedDestinationRemoval(media.id, 2, manager),
@@ -66,7 +107,9 @@ describe('confirmed destination removal persistence', () => {
       );
       assert.deepEqual(await removalSnapshot(), before);
       assert.equal(notify.mock.callCount(), 0);
+      assert.equal(observation.isFresh(media.tmdbId), true);
     } finally {
+      observation.close();
       await manager.query('DROP TRIGGER fail_destination_removal');
     }
   });

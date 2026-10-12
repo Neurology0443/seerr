@@ -2,10 +2,9 @@ import { MediaStatus, MediaType } from '@server/constants/media';
 import Media from '@server/entity/Media';
 import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
-import {
-  declineRequestsForDestination,
-  notifyDeclinedRequests,
-} from '@server/lib/destinationAvailability';
+import type { MediaRequest } from '@server/entity/MediaRequest';
+import { declineRequestsForDestination } from '@server/lib/destinationAvailability';
+import { invalidateDestinationScans } from '@server/utils/destinationOperationLock';
 import type { EntityManager } from 'typeorm';
 
 // Call only after the exact Arr instance confirms removal or absence.
@@ -14,8 +13,8 @@ export const persistConfirmedDestinationRemoval = async (
   mediaId: number,
   serverId: number,
   manager: EntityManager
-): Promise<void> => {
-  const declinedRequests = await manager.transaction(async (tx) => {
+): Promise<MediaRequest[]> => {
+  const { declinedRequests, media } = await manager.transaction(async (tx) => {
     const destination = await tx.findOneOrFail(MediaDestinationStatus, {
       where: { mediaId, serverId },
     });
@@ -41,7 +40,8 @@ export const persistConfirmedDestinationRemoval = async (
         { status: MediaStatus.DELETED }
       );
     }
-    return declined;
+    return { declinedRequests: declined, media };
   });
-  await notifyDeclinedRequests(declinedRequests);
+  invalidateDestinationScans(media.mediaType, media.tmdbId, serverId);
+  return declinedRequests;
 };

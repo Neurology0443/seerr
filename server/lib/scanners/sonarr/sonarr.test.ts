@@ -18,12 +18,18 @@ import MediaRequest from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import { persistConfirmedDestinationRemoval } from '@server/lib/destinationRemoval';
 import { Notification } from '@server/lib/notifications';
 import { sonarrScanner } from '@server/lib/scanners/sonarr';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
+import {
+  removalSnapshot,
+  seedRemoval,
+} from '@server/test/fixtures/destinationRemoval';
 import { runWithMockTimers } from '@server/test/runWithMockTimers';
+import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it, mock } from 'node:test';
 
@@ -210,6 +216,80 @@ function configureSonarr(overrides: Partial<SonarrSettings>[] = [{}]): void {
 }
 
 describe('Sonarr Scanner', () => {
+  it('rejects stale inventory and season observations after removal, but allows fresh rediscovery', async () => {
+    const { media, destinations } = await seedRemoval(MediaType.TV);
+    configureSonarr([
+      { id: 2, hostname: 'sonarr-en', independentRequestDestination: true },
+    ]);
+    getTvShowImpl = async () => fakeTmdbShow(media.tmdbId);
+    const before = await removalSnapshot();
+    let captured!: () => void;
+    const inventoryCaptured = new Promise<void>((resolve) => {
+      captured = resolve;
+    });
+    let resume!: () => void;
+    const resumed = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    getSeriesImpl = async () => {
+      const inventory = [fakeSonarrSeries({ id: 12, tvdbId: media.tvdbId })];
+      captured();
+      await resumed;
+      return inventory;
+    };
+    const scanning = runWithMockTimers(() => sonarrScanner.run());
+    await inventoryCaptured;
+    try {
+      await withDestinationOperationLock(MediaType.TV, media.tmdbId, 2, () =>
+        persistConfirmedDestinationRemoval(
+          media.id,
+          2,
+          getRepository(Media).manager
+        )
+      );
+    } finally {
+      resume();
+    }
+    await scanning;
+    const after = await removalSnapshot();
+    assert.equal(after.destinations[1].status, MediaStatus.DELETED);
+    assert.equal(after.destinations[1].externalServiceId, null);
+    assert.equal(after.destinations[1].externalServiceSlug, null);
+    assert.ok(
+      after.seasons
+        .filter((season) => season.destinationStatusId === destinations[1].id)
+        .every((season) => season.status === MediaStatus.DELETED)
+    );
+    assert.deepEqual(
+      after.seasons.filter(
+        (season) => season.destinationStatusId === destinations[0].id
+      ),
+      before.seasons.filter(
+        (season) => season.destinationStatusId === destinations[0].id
+      )
+    );
+    assert.deepEqual(after.media, before.media);
+    assert.deepEqual(after.destinations[0], before.destinations[0]);
+    assert.equal(after.requests[0].status, MediaRequestStatus.DECLINED);
+    getSeriesImpl = async () => [
+      fakeSonarrSeries({ id: 42, tvdbId: media.tvdbId, titleSlug: 're-added' }),
+    ];
+    await runWithMockTimers(() => sonarrScanner.run());
+    const fresh = await removalSnapshot();
+    assert.equal(fresh.destinations[1].status, MediaStatus.PARTIALLY_AVAILABLE);
+    assert.equal(fresh.destinations[1].externalServiceId, 42);
+    assert.equal(fresh.destinations[1].externalServiceSlug, 're-added');
+    assert.equal(
+      fresh.seasons.find(
+        (season) =>
+          season.destinationStatusId === destinations[1].id &&
+          season.seasonNumber === 1
+      )?.status,
+      MediaStatus.AVAILABLE
+    );
+    assert.equal(fresh.requests[0].status, MediaRequestStatus.DECLINED);
+  });
+
   beforeEach(() => {
     getSeriesImpl = async () => [];
     getLibrarySeriesByTvdbIdImpl = async () => [];

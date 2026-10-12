@@ -207,9 +207,21 @@ export const getRequestTargetState = async (
             request.type === request.media.mediaType &&
             server?.independentRequestDestination === true &&
             destination &&
-            destination.status !== MediaStatus.DELETED &&
-            Number.isSafeInteger(destination.externalServiceId) &&
-            (destination.externalServiceId ?? 0) > 0
+            [
+              MediaStatus.PROCESSING,
+              MediaStatus.PARTIALLY_AVAILABLE,
+              MediaStatus.AVAILABLE,
+            ].includes(destination.status) &&
+            (destination.externalServiceId == null ||
+              (Number.isSafeInteger(destination.externalServiceId) &&
+                destination.externalServiceId > 0)) &&
+            (request.type === MediaType.MOVIE
+              ? Number.isSafeInteger(media.tmdbId) && media.tmdbId > 0
+              : (Number.isSafeInteger(media.tvdbId) &&
+                  (media.tvdbId ?? 0) > 0) ||
+                (!media.tvdbId &&
+                  Number.isSafeInteger(media.tmdbId) &&
+                  media.tmdbId > 0))
           ),
           downloadStatus,
           ...(serviceUrl ? { serviceUrl } : {}),

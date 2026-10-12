@@ -12,11 +12,13 @@ import type {
   MediaResultsResponse,
   MediaWatchDataResponse,
 } from '@server/interfaces/api/mediaInterfaces';
+import { notifyDeclinedRequests } from '@server/lib/destinationAvailability';
 import { persistConfirmedDestinationRemoval } from '@server/lib/destinationRemoval';
 import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import { withDestinationOperationLock } from '@server/utils/destinationOperationLock';
 import {
   withDvrIdentityLock,
   withDvrSettingsMutationLock,
@@ -238,82 +240,96 @@ mediaRoutes.delete(
         const serverId = Number(value);
         // Settings updates only take the identity lock for role changes.
         // Take their mutation lock first as well to freeze connection settings.
-        await withDvrSettingsMutationLock(isMovie ? 'radarr' : 'sonarr', () =>
-          withDvrIdentityLock(
-            isMovie ? 'radarr' : 'sonarr',
-            serverId,
-            async () => {
-              // Resolve inside the identity lock; never fall back to a default.
-              const servers = isMovie
-                ? getSettings().radarr
-                : getSettings().sonarr;
-              const server = servers.find(
-                (candidate) => candidate.id === serverId
-              );
-              if (!server || server.independentRequestDestination !== true) {
-                throw Object.assign(
-                  new Error(
-                    'Independent destination is not configured for this media type.'
-                  ),
-                  { status: 400 }
-                );
-              }
-              const destination = await getRepository(
-                MediaDestinationStatus
-              ).findOne({
-                where: { mediaId: media.id, serverId },
-              });
-              if (
-                !destination ||
-                (destination.externalServiceId != null &&
-                  (!Number.isSafeInteger(destination.externalServiceId) ||
-                    destination.externalServiceId <= 0))
-              ) {
-                throw Object.assign(
-                  new Error('Destination state or Arr linkage is invalid.'),
-                  { status: 400 }
-                );
-              }
-              if (isMovie) {
-                const arr = new RadarrAPI({
-                  apiKey: server.apiKey,
-                  url: RadarrAPI.buildUrl(server, '/api/v3'),
-                });
-                await arr.removeMovieFromDestination(
-                  media.tmdbId,
-                  destination.externalServiceId
-                );
-              } else {
-                let tvdbId = media.tvdbId;
-                if (!tvdbId) {
-                  const series = await new TheMovieDb().getTvShow({
-                    tvId: media.tmdbId,
+        const declinedRequests = await withDestinationOperationLock(
+          media.mediaType,
+          media.tmdbId,
+          serverId,
+          () =>
+            withDvrSettingsMutationLock(isMovie ? 'radarr' : 'sonarr', () =>
+              withDvrIdentityLock(
+                isMovie ? 'radarr' : 'sonarr',
+                serverId,
+                async () => {
+                  // Resolve inside the identity lock; never fall back to a default.
+                  const servers = isMovie
+                    ? getSettings().radarr
+                    : getSettings().sonarr;
+                  const server = servers.find(
+                    (candidate) => candidate.id === serverId
+                  );
+                  if (
+                    !server ||
+                    server.independentRequestDestination !== true
+                  ) {
+                    throw Object.assign(
+                      new Error(
+                        'Independent destination is not configured for this media type.'
+                      ),
+                      { status: 400 }
+                    );
+                  }
+                  const destination = await getRepository(
+                    MediaDestinationStatus
+                  ).findOne({
+                    where: { mediaId: media.id, serverId },
                   });
-                  tvdbId = series.external_ids.tvdb_id;
-                }
-                if (!tvdbId || !Number.isSafeInteger(tvdbId) || tvdbId <= 0) {
-                  throw Object.assign(
-                    new Error('TVDB identity is unavailable.'),
-                    { status: 400 }
+                  if (
+                    !destination ||
+                    (destination.externalServiceId != null &&
+                      (!Number.isSafeInteger(destination.externalServiceId) ||
+                        destination.externalServiceId <= 0))
+                  ) {
+                    throw Object.assign(
+                      new Error('Destination state or Arr linkage is invalid.'),
+                      { status: 400 }
+                    );
+                  }
+                  if (isMovie) {
+                    const arr = new RadarrAPI({
+                      apiKey: server.apiKey,
+                      url: RadarrAPI.buildUrl(server, '/api/v3'),
+                    });
+                    await arr.removeMovieFromDestination(
+                      media.tmdbId,
+                      destination.externalServiceId
+                    );
+                  } else {
+                    let tvdbId = media.tvdbId;
+                    if (!tvdbId) {
+                      const series = await new TheMovieDb().getTvShow({
+                        tvId: media.tmdbId,
+                      });
+                      tvdbId = series.external_ids.tvdb_id;
+                    }
+                    if (
+                      !tvdbId ||
+                      !Number.isSafeInteger(tvdbId) ||
+                      tvdbId <= 0
+                    ) {
+                      throw Object.assign(
+                        new Error('TVDB identity is unavailable.'),
+                        { status: 400 }
+                      );
+                    }
+                    const arr = new SonarrAPI({
+                      apiKey: server.apiKey,
+                      url: SonarrAPI.buildUrl(server, '/api/v3'),
+                    });
+                    await arr.removeSeriesFromDestination(
+                      tvdbId,
+                      destination.externalServiceId
+                    );
+                  }
+                  return persistConfirmedDestinationRemoval(
+                    media.id,
+                    serverId,
+                    mediaRepository.manager
                   );
                 }
-                const arr = new SonarrAPI({
-                  apiKey: server.apiKey,
-                  url: SonarrAPI.buildUrl(server, '/api/v3'),
-                });
-                await arr.removeSeriesFromDestination(
-                  tvdbId,
-                  destination.externalServiceId
-                );
-              }
-              await persistConfirmedDestinationRemoval(
-                media.id,
-                serverId,
-                mediaRepository.manager
-              );
-            }
-          )
+              )
+            )
         );
+        await notifyDeclinedRequests(declinedRequests);
         return res.status(204).send();
       }
 
