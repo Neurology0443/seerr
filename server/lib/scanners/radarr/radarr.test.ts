@@ -743,6 +743,60 @@ describe('Radarr Scanner', () => {
   });
 
   describe('independent destination scanning', () => {
+    it('clears previous endpoint availability before an empty scan and rebuilds it only from fresh observations', async (t) => {
+      const { media } = await seedRemoval(MediaType.MOVIE);
+      const settings = getSettings();
+      const connectionA = { ...settings.radarr[1] };
+      settings.radarr = [connectionA];
+      t.mock.method(settings, 'save', async () => undefined);
+      const before = await removalSnapshot();
+      const notifications = sendNotificationMock.mock.callCount();
+      const app = express();
+      app.use(express.json());
+      app.use('/settings', settingsRoutes);
+      assert.equal(
+        (
+          await request(app)
+            .put('/settings/2')
+            .send({ ...connectionA, hostname: 'replacement' })
+        ).status,
+        200
+      );
+      const invalidated = await removalSnapshot();
+      assert.deepEqual(invalidated.media, before.media);
+      assert.deepEqual(invalidated.destinations[0], before.destinations[0]);
+      assert.deepEqual(invalidated.requests, before.requests);
+      assert.deepEqual(invalidated.seasonRequests, before.seasonRequests);
+      assert.equal(invalidated.destinations[1].status, MediaStatus.UNKNOWN);
+      assert.equal(invalidated.destinations[1].externalServiceId, null);
+      assert.equal(invalidated.destinations[1].externalServiceSlug, null);
+
+      getMoviesImpl = async () => [];
+      await runWithMockTimers(() => radarrScanner.run());
+      assert.deepEqual(await removalSnapshot(), invalidated);
+      assert.equal(sendNotificationMock.mock.callCount(), notifications);
+
+      getMoviesImpl = async () => [
+        fakeRadarrMovie({
+          id: 42,
+          tmdbId: media.tmdbId,
+          titleSlug: 'replacement-media',
+        }),
+      ];
+      await runWithMockTimers(() => radarrScanner.run());
+      const fresh = await removalSnapshot();
+      assert.deepEqual(fresh.media, before.media);
+      assert.deepEqual(fresh.destinations[0], before.destinations[0]);
+      assert.equal(fresh.destinations[1].status, MediaStatus.AVAILABLE);
+      assert.equal(fresh.destinations[1].externalServiceId, 42);
+      assert.equal(
+        fresh.destinations[1].externalServiceSlug,
+        'replacement-media'
+      );
+
+      assert.equal(fresh.requests[2].status, MediaRequestStatus.COMPLETED);
+    });
+
     for (const cleanup of [false, true]) {
       for (const restored of [false, true]) {
         it(
@@ -804,9 +858,17 @@ describe('Radarr Scanner', () => {
                   .status,
                 200
               );
+            const invalidated = await removalSnapshot();
             release();
             await scanning;
-            assert.deepEqual(await removalSnapshot(), before);
+            assert.deepEqual(await removalSnapshot(), invalidated);
+            assert.equal(
+              invalidated.destinations[1].status,
+              MediaStatus.UNKNOWN
+            );
+            assert.equal(invalidated.destinations[1].externalServiceId, null);
+            assert.deepEqual(invalidated.requests, before.requests);
+            assert.deepEqual(invalidated.seasonRequests, before.seasonRequests);
             assert.equal(sendNotificationMock.mock.callCount(), notifications);
             getMoviesImpl = async () => inventory;
             await runWithMockTimers(() => radarrScanner.run());
@@ -819,7 +881,7 @@ describe('Radarr Scanner', () => {
             assert.equal(
               after.requests[0].status,
               cleanup
-                ? MediaRequestStatus.DECLINED
+                ? MediaRequestStatus.APPROVED
                 : MediaRequestStatus.COMPLETED
             );
             if (cleanup)
@@ -827,7 +889,7 @@ describe('Radarr Scanner', () => {
             else assert.equal(after.destinations[1].externalServiceId, 42);
             assert.equal(
               sendNotificationMock.mock.callCount(),
-              notifications + 1
+              notifications + (cleanup ? 0 : 1)
             );
           }
         );
@@ -933,7 +995,9 @@ describe('Radarr Scanner', () => {
             writing();
             await resumed;
             assert.equal(settings.radarr[0].hostname, connectionA.hostname);
-            return originalUpdate(...args);
+            const result = await originalUpdate(...args);
+            assert.equal(result.destination.externalServiceId, 42);
+            return result;
           }
         );
         const scanning = runWithMockTimers(() => radarrScanner.run());
@@ -974,7 +1038,7 @@ describe('Radarr Scanner', () => {
               serverId: 2,
             })
           ).externalServiceId,
-          42
+          null
         );
         assert.equal(settings.radarr[0].hostname, 'connection-b');
       }

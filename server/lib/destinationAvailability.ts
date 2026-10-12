@@ -372,6 +372,46 @@ export const declineRequestsForDestination = async (
   return declinedRequests;
 };
 
+// Settings callers hold the server identity lock and commit this invalidation
+// before exposing a replacement endpoint. Requests and row identities survive;
+// only a fresh scanner can rebuild availability on the replacement instance.
+export const invalidateIndependentDestinationState = async (
+  mediaType: MediaType,
+  serverId: number,
+  manager?: EntityManager
+): Promise<void> => {
+  await managerOrDefault(manager).transaction(async (tx) => {
+    const destinations = tx
+      .createQueryBuilder(MediaDestinationStatus, 'destination')
+      .select('destination.id')
+      .innerJoin('destination.media', 'media')
+      .where('destination.serverId = :serverId', { serverId })
+      .andWhere('media.mediaType = :mediaType', { mediaType });
+    // The entire server can contain a large library; keep its scope in SQL
+    // rather than binding one parameter per destination.
+    await tx
+      .createQueryBuilder()
+      .update(MediaDestinationStatus)
+      .set({
+        status: MediaStatus.UNKNOWN,
+        externalServiceId: null,
+        externalServiceSlug: null,
+      })
+      .where(`id IN (${destinations.getQuery()})`)
+      .setParameters(destinations.getParameters())
+      .execute();
+    if (mediaType === MediaType.TV) {
+      await tx
+        .createQueryBuilder()
+        .update(MediaDestinationSeasonStatus)
+        .set({ status: MediaStatus.UNKNOWN })
+        .where(`"destinationStatusId" IN (${destinations.getQuery()})`)
+        .setParameters(destinations.getParameters())
+        .execute();
+    }
+  });
+};
+
 export const updateIndependentMovieDestination = async (
   {
     tmdbId,

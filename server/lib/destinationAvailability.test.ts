@@ -13,6 +13,7 @@ import { User } from '@server/entity/User';
 import {
   completeRequestsForDestination,
   declineRequestsForDestination,
+  invalidateIndependentDestinationState,
   markMissingMovieDestination,
   markMissingTvDestination,
   notifyAvailableRequests,
@@ -24,7 +25,10 @@ import {
 } from '@server/lib/destinationAvailability';
 import { Notification } from '@server/lib/notifications';
 import { setupTestDb } from '@server/test/db';
-import { seedRemoval } from '@server/test/fixtures/destinationRemoval';
+import {
+  removalSnapshot,
+  seedRemoval,
+} from '@server/test/fixtures/destinationRemoval';
 import assert from 'node:assert/strict';
 import { describe, it, mock } from 'node:test';
 import { Repository, type EntityManager } from 'typeorm';
@@ -92,6 +96,102 @@ const createRequest = async ({
 };
 
 describe('destination availability', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`invalidates all existing ${type} destination states without changing row identities or lifecycle`, async () => {
+      await seedRemoval(type);
+      for (const status of [
+        MediaStatus.UNKNOWN,
+        MediaStatus.PENDING,
+        MediaStatus.PROCESSING,
+        MediaStatus.PARTIALLY_AVAILABLE,
+        MediaStatus.AVAILABLE,
+        MediaStatus.DELETED,
+      ]) {
+        const media = await getRepository(Media).save(
+          new Media({
+            mediaType: type,
+            tmdbId: 1000 + status,
+            status: MediaStatus.AVAILABLE,
+          }),
+          { listeners: false }
+        );
+        const destination = await getRepository(MediaDestinationStatus).save(
+          new MediaDestinationStatus({
+            mediaId: media.id,
+            serverId: 2,
+            status,
+            externalServiceId: 200 + status,
+            externalServiceSlug: `previous-${status}`,
+          })
+        );
+        if (type === MediaType.TV)
+          await getRepository(MediaDestinationSeasonStatus).save(
+            new MediaDestinationSeasonStatus({
+              destinationStatusId: destination.id,
+              seasonNumber: 1,
+              status,
+            })
+          );
+      }
+      const before = await removalSnapshot();
+      const notifications = sendNotificationMock.mock.callCount();
+      await invalidateIndependentDestinationState(type, 2);
+      const after = await removalSnapshot();
+      assert.deepEqual(after.media, before.media);
+      assert.deepEqual(after.requests, before.requests);
+      assert.deepEqual(after.seasonRequests, before.seasonRequests);
+      assert.deepEqual(
+        after.destinations.map((row) => [row.id, row.mediaId, row.serverId]),
+        before.destinations.map((row) => [row.id, row.mediaId, row.serverId])
+      );
+      assert.deepEqual(
+        after.seasons.map((row) => [
+          row.id,
+          row.destinationStatusId,
+          row.seasonNumber,
+        ]),
+        before.seasons.map((row) => [
+          row.id,
+          row.destinationStatusId,
+          row.seasonNumber,
+        ])
+      );
+      const affectedIds = new Set(
+        after.destinations
+          .filter((row) => row.serverId === 2)
+          .map((row) => row.id)
+      );
+      assert.ok(
+        after.destinations
+          .filter((row) => affectedIds.has(row.id))
+          .every(
+            (row) =>
+              row.status === MediaStatus.UNKNOWN &&
+              row.externalServiceId === null &&
+              row.externalServiceSlug === null
+          )
+      );
+      assert.ok(
+        after.seasons
+          .filter((row) => affectedIds.has(row.destinationStatusId))
+          .every((row) => row.status === MediaStatus.UNKNOWN)
+      );
+      assert.deepEqual(
+        after.destinations.filter((row) => !affectedIds.has(row.id)),
+        before.destinations.filter((row) => !affectedIds.has(row.id))
+      );
+      assert.deepEqual(
+        after.seasons.filter(
+          (row) => !affectedIds.has(row.destinationStatusId)
+        ),
+        before.seasons.filter(
+          (row) => !affectedIds.has(row.destinationStatusId)
+        )
+      );
+      assert.equal(sendNotificationMock.mock.callCount(), notifications);
+    });
+  }
+
   for (const type of [MediaType.MOVIE, MediaType.TV]) {
     it(`rolls back ${type} reconciliation without notifying when destination persistence fails`, async (t) => {
       const { media, destinations, requests } = await seedRemoval(type);

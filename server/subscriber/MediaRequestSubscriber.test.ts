@@ -405,7 +405,17 @@ describe('independent Arr addition and removal coordination', () => {
           async (...args: unknown[]) => {
             callbackStarted.resolve();
             await callbackReleased.promise;
-            return originalSuccess(...args);
+            const applied = await originalSuccess(...args);
+            assert.equal(
+              (
+                await getRepository(MediaDestinationStatus).findOneByOrFail({
+                  mediaId: req.media.id,
+                  serverId: req.serverId,
+                })
+              ).externalServiceId,
+              7007
+            );
+            return applied;
           }
         );
         const manager = getRepository(MediaRequest).manager;
@@ -463,7 +473,7 @@ describe('independent Arr addition and removal coordination', () => {
               serverId: req.serverId,
             })
           ).externalServiceId,
-          7007
+          null
         );
         assert.equal(
           (await getRepository(MediaRequest).findOneByOrFail({ id: req.id }))

@@ -1,5 +1,6 @@
 import RadarrAPI from '@server/api/servarr/radarr';
 import { MediaType } from '@server/constants/media';
+import { invalidateIndependentDestinationState } from '@server/lib/destinationAvailability';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import {
@@ -16,6 +17,7 @@ import logger from '@server/logger';
 import { invalidateDestinationConnectionScans } from '@server/utils/destinationOperationLock';
 import {
   hasDvrConnectionChanged,
+  hasDvrEndpointChanged,
   withDvrIdentityLock,
   withDvrSettingsMutationLock,
 } from '@server/utils/dvrIdentityLock';
@@ -205,6 +207,16 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
         }
       }
 
+      const endpointChanged =
+        currentRadarr.independentRequestDestination === true &&
+        hasDvrEndpointChanged(currentRadarr, updatedRadarr);
+      const previousServers = endpointChanged
+        ? settings.radarr.map((server) => ({ ...server }))
+        : undefined;
+      if (endpointChanged) {
+        await invalidateIndependentDestinationState(MediaType.MOVIE, serverId);
+      }
+
       // If we are setting this as the default, clear any previous defaults for the same type first
       // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
       // and are the default
@@ -222,7 +234,14 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
       if (hasDvrConnectionChanged(currentRadarr, updatedRadarr)) {
         invalidateDestinationConnectionScans(MediaType.MOVIE, serverId);
       }
-      await settings.save();
+      try {
+        await settings.save();
+      } catch (error) {
+        // DB invalidation is already committed. Restoring the old configuration
+        // is safe; its availability will be rebuilt without restoring stale IDs.
+        if (previousServers) settings.radarr = previousServers;
+        throw error;
+      }
 
       return res.status(200).json(settings.radarr[radarrIndex]);
     };

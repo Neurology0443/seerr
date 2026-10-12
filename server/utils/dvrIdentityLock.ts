@@ -1,4 +1,5 @@
 import type { DVRSettings } from '@server/lib/settings';
+import { isSameDvrEndpoint } from '@server/lib/settings/dvrValidation';
 import AsyncLock from '@server/utils/asyncLock';
 
 export type DvrIdentityKind = 'radarr' | 'sonarr';
@@ -40,3 +41,10 @@ export const hasDvrConnectionChanged = (
   Boolean(previous.useSsl) !== Boolean(next.useSsl) ||
   (previous.baseUrl ?? '') !== (next.baseUrl ?? '') ||
   previous.apiKey !== next.apiKey;
+
+export const hasDvrEndpointChanged = (
+  previous: DvrConnectionSettings,
+  next: DvrConnectionSettings
+): boolean =>
+  !isSameDvrEndpoint(previous, next) ||
+  Boolean(previous.useSsl) !== Boolean(next.useSsl);

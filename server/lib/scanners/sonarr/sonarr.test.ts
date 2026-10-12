@@ -223,6 +223,111 @@ function configureSonarr(overrides: Partial<SonarrSettings>[] = [{}]): void {
 }
 
 describe('Sonarr Scanner', () => {
+  it('clears previous endpoint availability before an empty scan and rebuilds it only from fresh observations', async (t) => {
+    const { media, destinations } = await seedRemoval(MediaType.TV);
+    const settings = getSettings();
+    const connectionA = { ...settings.sonarr[1] };
+    settings.sonarr = [connectionA];
+    t.mock.method(settings, 'save', async () => undefined);
+    const before = await removalSnapshot();
+    const notifications = sendNotificationMock.mock.callCount();
+    const app = express();
+    app.use(express.json());
+    app.use('/settings', settingsRoutes);
+    assert.equal(
+      (
+        await request(app)
+          .put('/settings/2')
+          .send({ ...connectionA, hostname: 'replacement' })
+      ).status,
+      200
+    );
+    const invalidated = await removalSnapshot();
+    assert.deepEqual(invalidated.media, before.media);
+    assert.deepEqual(invalidated.destinations[0], before.destinations[0]);
+    assert.deepEqual(invalidated.requests, before.requests);
+    assert.deepEqual(invalidated.seasonRequests, before.seasonRequests);
+    assert.equal(invalidated.destinations[1].status, MediaStatus.UNKNOWN);
+    assert.equal(invalidated.destinations[1].externalServiceId, null);
+    assert.equal(invalidated.destinations[1].externalServiceSlug, null);
+    assert.ok(
+      invalidated.seasons
+        .filter((row) => row.destinationStatusId === destinations[1].id)
+        .every((row) => row.status === MediaStatus.UNKNOWN)
+    );
+    assert.deepEqual(
+      invalidated.seasons.filter(
+        (row) => row.destinationStatusId === destinations[0].id
+      ),
+      before.seasons.filter(
+        (row) => row.destinationStatusId === destinations[0].id
+      )
+    );
+    getSeriesImpl = async () => [];
+    await runWithMockTimers(() => sonarrScanner.run());
+    assert.deepEqual(await removalSnapshot(), invalidated);
+    assert.equal(sendNotificationMock.mock.callCount(), notifications);
+    getTvShowImpl = async () =>
+      fakeTmdbShow(
+        media.tmdbId,
+        [1, 2].map((season_number) => ({
+          id: season_number,
+          season_number,
+          episode_count: 10,
+          name: `Season ${season_number}`,
+          overview: '',
+          air_date: '2024-01-01',
+        }))
+      );
+    getSeriesImpl = async () => [
+      fakeSonarrSeries({
+        id: 42,
+        tvdbId: media.tvdbId,
+        titleSlug: 'replacement-media',
+        seasons: [1, 2].map((seasonNumber) => ({
+          seasonNumber,
+          monitored: true,
+          statistics: {
+            episodeFileCount: 10,
+            totalEpisodeCount: 10,
+            episodeCount: 10,
+            percentOfEpisodes: 100,
+            sizeOnDisk: 0,
+            previousAiring: undefined,
+          },
+        })),
+      }),
+    ];
+    await runWithMockTimers(() => sonarrScanner.run());
+    const fresh = await removalSnapshot();
+    assert.deepEqual(fresh.media, before.media);
+    assert.deepEqual(fresh.destinations[0], before.destinations[0]);
+    assert.equal(fresh.destinations[1].status, MediaStatus.AVAILABLE);
+    assert.equal(fresh.destinations[1].externalServiceId, 42);
+    assert.equal(
+      fresh.destinations[1].externalServiceSlug,
+      'replacement-media'
+    );
+    assert.deepEqual(
+      fresh.seasons.map((row) => [
+        row.id,
+        row.destinationStatusId,
+        row.seasonNumber,
+      ]),
+      before.seasons.map((row) => [
+        row.id,
+        row.destinationStatusId,
+        row.seasonNumber,
+      ])
+    );
+    assert.ok(
+      fresh.seasons
+        .filter((row) => row.destinationStatusId === destinations[1].id)
+        .every((row) => row.status === MediaStatus.AVAILABLE)
+    );
+    assert.equal(fresh.requests[2].status, MediaRequestStatus.COMPLETED);
+  });
+
   for (const cleanup of [false, true]) {
     for (const restored of [false, true]) {
       it(
@@ -291,9 +396,14 @@ describe('Sonarr Scanner', () => {
               (await request(app).put('/settings/2').send(connectionA)).status,
               200
             );
+          const invalidated = await removalSnapshot();
           release();
           await scanning;
-          assert.deepEqual(await removalSnapshot(), before);
+          assert.deepEqual(await removalSnapshot(), invalidated);
+          assert.equal(invalidated.destinations[1].status, MediaStatus.UNKNOWN);
+          assert.equal(invalidated.destinations[1].externalServiceId, null);
+          assert.deepEqual(invalidated.requests, before.requests);
+          assert.deepEqual(invalidated.seasonRequests, before.seasonRequests);
           assert.equal(sendNotificationMock.mock.callCount(), notifications);
           getSeriesImpl = async () => inventory;
           await runWithMockTimers(() => sonarrScanner.run());
@@ -305,14 +415,14 @@ describe('Sonarr Scanner', () => {
           assert.deepEqual(after.destinations[0], before.destinations[0]);
           assert.equal(
             after.requests[0].status,
-            cleanup ? MediaRequestStatus.DECLINED : MediaRequestStatus.COMPLETED
+            cleanup ? MediaRequestStatus.APPROVED : MediaRequestStatus.COMPLETED
           );
           if (cleanup)
             assert.equal(after.destinations[1].status, MediaStatus.UNKNOWN);
           else assert.equal(after.destinations[1].externalServiceId, 42);
           assert.equal(
             sendNotificationMock.mock.callCount(),
-            notifications + 1
+            notifications + (cleanup ? 0 : 1)
           );
         }
       );
@@ -420,7 +530,9 @@ describe('Sonarr Scanner', () => {
           writing();
           await resumed;
           assert.equal(settings.sonarr[0].hostname, connectionA.hostname);
-          return originalUpdate(...args);
+          const result = await originalUpdate(...args);
+          assert.equal(result.destination.externalServiceId, 42);
+          return result;
         }
       );
       const scanning = runWithMockTimers(() => sonarrScanner.run());
@@ -461,7 +573,7 @@ describe('Sonarr Scanner', () => {
             serverId: 2,
           })
         ).externalServiceId,
-        42
+        null
       );
       assert.equal(settings.sonarr[0].hostname, 'connection-b');
     }

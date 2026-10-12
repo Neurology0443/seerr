@@ -311,7 +311,7 @@ for (const type of [MediaType.MOVIE, MediaType.TV]) {
                 serverId: 2,
               })
             ).status,
-            MediaStatus.DELETED
+            mutation === 'deletion' ? MediaStatus.DELETED : MediaStatus.UNKNOWN
           );
         }
       );
