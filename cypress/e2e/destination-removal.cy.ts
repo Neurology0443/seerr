@@ -234,12 +234,7 @@ describe('destination removal management', () => {
     }).as('remove');
     cy.contains('[data-testid="manage-destination"]', 'EN (4K)').within(() => {
       cy.contains('button', 'Remove from Radarr').click();
-      cy.contains(
-        'button',
-        'Remove this movie and its files from Radarr destination "EN"?'
-      )
-        .should('be.visible')
-        .click();
+      cy.contains('button', 'Are you sure?').should('be.visible').click();
     });
     cy.wait('@remove').its('request.url').should('not.contain', 'is4k');
     cy.wait('@targets');
@@ -255,7 +250,7 @@ describe('destination removal management', () => {
     }).as('remove');
     cy.contains('[data-testid="manage-destination"]', 'EN (4K)').within(() => {
       cy.contains('button', 'Remove from Radarr').click();
-      cy.contains('button', 'Remove this movie and its files').click();
+      cy.contains('button', 'Are you sure?').click();
     });
     cy.wait('@remove');
     cy.contains('Something went wrong while removing the media.').should(
@@ -309,11 +304,8 @@ describe('destination removal management', () => {
     cy.intercept('DELETE', '/api/v1/media/100/file?serverId=2', {
       statusCode: 204,
     }).as('remove');
-    cy.contains('button', 'Remove from Radarr').click();
-    cy.contains(
-      'button',
-      'Remove this movie and its files from Radarr destination "EN"?'
-    ).click();
+    cy.contains('button', 'Remove from Radarr').as('removeButton').click();
+    cy.get('@removeButton').should('contain', 'Are you sure?').click();
     cy.wait('@remove');
     cy.wait('@list');
     cy.wait('@count');
@@ -340,8 +332,8 @@ describe('destination removal management', () => {
     cy.intercept('DELETE', '/api/v1/media/100/file?serverId=2', {
       statusCode: 404,
     }).as('remove');
-    cy.contains('button', 'Remove from Radarr').click();
-    cy.contains('button', 'Remove this movie and its files').click();
+    cy.contains('button', 'Remove from Radarr').as('removeButton').click();
+    cy.get('@removeButton').should('contain', 'Are you sure?').click();
     cy.wait('@remove');
     cy.contains('Something went wrong while removing the media.').should(
       'be.visible'

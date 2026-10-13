@@ -64,8 +64,6 @@ const messages = defineMessages('components.ManageSlideOver', {
     '* This will irreversibly remove all data for this {mediaType}, including any requests. If this item exists in your {mediaServerName} library, the media information will be recreated during the next scan.',
   manageModalClearDestinationWarning:
     'This also purges multi-destination tracking data. Clear Data does not delete media files from Radarr/Sonarr.',
-  removeDestinationConfirm:
-    'Remove this {mediaType} and its files from {arr} destination "{name}"?',
   standard: 'Standard',
   manageModalRemoveMediaWarning:
     '* This will irreversibly remove this {mediaType} from {arr}, including all files.',
@@ -723,29 +721,35 @@ const ManageSlideOver = ({
                     </a>
                   )}
                   {target.canRemove && (
-                    <ConfirmButton
-                      onClick={() => deleteMediaFile(false, target.serverId)}
-                      confirmText={intl.formatMessage(
-                        messages.removeDestinationConfirm,
-                        {
-                          mediaType: intl.formatMessage(
-                            mediaType === 'movie'
-                              ? messages.movie
-                              : messages.tvshow
-                          ),
-                          arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
-                          name: target.name,
-                        }
-                      )}
-                      className="min-h-20 w-full"
-                    >
-                      <TrashIcon />
-                      <span>
-                        {intl.formatMessage(messages.removearr, {
-                          arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
-                        })}
-                      </span>
-                    </ConfirmButton>
+                    <div>
+                      <ConfirmButton
+                        onClick={() => deleteMediaFile(false, target.serverId)}
+                        confirmText={intl.formatMessage(
+                          globalMessages.areyousure
+                        )}
+                        className="w-full"
+                      >
+                        <TrashIcon />
+                        <span>
+                          {intl.formatMessage(messages.removearr, {
+                            arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+                          })}
+                        </span>
+                      </ConfirmButton>
+                      <div className="mt-1 text-xs text-gray-400">
+                        {intl.formatMessage(
+                          messages.manageModalRemoveMediaWarning,
+                          {
+                            mediaType: intl.formatMessage(
+                              mediaType === 'movie'
+                                ? messages.movie
+                                : messages.tvshow
+                            ),
+                            arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+                          }
+                        )}
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>

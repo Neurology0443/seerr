@@ -52,8 +52,6 @@ const messages = defineMessages('components.RequestList.RequestItem', {
   tvdbid: 'TheTVDB ID',
   unknowntitle: 'Unknown Title',
   removearr: 'Remove from {arr}',
-  removeDestinationConfirm:
-    'Remove this {mediaType} and its files from {arr} destination "{name}"?',
   removemediaerror: 'Something went wrong while removing the media.',
   profileName: 'Profile',
 });
@@ -748,27 +746,10 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                   !removalTarget?.deleted && (
                     <ConfirmButton
                       onClick={() => deleteMediaFile()}
-                      confirmText={
-                        removalTarget?.isIndependent
-                          ? intl.formatMessage(
-                              messages.removeDestinationConfirm,
-                              {
-                                mediaType:
-                                  request.type === 'movie' ? 'movie' : 'series',
-                                arr:
-                                  request.type === 'movie'
-                                    ? 'Radarr'
-                                    : 'Sonarr',
-                                name: removalTarget.name,
-                              }
-                            )
-                          : intl.formatMessage(globalMessages.areyousure)
-                      }
-                      className={
-                        removalTarget?.isIndependent
-                          ? 'min-h-20 w-full'
-                          : 'w-full'
-                      }
+                      confirmText={intl.formatMessage(
+                        globalMessages.areyousure
+                      )}
+                      className="w-full"
                     >
                       <TrashIcon />
                       <span>
