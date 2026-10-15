@@ -731,6 +731,66 @@ const TvRequestModal = ({
           }
         />
       )}
+      {hasPermission(
+        [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
+        { type: 'or' }
+      ) && (
+        <fieldset
+          disabled={!!editRequest && (editSession.blocked || isUpdating)}
+        >
+          <AdvancedRequester
+            disabled={!!requestToEdit && (editSession.blocked || isUpdating)}
+            key={
+              editRequest
+                ? `${editRequest.id}:${editRequest.editRevision}`
+                : 'new'
+            }
+            type="tv"
+            tmdbId={tmdbId}
+            is4k={is4k}
+            isAnime={data?.keywords.some(
+              (keyword) => keyword.id === ANIME_KEYWORD_ID
+            )}
+            quota={quota}
+            onChange={(overrides) => setRequestOverrides(overrides)}
+            onServerChange={(serverId) => {
+              if (!editRequest) {
+                setSelectedSeasons([]);
+              }
+              setRequestOverrides((overrides) => ({
+                server: serverId,
+                user: overrides?.user,
+                ignoreQuota: overrides?.ignoreQuota,
+                isReady: false,
+                hasConfigurationChanges: true,
+                hasLocalChanges: true,
+              }));
+            }}
+            requestUser={editRequest?.requestedBy}
+            requestId={editRequest?.id}
+            initialServerId={
+              editRequest ? editRequest.serverId : defaultTarget?.serverId
+            }
+            hideDestinationSelector={!editRequest && !canSelectDestination}
+            destinationReadOnly={
+              editRequest
+                ? isEditDestinationReadOnly(editRequest.serverId, editTarget)
+                : false
+            }
+            defaultOverrides={
+              editRequest
+                ? {
+                    folder: editRequest.rootFolder,
+                    profile: editRequest.profileId,
+                    server: editRequest.serverId,
+                    language: editRequest.languageProfileId,
+                    tags: editRequest.tags,
+                  }
+                : undefined
+            }
+          />
+        </fieldset>
+      )}
       <div className="flex flex-col">
         <div className="-mx-4 sm:mx-0">
           <div className="inline-block min-w-full py-2 align-middle">
@@ -943,66 +1003,6 @@ const TvRequestModal = ({
           </div>
         </div>
       </div>
-      {hasPermission(
-        [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
-        { type: 'or' }
-      ) && (
-        <fieldset
-          disabled={!!editRequest && (editSession.blocked || isUpdating)}
-        >
-          <AdvancedRequester
-            disabled={!!requestToEdit && (editSession.blocked || isUpdating)}
-            key={
-              editRequest
-                ? `${editRequest.id}:${editRequest.editRevision}`
-                : 'new'
-            }
-            type="tv"
-            tmdbId={tmdbId}
-            is4k={is4k}
-            isAnime={data?.keywords.some(
-              (keyword) => keyword.id === ANIME_KEYWORD_ID
-            )}
-            quota={quota}
-            onChange={(overrides) => setRequestOverrides(overrides)}
-            onServerChange={(serverId) => {
-              if (!editRequest) {
-                setSelectedSeasons([]);
-              }
-              setRequestOverrides((overrides) => ({
-                server: serverId,
-                user: overrides?.user,
-                ignoreQuota: overrides?.ignoreQuota,
-                isReady: false,
-                hasConfigurationChanges: true,
-                hasLocalChanges: true,
-              }));
-            }}
-            requestUser={editRequest?.requestedBy}
-            requestId={editRequest?.id}
-            initialServerId={
-              editRequest ? editRequest.serverId : defaultTarget?.serverId
-            }
-            hideDestinationSelector={!editRequest && !canSelectDestination}
-            destinationReadOnly={
-              editRequest
-                ? isEditDestinationReadOnly(editRequest.serverId, editTarget)
-                : false
-            }
-            defaultOverrides={
-              editRequest
-                ? {
-                    folder: editRequest.rootFolder,
-                    profile: editRequest.profileId,
-                    server: editRequest.serverId,
-                    language: editRequest.languageProfileId,
-                    tags: editRequest.tags,
-                  }
-                : undefined
-            }
-          />
-        </fieldset>
-      )}
     </Modal>
   );
 };
