@@ -31,7 +31,18 @@ tvRoutes.get<{ id: string }, TvRequestTarget[]>(
   async (req, res, next) => {
     try {
       const tmdb = new TheMovieDb();
-      const show = await tmdb.getTvShow({ tvId: Number(req.params.id) });
+      const tmdbTv = await tmdb.getTvShow({
+        tvId: Number(req.params.id),
+      });
+      const metadataProvider = tmdbTv.keywords.results.some(
+        (keyword: TmdbKeyword) => keyword.id === ANIME_KEYWORD_ID
+      )
+        ? await getMetadataProvider('anime')
+        : await getMetadataProvider('tv');
+      const show = await metadataProvider.getTvShow({
+        tvId: Number(req.params.id),
+        language: (req.query.language as string) ?? req.locale,
+      });
       const settings = getSettings();
       const seasonNumbers = show.seasons
         .filter(

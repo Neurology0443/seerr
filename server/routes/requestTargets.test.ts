@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { before, beforeEach, describe, it } from 'node:test';
+import { before, beforeEach, describe, it, type TestContext } from 'node:test';
 
 import TheMovieDb from '@server/api/themoviedb';
+import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import type { TmdbTvDetails } from '@server/api/themoviedb/interfaces';
+import Tvdb from '@server/api/tvdb';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -21,7 +23,7 @@ import type {
   TvRequestTarget,
 } from '@server/interfaces/api/requestInterfaces';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
-import { getSettings } from '@server/lib/settings';
+import { MetadataProviderType, getSettings } from '@server/lib/settings';
 import { checkUser, isAuthenticated } from '@server/middleware/auth';
 import { setupTestDb } from '@server/test/db';
 import type { Express } from 'express';
@@ -32,19 +34,14 @@ import authRoutes from './auth';
 import movieRoutes from './movie';
 import tvRoutes from './tv';
 
+let tmdbShow: Pick<TmdbTvDetails, 'keywords' | 'external_ids' | 'seasons'>;
+
 Object.defineProperty(TheMovieDb.prototype, 'getTvShow', {
   get() {
     return async ({ tvId }: { tvId: number }) =>
       ({
         id: tvId,
-        keywords: { results: [] },
-        external_ids: {},
-        seasons: [
-          { season_number: 0, episode_count: 2 },
-          { season_number: 1, episode_count: 10 },
-          { season_number: 2, episode_count: 8 },
-          { season_number: 3, episode_count: 0 },
-        ],
+        ...tmdbShow,
       }) as unknown as TmdbTvDetails;
   },
   set() {},
@@ -137,9 +134,46 @@ beforeEach(() => {
   getSettings().radarr = [];
   getSettings().sonarr = [];
   getSettings().main.enableSpecialEpisodes = false;
+  getSettings().metadataSettings = {
+    tv: MetadataProviderType.TMDB,
+    anime: MetadataProviderType.TMDB,
+  };
+  tmdbShow = {
+    keywords: { results: [] },
+    external_ids: { tvdb_id: 1234 } as TmdbTvDetails['external_ids'],
+    seasons: [
+      { season_number: 0, episode_count: 2 },
+      { season_number: 1, episode_count: 10 },
+      { season_number: 2, episode_count: 8 },
+      { season_number: 3, episode_count: 0 },
+    ] as TmdbTvDetails['seasons'],
+  };
 });
 
 setupTestDb();
+
+function mockTvdb(t: TestContext, unavailable = false) {
+  const tvdb = new Tvdb();
+  t.mock.method(tvdb, 'login', async () => ({ token: 'test-token' }));
+  // Stub only the transport, retaining provider selection, season mapping,
+  // and the existing fallback behavior in Tvdb.getTvShow.
+  Object.defineProperty(tvdb, 'get', {
+    value: async () => {
+      if (unavailable) throw new Error('TheTVDB unavailable');
+      return {
+        data: {
+          id: 1234,
+          seasons: [0, 1, 2, 3, 4].map((number) => ({
+            number,
+            type: { type: 'official' },
+          })),
+          episodes: [0, 1, 2, 3].map((seasonNumber) => ({ seasonNumber })),
+        },
+      };
+    },
+  });
+  return t.mock.method(Tvdb, 'getInstance', async () => tvdb);
+}
 
 async function login() {
   const prior = getSettings().main.localLogin;
@@ -288,85 +322,221 @@ describe('GET /movie/:id/request-targets', () => {
 });
 
 describe('GET /tv/:id/request-targets', () => {
-  it('isolates season state and occupation by destination and native tier', async () => {
-    getSettings().sonarr = [
-      sonarr(31, { name: 'Native' }),
-      sonarr(32, { name: 'Native 4K', is4k: true }),
-      sonarr(33, { name: 'FR', independentRequestDestination: true }),
-      sonarr(34, { name: 'EN', independentRequestDestination: true }),
-    ];
-    const media = await getRepository(Media).save(
-      new Media({
-        mediaType: MediaType.TV,
-        tmdbId: 52001,
-        status: MediaStatus.PROCESSING,
-        status4k: MediaStatus.PROCESSING,
-        seasons: [
-          new Season({
-            seasonNumber: 1,
-            status: MediaStatus.AVAILABLE,
-            status4k: MediaStatus.UNKNOWN,
-          }),
-          new Season({
-            seasonNumber: 2,
-            status: MediaStatus.UNKNOWN,
-            status4k: MediaStatus.AVAILABLE,
-          }),
-        ],
-      })
-    );
-    const [french, english] = await getRepository(MediaDestinationStatus).save([
-      new MediaDestinationStatus({
-        mediaId: media.id,
-        serverId: 33,
-        status: MediaStatus.PROCESSING,
-      }),
-      new MediaDestinationStatus({
-        mediaId: media.id,
-        serverId: 34,
-        status: MediaStatus.PROCESSING,
-      }),
-    ]);
-    await getRepository(MediaDestinationSeasonStatus).save([
-      new MediaDestinationSeasonStatus({
-        destinationStatusId: french.id,
-        seasonNumber: 1,
-        status: MediaStatus.UNKNOWN,
-      }),
-      new MediaDestinationSeasonStatus({
-        destinationStatusId: english.id,
-        seasonNumber: 1,
-        status: MediaStatus.AVAILABLE,
-      }),
-    ]);
-    await seedRequest(media, 34, MediaRequestStatus.PENDING, [1]);
-    await seedRequest(media, 31, MediaRequestStatus.APPROVED, [2]);
+  for (const provider of [
+    MetadataProviderType.TMDB,
+    MetadataProviderType.TVDB,
+  ]) {
+    it(`isolates ${provider} season state and occupation by destination and native tier`, async (t) => {
+      if (provider === MetadataProviderType.TVDB) {
+        getSettings().metadataSettings.anime = MetadataProviderType.TVDB;
+        tmdbShow.keywords.results = [{ id: ANIME_KEYWORD_ID, name: 'anime' }];
+        tmdbShow.seasons = tmdbShow.seasons.filter(
+          (season) => season.season_number === 1
+        );
+        mockTvdb(t);
+      }
+      getSettings().sonarr = [
+        sonarr(31, { name: 'Native' }),
+        sonarr(32, { name: 'Native 4K', is4k: true }),
+        sonarr(33, { name: 'FR', independentRequestDestination: true }),
+        sonarr(34, { name: 'EN', independentRequestDestination: true }),
+      ];
+      const media = await getRepository(Media).save(
+        new Media({
+          mediaType: MediaType.TV,
+          tmdbId: 52001,
+          status: MediaStatus.PROCESSING,
+          status4k: MediaStatus.PROCESSING,
+          seasons: [
+            new Season({
+              seasonNumber: 1,
+              status: MediaStatus.AVAILABLE,
+              status4k: MediaStatus.UNKNOWN,
+            }),
+            new Season({
+              seasonNumber: 2,
+              status: MediaStatus.UNKNOWN,
+              status4k: MediaStatus.AVAILABLE,
+            }),
+          ],
+        })
+      );
+      const [french, english] = await getRepository(
+        MediaDestinationStatus
+      ).save([
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 33,
+          status: MediaStatus.PROCESSING,
+        }),
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 34,
+          status: MediaStatus.PROCESSING,
+        }),
+      ]);
+      await getRepository(MediaDestinationSeasonStatus).save([
+        new MediaDestinationSeasonStatus({
+          destinationStatusId: french.id,
+          seasonNumber: 1,
+          status: MediaStatus.UNKNOWN,
+        }),
+        new MediaDestinationSeasonStatus({
+          destinationStatusId: english.id,
+          seasonNumber: 1,
+          status: MediaStatus.AVAILABLE,
+        }),
+      ]);
+      await seedRequest(media, 34, MediaRequestStatus.PENDING, [1]);
+      await seedRequest(media, 31, MediaRequestStatus.APPROVED, [2]);
+      if (provider === MetadataProviderType.TVDB) {
+        await seedRequest(media, 34, MediaRequestStatus.PENDING, [3]);
+        await seedRequest(media, 32, MediaRequestStatus.APPROVED, [3], true);
+      }
 
-    const response = await (await login()).get('/tv/52001/request-targets');
-    assert.strictEqual(response.status, 200);
-    const byId = new Map<number, TvRequestTarget>(
-      (response.body as TvRequestTarget[]).map((target) => [
-        target.serverId,
-        target,
-      ])
-    );
-    const season = (serverId: number, seasonNumber: number) =>
-      byId
-        .get(serverId)
-        ?.seasons.find((candidate) => candidate.seasonNumber === seasonNumber);
+      const response = await (await login()).get('/tv/52001/request-targets');
+      assert.strictEqual(response.status, 200);
+      const byId = new Map<number, TvRequestTarget>(
+        (response.body as TvRequestTarget[]).map((target) => [
+          target.serverId,
+          target,
+        ])
+      );
+      const season = (serverId: number, seasonNumber: number) =>
+        byId
+          .get(serverId)
+          ?.seasons.find(
+            (candidate) => candidate.seasonNumber === seasonNumber
+          );
 
-    assert.strictEqual(season(33, 1)?.requestable, true);
-    assert.strictEqual(season(34, 1)?.requestable, false);
-    assert.strictEqual(season(33, 2)?.status, MediaStatus.UNKNOWN);
-    assert.strictEqual(season(31, 1)?.status, MediaStatus.AVAILABLE);
-    assert.strictEqual(season(31, 2)?.requestable, false);
-    assert.strictEqual(season(32, 1)?.status, MediaStatus.UNKNOWN);
-    assert.strictEqual(season(32, 2)?.status, MediaStatus.AVAILABLE);
-    assert.strictEqual(
-      byId.get(33)?.requestable,
-      byId.get(33)?.seasons.some((candidate) => candidate.requestable)
-    );
-  });
+      for (const target of byId.values()) {
+        assert.deepStrictEqual(
+          target.seasons.map((season) => season.seasonNumber),
+          provider === MetadataProviderType.TVDB ? [1, 2, 3] : [1, 2]
+        );
+        assert.strictEqual(target.status, MediaStatus.PROCESSING);
+        assert.strictEqual(
+          target.requestable,
+          target.seasons.some((season) => season.requestable)
+        );
+      }
+      assert.strictEqual(season(33, 1)?.requestable, true);
+      assert.strictEqual(season(34, 1)?.requestable, false);
+      assert.strictEqual(season(33, 2)?.status, MediaStatus.UNKNOWN);
+      assert.strictEqual(season(31, 1)?.status, MediaStatus.AVAILABLE);
+      assert.strictEqual(season(31, 2)?.requestable, false);
+      assert.strictEqual(season(32, 1)?.status, MediaStatus.UNKNOWN);
+      assert.strictEqual(season(32, 2)?.status, MediaStatus.AVAILABLE);
+      if (provider === MetadataProviderType.TVDB) {
+        assert.deepStrictEqual(season(33, 3), {
+          seasonNumber: 3,
+          status: MediaStatus.UNKNOWN,
+          requestable: true,
+        });
+        assert.strictEqual(season(34, 3)?.requestable, false);
+        assert.strictEqual(season(32, 3)?.requestable, false);
+        assert.strictEqual(season(31, 3)?.requestable, true);
+        assert.strictEqual(season(33, 2)?.requestable, true);
+      }
+    });
+  }
+
+  for (const anime of [false, true]) {
+    for (const provider of [
+      MetadataProviderType.TMDB,
+      MetadataProviderType.TVDB,
+    ]) {
+      for (const specials of [false, true]) {
+        it(`uses ${provider} for ${anime ? 'anime' : 'regular TV'} with specials ${specials ? 'enabled' : 'disabled'}`, async (t) => {
+          const otherProvider =
+            provider === MetadataProviderType.TVDB
+              ? MetadataProviderType.TMDB
+              : MetadataProviderType.TVDB;
+          getSettings().metadataSettings = {
+            tv: anime ? otherProvider : provider,
+            anime: anime ? provider : otherProvider,
+          };
+          getSettings().main.enableSpecialEpisodes = specials;
+          if (anime) {
+            tmdbShow.keywords.results = [
+              { id: ANIME_KEYWORD_ID, name: 'anime' },
+            ];
+          }
+          const lookup = mockTvdb(t);
+          getSettings().sonarr = [
+            sonarr(41),
+            sonarr(42, { independentRequestDestination: true }),
+          ];
+
+          const response = await (
+            await login()
+          ).get('/tv/52003/request-targets');
+
+          assert.strictEqual(response.status, 200);
+          assert.strictEqual(
+            lookup.mock.callCount(),
+            provider === MetadataProviderType.TVDB ? 1 : 0
+          );
+          const expectedSeasons = [
+            ...(specials ? [0] : []),
+            1,
+            2,
+            ...(provider === MetadataProviderType.TVDB ? [3] : []),
+          ];
+          for (const target of response.body as TvRequestTarget[]) {
+            assert.deepStrictEqual(
+              target.seasons,
+              expectedSeasons.map((seasonNumber) => ({
+                seasonNumber,
+                status: MediaStatus.UNKNOWN,
+                requestable: true,
+              }))
+            );
+            assert.strictEqual(target.status, MediaStatus.UNKNOWN);
+            assert.strictEqual(target.requestable, true);
+          }
+          assert.strictEqual(await getRepository(Media).count(), 0);
+          assert.strictEqual(await getRepository(Season).count(), 0);
+          assert.strictEqual(await getRepository(MediaRequest).count(), 0);
+          assert.strictEqual(await getRepository(SeasonRequest).count(), 0);
+          assert.strictEqual(
+            await getRepository(MediaDestinationStatus).count(),
+            0
+          );
+          assert.strictEqual(
+            await getRepository(MediaDestinationSeasonStatus).count(),
+            0
+          );
+        });
+      }
+    }
+  }
+
+  for (const failure of ['initialization', 'metadata'] as const) {
+    it(`falls back to TMDB when TheTVDB ${failure} fails`, async (t) => {
+      getSettings().metadataSettings.tv = MetadataProviderType.TVDB;
+      getSettings().sonarr = [sonarr(43)];
+      if (failure === 'initialization') {
+        t.mock.method(Tvdb, 'getInstance', async () => {
+          throw new Error('TheTVDB initialization failed');
+        });
+      } else {
+        mockTvdb(t, true);
+      }
+
+      const response = await (await login()).get('/tv/52004/request-targets');
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(
+        response.body[0].seasons,
+        [1, 2].map((seasonNumber) => ({
+          seasonNumber,
+          status: MediaStatus.UNKNOWN,
+          requestable: true,
+        }))
+      );
+    });
+  }
 
   it('does not create destination rows while reading missing TV state', async () => {
     getSettings().sonarr = [
