@@ -139,6 +139,139 @@ describe('Manage Movie visibility', () => {
     cy.get('[data-testid=manage-movie-button]').should('not.exist');
   });
 
+  const labelDownload = {
+    mediaType: 'movie',
+    externalId: 100,
+    downloadId: 'native-release',
+    title: 'Native original release',
+    size: 100,
+    sizeLeft: 40,
+    status: 'downloading',
+    timeLeft: '00:10:00',
+    estimatedCompletionTime: '2030-01-01T00:00:00Z',
+  };
+  for (const [status, active, expected] of [
+    [5, true, 'Processing'],
+    [5, false, 'Available'],
+    [4, true, 'Processing'],
+    [4, false, 'Partially Available'],
+    [3, true, 'Processing'],
+    [3, false, 'Requested'],
+    [7, true, 'Processing'],
+    [7, false, 'Deleted'],
+  ] as const) {
+    it(`preserves native destination status labels for status ${status} with active downloads=${active}`, () => {
+      cy.viewport(1440, 1000);
+      const data = title();
+      cy.intercept('GET', '/api/v1/media/100/downloads', {
+        groups: [
+          {
+            serverId: 1,
+            name: 'Configured native',
+            isIndependent: false,
+            is4k: false,
+            status,
+            downloads: active ? [labelDownload] : [],
+          },
+        ],
+      }).as('statusSnapshot');
+      const fixture = {
+        ...data,
+        mediaInfo: {
+          ...data.mediaInfo,
+          serviceId: 1,
+          mediaUrl: 'https://native.example/movie/100',
+        },
+      };
+      visit(fixture, 2);
+      cy.wait('@statusSnapshot');
+      cy.contains('.media-status a', 'Configured native')
+        .should('be.visible')
+        .and('have.attr', 'href', 'https://native.example/movie/100')
+        .find('span.shrink-0')
+        .first()
+        .should('have.text', expected);
+      if (active) {
+        cy.contains('.media-status a', 'Configured native').should(
+          'contain.text',
+          '· 1'
+        );
+      }
+    });
+  }
+
+  it('keeps independent destination status labels separate from native download overrides', () => {
+    cy.viewport(1440, 1000);
+    const data = title();
+    const native = {
+      serverId: 1,
+      name: 'Configured native',
+      isIndependent: false,
+      is4k: false,
+      status: 5,
+      downloads: [labelDownload],
+    };
+    const independent = { ...native, isIndependent: true };
+    cy.intercept('GET', '/api/v1/media/100/downloads', {
+      groups: [
+        native,
+        { ...independent, serverId: 2, name: 'Available destination' },
+        { ...independent, serverId: 3, name: 'Partial destination', status: 4 },
+        {
+          ...independent,
+          serverId: 4,
+          name: 'Requested destination',
+          status: 3,
+          downloads: [],
+        },
+        { ...independent, serverId: 5, name: 'Unknown destination', status: 1 },
+        { ...independent, serverId: 6, name: 'Deleted destination', status: 7 },
+        {
+          ...independent,
+          serverId: 7,
+          name: 'Unknown hidden',
+          status: 1,
+          downloads: [],
+        },
+        {
+          ...independent,
+          serverId: 8,
+          name: 'Deleted hidden',
+          status: 7,
+          downloads: [],
+        },
+      ],
+    }).as('statusSnapshot');
+    const fixture = {
+      ...data,
+      mediaInfo: { ...data.mediaInfo, serviceId: 1 },
+    };
+    visit(fixture);
+    cy.wait('@statusSnapshot');
+    for (const [name, expected] of [
+      ['Configured native', 'Processing'],
+      ['Available destination', 'Available'],
+      ['Partial destination', 'Partially Available'],
+      ['Requested destination', 'Processing'],
+      ['Unknown destination', 'Downloads'],
+      ['Deleted destination', 'Deleted'],
+    ]) {
+      cy.contains('.media-status a', name)
+        .should('be.visible')
+        .find('span.shrink-0')
+        .first()
+        .should('have.text', expected);
+    }
+    cy.get('.media-status')
+      .should('not.contain.text', 'Unknown hidden')
+      .and('not.contain.text', 'Deleted hidden');
+    cy.contains('.media-status a', 'Available destination').should(
+      'have.attr',
+      'href',
+      `/movie/${id}?manage=1`
+    );
+  });
+
   for (const permissions of [2, 48]) {
     it(`preserves native polling alongside the shared snapshot with permissions ${permissions}`, () => {
       const nextId = id + 1;

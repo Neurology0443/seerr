@@ -381,7 +381,7 @@ describe('Management downloads', () => {
       cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}`);
       cy.wait(['@managementTitle', '@snapshot']);
       const standard = () =>
-        cy.contains('.media-status a', /^Available\s*·\s*Shared native/);
+        cy.contains('.media-status a', /^Processing\s*·\s*Shared native/);
       const ultraHd = () =>
         cy.contains('.media-status a', /^4K Processing\s*·\s*Shared native/);
       standard().should('be.visible').trigger('mouseenter');

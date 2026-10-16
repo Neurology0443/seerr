@@ -96,6 +96,110 @@ describe('Destination-aware TV snapshots', () => {
       cy.intercept('GET', `/api/v1/tv/${id}/request-targets`, []);
   });
 
+  it('preserves native TV destination status labels, 4K summaries and independent season-pack tooltips', () => {
+    cy.viewport(1440, 1000);
+    cy.intercept('GET', '/api/v1/settings/public', (req) => {
+      delete req.headers['if-none-match'];
+      delete req.headers['if-modified-since'];
+      req.continue((res) => Object.assign(res.body, { series4kEnabled: true }));
+    });
+    const data = fixture(66732, 100, 'Label series');
+    cy.intercept('GET', '/api/v1/tv/66732', {
+      ...data,
+      mediaInfo: { ...data.mediaInfo, serviceId4k: 2 },
+    }).as('labelTitle');
+    const pack = (season: number) =>
+      Array.from({ length: 23 }, (_, index) => ({
+        mediaType: 'tv',
+        externalId: 100,
+        downloadId: `pack-${season}`,
+        title: `Season ${season} original release`,
+        size: 100,
+        sizeLeft: 40,
+        status: 'paused',
+        timeLeft: '00:10:00',
+        estimatedCompletionTime: '2030-01-01T00:00:00Z',
+        episode: {
+          id: index + 1,
+          seasonNumber: season,
+          episodeNumber: index + 1,
+          absoluteEpisodeNumber: index + 1,
+        },
+      }));
+    const native = {
+      serverId: 1,
+      name: 'Native series',
+      is4k: false,
+      isIndependent: false,
+      status: 3,
+      downloads: [],
+    };
+    cy.intercept('GET', '/api/v1/media/100/downloads', {
+      groups: [
+        native,
+        {
+          ...native,
+          serverId: 2,
+          name: 'Native ultra HD',
+          is4k: true,
+          status: 4,
+          downloads: pack(2),
+        },
+        {
+          ...native,
+          serverId: 3,
+          name: 'Independent series',
+          isIndependent: true,
+          status: 5,
+          downloads: [1, 2, 3].flatMap(pack),
+        },
+      ],
+    }).as('statusSnapshot');
+    cy.intercept('GET', '/api/v1/media/100/watch_data', {});
+    cy.visit('/tv/66732');
+    cy.wait(['@labelTitle', '@statusSnapshot']);
+    cy.contains('.media-status a', 'Native series')
+      .should('contain.text', 'Requested')
+      .and('have.attr', 'href', '/tv/66733')
+      .trigger('mouseenter');
+    cy.get('[data-popper-placement]').should('contain.text', 'Play on Plex');
+    cy.contains('.media-status a', 'Native series').trigger('mouseleave');
+    cy.contains('.media-status a', 'Native ultra HD')
+      .should('contain.text', '4K Processing')
+      .and('contain.text', '· S2')
+      .and('not.contain.text', 'S2E1')
+      .trigger('mouseenter');
+    cy.get('[data-popper-placement] li').should('have.length', 1);
+    cy.get('[data-popper-placement]')
+      .should('contain.text', 'Native ultra HD (4K)')
+      .and('contain.text', 'Season 2 original release')
+      .and('contain.text', '60%')
+      .and('contain.text', 'paused');
+    cy.contains('.media-status a', 'Native ultra HD').trigger('mouseleave');
+    cy.contains('.media-status a', 'Independent series')
+      .should('contain.text', 'Available')
+      .and('contain.text', '· 3');
+    cy.contains('.media-status a', 'Independent series')
+      .find('div.absolute')
+      .should('not.exist');
+    cy.contains('.media-status a', 'Independent series').trigger('mouseenter');
+    cy.get('[data-popper-placement] li').should('have.length', 3);
+    for (const season of [1, 2, 3]) {
+      cy.get('[data-popper-placement]').should(
+        'contain.text',
+        `Season ${season} original release`
+      );
+    }
+    cy.contains('.media-status a', 'Independent series')
+      .trigger('mouseleave')
+      .click();
+    cy.get('.slideover').should('be.visible');
+    cy.contains('[data-testid="manage-download-group"]', 'Independent series')
+      .find('li')
+      .should('have.length', 3);
+    cy.get('@statusSnapshot.all').should('have.length', 1);
+  });
+
   for (const permissions of [2, 48]) {
     it(`preserves native polling alongside the shared snapshot with permissions ${permissions}`, () => {
       cy.intercept('GET', '/api/v1/auth/me', {

@@ -194,7 +194,7 @@ const StatusBadge = ({
     )
       return null;
     if (isIndependent && status === MediaStatus.PENDING) return null;
-    const statusMessage =
+    let statusMessage =
       status === MediaStatus.AVAILABLE
         ? globalMessages.available
         : status === MediaStatus.PARTIALLY_AVAILABLE
@@ -208,6 +208,19 @@ const StatusBadge = ({
                 : status === MediaStatus.BLOCKLISTED
                   ? globalMessages.blocklisted
                   : messages.downloads;
+    if (
+      !isIndependent &&
+      (status === MediaStatus.AVAILABLE ||
+        status === MediaStatus.PARTIALLY_AVAILABLE ||
+        status === MediaStatus.PROCESSING ||
+        status === MediaStatus.DELETED)
+    ) {
+      statusMessage = inProgress
+        ? globalMessages.processing
+        : status === MediaStatus.PROCESSING
+          ? globalMessages.requested
+          : statusMessage;
+    }
     const label = intl.formatMessage(statusMessage);
     return (
       <Tooltip
