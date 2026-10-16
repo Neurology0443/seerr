@@ -5,6 +5,9 @@ import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSea
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
+import downloadTracker, {
+  type DownloadingItem,
+} from '@server/lib/downloadtracker';
 import { getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
 import {
@@ -34,6 +37,7 @@ const app = express();
 before(() => {
   app.use(express.json());
   app.use(async (req, _res, next) => {
+    if (req.header('X-User') === 'anonymous') return next();
     req.user = await getRepository(User).findOneByOrFail({
       id: req.header('X-User') === '2' ? 2 : 1,
     });
@@ -63,6 +67,387 @@ before(() => {
   );
 });
 afterEach(() => mock.restoreAll());
+
+for (const type of [MediaType.MOVIE, MediaType.TV]) {
+  describe(`cached ${type} management downloads`, () => {
+    const setupDownloads = async () => {
+      const seeded = await seedRemoval(type);
+      const settings = getSettings();
+      const servers = [
+        removalServer(99, false),
+        removalServer(98, false, true),
+        removalServer(1),
+        removalServer(2),
+        removalServer(3, true, true),
+      ];
+      if (type === MediaType.TV) settings.sonarr = servers;
+      else settings.radarr = servers;
+      await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: seeded.media.id,
+          serverId: 3,
+          externalServiceId: 13,
+        })
+      );
+      const item = (externalId: number): DownloadingItem => ({
+        mediaType: type,
+        externalId,
+        size: 100,
+        sizeLeft: 40,
+        status: 'paused',
+        timeLeft: '00:10:00',
+        estimatedCompletionTime: new Date('2030-01-01T00:00:00Z'),
+        title: `Original release ${externalId}`,
+        downloadId: 'same-hash',
+      });
+      const queues = new Map([
+        [99, [item(100)]],
+        [98, [item(101)]],
+        [1, [item(11)]],
+        [2, [item(12), item(12)]],
+        [3, [item(13)]],
+      ]);
+      const progress = mock.method(
+        downloadTracker,
+        type === MediaType.TV ? 'getSeriesProgress' : 'getMovieProgress',
+        (serverId: number, externalId: number) =>
+          (queues.get(serverId) ?? []).filter(
+            (item) => item.externalId === externalId
+          )
+      );
+      const external = mock.method(axios, 'create', () => {
+        throw new Error('Management must not create external clients');
+      });
+      const update = mock.method(downloadTracker, 'updateDownloads', () => {
+        throw new Error('Management must not refresh queues');
+      });
+      return { ...seeded, servers, queues, progress, external, update };
+    };
+
+    it('returns exact native and independent destinations without external calls or writes', async () => {
+      const { media, external, update, progress } = await setupDownloads();
+      const before = await removalSnapshot();
+      const response = await request(app)
+        .get(`/api/v1/media/${media.id}/downloads`)
+        .set('X-API-Key', 'test');
+      assert.equal(response.status, 200);
+      assert.deepEqual(
+        response.body.groups.map(
+          (group: {
+            serverId: number;
+            is4k: boolean;
+            isIndependent: boolean;
+            downloads: DownloadingItem[];
+          }) => [
+            group.serverId,
+            group.is4k,
+            group.isIndependent,
+            group.downloads.map((item) => [item.externalId, item.downloadId]),
+          ]
+        ),
+        [
+          [99, false, false, [[100, 'same-hash']]],
+          [98, true, false, [[101, 'same-hash']]],
+          [1, false, true, [[11, 'same-hash']]],
+          [
+            2,
+            false,
+            true,
+            [
+              [12, 'same-hash'],
+              [12, 'same-hash'],
+            ],
+          ],
+          [3, true, true, [[13, 'same-hash']]],
+        ]
+      );
+      assert.ok(
+        progress.mock.calls.some(
+          (call) => call.arguments[0] === 2 && call.arguments[1] === 12
+        )
+      );
+      assert.deepEqual(
+        response.body.groups.map((group: { status: number }) => group.status),
+        [
+          MediaStatus.AVAILABLE,
+          MediaStatus.PARTIALLY_AVAILABLE,
+          MediaStatus.AVAILABLE,
+          MediaStatus.AVAILABLE,
+          MediaStatus.UNKNOWN,
+        ]
+      );
+      assert.equal(external.mock.callCount(), 0);
+      assert.equal(update.mock.callCount(), 0);
+      assert.deepEqual(await removalSnapshot(), before);
+    });
+
+    it('uses current names and keeps independent-only queues without requests or episode fields', async () => {
+      const { media, queues, servers } = await setupDownloads();
+      queues.delete(99);
+      queues.delete(98);
+      servers[3].name = 'Renamed destination';
+      await getRepository(MediaRequest).delete({ media: { id: media.id } });
+      const response = await request(app).get(`/media/${media.id}/downloads`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(
+        response.body.groups.map(
+          (group: { serverId: number }) => group.serverId
+        ),
+        [99, 98, 1, 2, 3]
+      );
+      assert.equal(response.body.groups[3].name, 'Renamed destination');
+      assert.equal(response.body.groups[3].downloads.length, 2);
+      assert.equal(response.body.groups[3].downloads[0].episode, undefined);
+      assert.ok(
+        response.body.groups
+          .slice(0, 2)
+          .every(
+            (group: { downloads: DownloadingItem[] }) =>
+              group.downloads.length === 0
+          )
+      );
+    });
+
+    for (const sameExternalId of [false, true]) {
+      it(`keeps native Standard/4K slots separate with one server and ${sameExternalId ? 'identical' : 'different'} external IDs`, async () => {
+        const { media, queues, servers, external, update } =
+          await setupDownloads();
+        servers.push(removalServer(7, false, !sameExternalId));
+        const standard = { ...queues.get(99)![0], externalId: 100 };
+        const ultraHd = { ...standard, externalId: 200, downloadId: '4k-hash' };
+        queues.set(7, [standard, ultraHd]);
+        await getRepository(Media).update(media.id, {
+          serviceId: 7,
+          serviceId4k: 7,
+          externalServiceId: 100,
+          externalServiceId4k: sameExternalId ? 100 : 200,
+          status: MediaStatus.AVAILABLE,
+          status4k: MediaStatus.PROCESSING,
+        });
+        const before = await removalSnapshot();
+        const response = await request(app).get(`/media/${media.id}/downloads`);
+        assert.equal(response.status, 200);
+        const native = response.body.groups.filter(
+          (group: { isIndependent: boolean }) => !group.isIndependent
+        );
+        assert.equal(native.length, 2);
+        assert.deepEqual(native, [
+          {
+            serverId: 7,
+            name: servers.at(-1)!.name,
+            is4k: false,
+            isIndependent: false,
+            status: MediaStatus.AVAILABLE,
+            downloads: JSON.parse(JSON.stringify([standard])),
+          },
+          {
+            serverId: 7,
+            name: servers.at(-1)!.name,
+            is4k: true,
+            isIndependent: false,
+            status: MediaStatus.PROCESSING,
+            downloads: JSON.parse(
+              JSON.stringify([sameExternalId ? standard : ultraHd])
+            ),
+          },
+        ]);
+        assert.deepEqual(await removalSnapshot(), before);
+        assert.equal(external.mock.callCount(), 0);
+        assert.equal(update.mock.callCount(), 0);
+      });
+    }
+
+    it('does not depend on request completion', async () => {
+      const { media } = await setupDownloads();
+      const before = (await request(app).get(`/media/${media.id}/downloads`))
+        .body;
+      await getRepository(MediaRequest)
+        .createQueryBuilder()
+        .update()
+        .set({ status: 5 })
+        .where('mediaId = :mediaId', { mediaId: media.id })
+        .callListeners(false)
+        .execute();
+      assert.deepEqual(
+        (await request(app).get(`/media/${media.id}/downloads`)).body,
+        before
+      );
+    });
+
+    it('retains persisted native and independent statuses when all cached queues are empty', async () => {
+      const { media, queues } = await setupDownloads();
+      queues.clear();
+      const response = await request(app).get(`/media/${media.id}/downloads`);
+      assert.equal(response.status, 200);
+      assert.equal(response.body.groups.length, 5);
+      assert.ok(
+        response.body.groups.every(
+          (group: { downloads: DownloadingItem[] }) =>
+            group.downloads.length === 0
+        )
+      );
+      assert.deepEqual(
+        response.body.groups.map((group: { status: number }) => group.status),
+        [5, 4, 5, 5, 1]
+      );
+    });
+
+    for (const invalid of [
+      'missing',
+      'null',
+      'zero',
+      'negative',
+      'removed',
+      'wrong-type',
+      'native',
+    ]) {
+      it(`handles ${invalid} independent linkage without fallback`, async () => {
+        const { media, servers, progress } = await setupDownloads();
+        if (invalid === 'missing')
+          await getRepository(MediaDestinationStatus).delete({
+            mediaId: media.id,
+            serverId: 2,
+          });
+        else if (['null', 'zero', 'negative'].includes(invalid))
+          await getRepository(MediaDestinationStatus).update(
+            { mediaId: media.id, serverId: 2 },
+            {
+              externalServiceId:
+                invalid === 'null' ? null : invalid === 'zero' ? 0 : -1,
+            }
+          );
+        else if (invalid === 'native')
+          servers[3].independentRequestDestination = false;
+        else {
+          servers.splice(3, 1);
+          if (invalid === 'wrong-type') {
+            if (type === MediaType.TV)
+              getSettings().radarr = [removalServer(2)];
+            else getSettings().sonarr = [removalServer(2)];
+          }
+        }
+        const response = await request(app).get(`/media/${media.id}/downloads`);
+        assert.equal(response.status, 200);
+        assert.deepEqual(
+          response.body.groups.map(
+            (group: { serverId: number }) => group.serverId
+          ),
+          ['null', 'zero', 'negative'].includes(invalid)
+            ? [99, 98, 1, 2, 3]
+            : [99, 98, 1, 3]
+        );
+        if (['null', 'zero', 'negative'].includes(invalid)) {
+          const destination = response.body.groups.find(
+            (group: { serverId: number }) => group.serverId === 2
+          );
+          assert.equal(destination.status, MediaStatus.AVAILABLE);
+          assert.deepEqual(destination.downloads, []);
+          assert.ok(
+            progress.mock.calls.every((call) => call.arguments[0] !== 2)
+          );
+        }
+      });
+    }
+
+    for (const invalid of ['server', 'removed', 'independent']) {
+      it(`does not infer a native destination when its ${invalid} linkage is invalid`, async () => {
+        const { media, servers } = await setupDownloads();
+        if (invalid === 'server')
+          await getRepository(Media).update(media.id, { serviceId: null });
+        if (invalid === 'removed') servers.splice(0, 1);
+        if (invalid === 'independent')
+          servers[0].independentRequestDestination = true;
+        const response = await request(app).get(`/media/${media.id}/downloads`);
+        assert.equal(response.status, 200);
+        assert.ok(
+          response.body.groups.every(
+            (group: { serverId: number }) => group.serverId !== 99
+          )
+        );
+      });
+    }
+
+    it('retains native statuses with missing or invalid external IDs', async () => {
+      const { media } = await setupDownloads();
+      await getRepository(Media).update(media.id, {
+        externalServiceId: null,
+        externalServiceId4k: -1,
+      });
+      const response = await request(app).get(`/media/${media.id}/downloads`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(
+        response.body.groups
+          .slice(0, 2)
+          .map(
+            (group: {
+              serverId: number;
+              status: number;
+              downloads: DownloadingItem[];
+            }) => [group.serverId, group.status, group.downloads]
+          ),
+        [
+          [99, 5, []],
+          [98, 4, []],
+        ]
+      );
+    });
+
+    for (const status of [
+      MediaStatus.UNKNOWN,
+      MediaStatus.PROCESSING,
+      MediaStatus.PARTIALLY_AVAILABLE,
+      MediaStatus.AVAILABLE,
+      MediaStatus.DELETED,
+    ]) {
+      for (const active of [false, true]) {
+        it(`serializes independent status ${status} independently of active=${active} queues and native statuses`, async () => {
+          const { media, queues, external, update } = await setupDownloads();
+          await getRepository(MediaDestinationStatus).update(
+            { mediaId: media.id, serverId: 2 },
+            { status }
+          );
+          if (!active) queues.delete(2);
+          const before = await removalSnapshot();
+          const response = await request(app).get(
+            `/media/${media.id}/downloads`
+          );
+          assert.equal(response.status, 200);
+          const group = response.body.groups.find(
+            (group: { serverId: number }) => group.serverId === 2
+          );
+          assert.equal(group.status, status);
+          assert.equal(group.downloads.length, active ? 2 : 0);
+          assert.deepEqual(await removalSnapshot(), before);
+          assert.equal(external.mock.callCount(), 0);
+          assert.equal(update.mock.callCount(), 0);
+        });
+      }
+    }
+
+    it('requires MANAGE_REQUESTS and an existing internal media ID', async () => {
+      const { media, external } = await setupDownloads();
+      for (const user of ['2', 'anonymous'])
+        assert.equal(
+          (
+            await request(app)
+              .get(`/media/${media.id}/downloads`)
+              .set('X-User', user)
+          ).status,
+          403
+        );
+      assert.equal(
+        (await request(app).get('/media/999999/downloads')).status,
+        404
+      );
+      for (const id of ['x', '0', '-1', '1.5', '9007199254740993'])
+        assert.equal(
+          (await request(app).get(`/media/${id}/downloads`)).status,
+          400
+        );
+      assert.equal(external.mock.callCount(), 0);
+    });
+  });
+}
 
 const arrMock = (
   type: MediaType,

@@ -1,10 +1,677 @@
 // Runs against the existing Cypress app/database, like movie-details.cy.ts.
 // Arr, requestability and most mutations are stubbed for these UI regressions.
 // The persistence case also verifies a real pending native request in this DB.
+import type { MediaDownloadsResponse } from '@server/interfaces/api/mediaInterfaces';
 import type {
   MovieRequestTarget,
   TvRequestTarget,
 } from '@server/interfaces/api/requestInterfaces';
+
+describe('Management downloads', () => {
+  beforeEach(() => {
+    cy.session(
+      'management-downloads-admin',
+      () => {
+        cy.request('POST', '/api/v1/auth/local', {
+          email: Cypress.env('ADMIN_EMAIL'),
+          password: Cypress.env('ADMIN_PASSWORD'),
+        })
+          .its('status')
+          .should('eq', 200);
+      },
+      {
+        validate() {
+          cy.request('/api/v1/auth/me').its('status').should('eq', 200);
+        },
+      }
+    );
+    cy.intercept('GET', '/api/v1/auth/me', admin);
+    cy.intercept('GET', '/api/v1/media/100/watch_data', {});
+    cy.intercept('GET', '/api/v1/settings/radarr', servers);
+    cy.intercept('GET', '/api/v1/settings/sonarr', servers);
+    cy.intercept('GET', '/api/v1/settings/public', (req) => {
+      req.continue((res) =>
+        Object.assign(res.body, { movie4kEnabled: true, series4kEnabled: true })
+      );
+    });
+  });
+
+  const downloads = (type: 'movie' | 'tv', season = 1, count = 1) =>
+    Array.from({ length: count }, (_, index) => ({
+      mediaType: type,
+      externalId: 12,
+      downloadId: `pack-${season}`,
+      title: `The Mentalist (2008) S0${season} Original release`,
+      size: 1000,
+      sizeLeft: 400,
+      status: 'paused',
+      timeLeft: '00:10:00',
+      estimatedCompletionTime: new Date('2030-01-01T00:00:00Z'),
+      ...(type === 'tv'
+        ? {
+            episode: {
+              id: index + 1,
+              seasonNumber: season,
+              episodeNumber: index + 1,
+              absoluteEpisodeNumber: index + 1,
+            },
+          }
+        : {}),
+    }));
+  const groups = (type: 'movie' | 'tv'): MediaDownloadsResponse['groups'] => [
+    {
+      serverId: 1,
+      name: 'Native service',
+      status: 3,
+      is4k: false,
+      isIndependent: false,
+      downloads: downloads(type),
+    },
+    {
+      serverId: 2,
+      name: 'Independent A',
+      status: 3,
+      is4k: false,
+      isIndependent: true,
+      downloads: [...downloads(type, 1, 23), ...downloads(type, 2, 23)],
+    },
+    {
+      serverId: 3,
+      name: 'Independent B',
+      status: 3,
+      is4k: false,
+      isIndependent: true,
+      downloads: downloads(type),
+    },
+    {
+      serverId: 4,
+      name: 'Ultra HD',
+      status: 3,
+      is4k: true,
+      isIndependent: true,
+      downloads: downloads(type),
+    },
+    {
+      serverId: 5,
+      name: 'Native Ultra HD',
+      status: 3,
+      is4k: true,
+      isIndependent: false,
+      downloads: downloads(type),
+    },
+    {
+      serverId: 6,
+      name: 'Empty service',
+      status: 3,
+      is4k: false,
+      isIndependent: true,
+      downloads: [],
+    },
+  ];
+  const prepare = (type: 'movie' | 'tv', nativeFallback = false) => {
+    const title = visitMedia(
+      type,
+      [],
+      false,
+      true,
+      undefined,
+      [1, 2],
+      false,
+      true
+    );
+    cy.intercept(
+      'GET',
+      `/api/v1/${type}/${type === 'movie' ? movieId : tvId}`,
+      {
+        ...title,
+        mediaInfo: {
+          ...title.mediaInfo,
+          status: 3,
+          serviceId: 1,
+          serviceId4k: 5,
+          downloadStatus: nativeFallback ? downloads(type) : [],
+        },
+      }
+    ).as('managementTitle');
+  };
+  const open = (type: 'movie' | 'tv') => {
+    cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}?manage=1`);
+    cy.wait('@managementTitle');
+    cy.get('.slideover').should('be.visible');
+  };
+  const badge = (name: string) =>
+    cy.contains('.media-status > a, .media-status > span', name);
+
+  it('preserves native DELETED visibility and UNKNOWN hiding with a destination name', () => {
+    prepare('movie');
+    cy.intercept('GET', '/api/v1/media/100/downloads', {
+      groups: [
+        { ...groups('movie')[0], status: 7, downloads: [] },
+        { ...groups('movie')[4], name: 'Native unknown', status: 1 },
+      ],
+    }).as('snapshot');
+    cy.visit(`/movie/${movieId}`);
+    cy.wait(['@managementTitle', '@snapshot']);
+    badge('Native service')
+      .should('be.visible')
+      .and('contain.text', 'Deleted')
+      .and('have.attr', 'href', `/movie/${movieId}?manage=1`)
+      .trigger('mouseenter');
+    cy.get('[data-popper-placement]').should('contain.text', 'Manage Movie');
+    cy.get('.media-status').should('not.contain.text', 'Native unknown');
+    badge('Native service').trigger('mouseleave').click();
+    cy.get('.slideover').should('be.visible');
+  });
+
+  for (const type of ['movie', 'tv'] as const) {
+    for (const permissions of [2, 16]) {
+      it(`shows isolated ${type} destination badges and compact tooltips with permissions ${permissions}`, () => {
+        cy.viewport(1440, 1000);
+        cy.intercept('GET', '/api/v1/auth/me', { ...admin, permissions });
+        prepare(type);
+        const snapshot = groups(type);
+        snapshot[0] = { ...snapshot[0], status: 5, downloads: [] };
+        snapshot[4] = { ...snapshot[4], status: 4, downloads: [] };
+        snapshot[1].downloads = [1, 2, 3].flatMap((season) =>
+          downloads(type, season, 23).map((item) => ({
+            ...item,
+            title: `A season ${season}`,
+          }))
+        );
+        snapshot[2].downloads = downloads(type, 2, 23).map((item) => ({
+          ...item,
+          downloadId: 'pack-1',
+          title: 'B only',
+        }));
+        snapshot[5] = {
+          ...snapshot[5],
+          name: 'Unknown destination',
+          status: 1,
+          downloads: downloads(type).map((item) => ({
+            ...item,
+            episode: undefined,
+            title: 'Unknown release',
+          })),
+        };
+        snapshot.push(
+          {
+            serverId: 7,
+            name: 'Deleted destination',
+            is4k: false,
+            isIndependent: true,
+            status: 7,
+            downloads: downloads(type),
+          },
+          {
+            serverId: 8,
+            name: 'Processing empty',
+            is4k: false,
+            isIndependent: true,
+            status: 3,
+            downloads: [],
+          },
+          {
+            serverId: 9,
+            name: 'Available empty',
+            is4k: false,
+            isIndependent: true,
+            status: 5,
+            downloads: [],
+          },
+          {
+            serverId: 10,
+            name: 'Partial empty',
+            is4k: false,
+            isIndependent: true,
+            status: 4,
+            downloads: [],
+          },
+          {
+            serverId: 11,
+            name: 'Pending hidden',
+            is4k: false,
+            isIndependent: true,
+            status: 2,
+            downloads: downloads(type),
+          },
+          {
+            serverId: 12,
+            name: 'Unknown hidden',
+            is4k: false,
+            isIndependent: true,
+            status: 1,
+            downloads: [],
+          },
+          {
+            serverId: 13,
+            name: 'Deleted hidden',
+            is4k: false,
+            isIndependent: true,
+            status: 7,
+            downloads: [],
+          },
+          {
+            serverId: 14,
+            name: 'Other Ultra HD',
+            is4k: true,
+            isIndependent: true,
+            status: 5,
+            downloads: [],
+          }
+        );
+        cy.intercept('GET', '/api/v1/media/100/downloads', {
+          groups: snapshot,
+        }).as('snapshot');
+        cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}`);
+        cy.wait(['@managementTitle', '@snapshot']);
+        badge('Native service')
+          .should('contain.text', 'Available')
+          .trigger('mouseenter');
+        cy.get('[data-popper-placement]').should(
+          'contain.text',
+          type === 'movie' ? 'Manage Movie' : 'Manage Series'
+        );
+        badge('Native service').trigger('mouseleave');
+        badge('Native Ultra HD').should(
+          'contain.text',
+          '4K Partially Available'
+        );
+        badge('Independent A')
+          .should('contain.text', 'Processing')
+          .and('contain.text', '· 3')
+          .and('not.contain.text', 'S1E1')
+          .and('not.contain.text', 'S3E1');
+        badge('Independent A').find('div.absolute').should('not.exist');
+        badge('Independent A').trigger('mouseenter');
+        cy.get('[data-popper-placement]')
+          .should('contain.text', 'Independent A (Standard)')
+          .and('not.contain.text', 'B only');
+        cy.get('[data-popper-placement] li').should('have.length', 3);
+        for (const season of [1, 2, 3])
+          cy.get('[data-popper-placement] .truncate').should(
+            'contain.text',
+            `A season ${season}`
+          );
+        cy.get('[data-popper-placement]')
+          .should('contain.text', '60%')
+          .and('contain.text', 'paused');
+        badge('Independent A').trigger('mouseleave');
+        badge('Independent B')
+          .should('contain.text', type === 'tv' ? '· S2' : '· 1')
+          .and('not.contain.text', 'S2E1');
+        badge('Independent B')
+          .find('div.absolute')
+          .should('have.attr', 'style')
+          .and('contain', '60%');
+        badge('Independent B').trigger('mouseenter');
+        cy.get('[data-popper-placement] li').should('have.length', 1);
+        cy.get('[data-popper-placement] .truncate').should(
+          'have.text',
+          'B only'
+        );
+        badge('Independent B').trigger('mouseleave');
+        badge('Unknown destination')
+          .should('contain.text', 'Downloads')
+          .and('not.contain.text', 'Processing');
+        badge('Deleted destination')
+          .should('contain.text', 'Deleted')
+          .and('not.contain.text', 'Processing');
+        badge('Processing empty').should('contain.text', 'Processing');
+        badge('Partial empty').should('contain.text', 'Partially Available');
+        badge('Available empty')
+          .should('contain.text', 'Available')
+          .trigger('mouseenter');
+        cy.get('[data-popper-placement]')
+          .should('contain.text', 'Available empty (Standard)')
+          .and('contain.text', 'No active downloads.');
+        badge('Available empty').trigger('mouseleave');
+        badge('Other Ultra HD').should('contain.text', '4K Available');
+        cy.get('.media-status')
+          .should('not.contain.text', 'Pending hidden')
+          .and('not.contain.text', 'Unknown hidden')
+          .and('not.contain.text', 'Deleted hidden');
+        badge('Independent A')
+          .should(
+            'have.attr',
+            'href',
+            `/${type}/${type === 'movie' ? movieId : tvId}?manage=1`
+          )
+          .click();
+        cy.get('.slideover').should('be.visible');
+        cy.contains('[data-testid="manage-download-group"]', 'Independent A')
+          .find('li')
+          .should('have.length', 3);
+        cy.get('@snapshot.all').should('have.length', 1);
+      });
+    }
+
+    it(`selects distinct native ${type} Standard/4K slots sharing one server`, () => {
+      cy.viewport(1440, 1000);
+      const title = visitMedia(
+        type,
+        [],
+        false,
+        true,
+        undefined,
+        [1, 2],
+        false,
+        true
+      );
+      cy.intercept(
+        'GET',
+        `/api/v1/${type}/${type === 'movie' ? movieId : tvId}`,
+        {
+          ...title,
+          mediaInfo: { ...title.mediaInfo, serviceId: 7, serviceId4k: 7 },
+        }
+      ).as('managementTitle');
+      const native = { ...groups(type)[0], serverId: 7, name: 'Shared native' };
+      cy.intercept('GET', '/api/v1/media/100/downloads', {
+        groups: [
+          // Put 4K first so selection cannot depend on response ordering.
+          {
+            ...native,
+            is4k: true,
+            status: 3,
+            downloads: downloads(type, 2, 23),
+          },
+          { ...native, status: 5, downloads: downloads(type, 1, 23) },
+        ],
+      }).as('snapshot');
+      cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}`);
+      cy.wait(['@managementTitle', '@snapshot']);
+      const standard = () =>
+        cy.contains('.media-status a', /^Processing\s*·\s*Shared native/);
+      const ultraHd = () =>
+        cy.contains('.media-status a', /^4K Processing\s*·\s*Shared native/);
+      standard().should('be.visible').trigger('mouseenter');
+      cy.get('[data-popper-placement] li').should('have.length', 1);
+      cy.get('[data-popper-placement]')
+        .should('contain.text', 'Shared native (Standard)')
+        .and('contain.text', 'S01 Original release')
+        .and('not.contain.text', 'S02 Original release');
+      standard().trigger('mouseleave');
+      ultraHd().should('be.visible').trigger('mouseenter');
+      cy.get('[data-popper-placement] li').should('have.length', 1);
+      cy.get('[data-popper-placement]')
+        .should('contain.text', 'Shared native (4K)')
+        .and('contain.text', 'S02 Original release')
+        .and('not.contain.text', 'S01 Original release');
+      ultraHd().trigger('mouseleave').click();
+      cy.get('.slideover').should('be.visible');
+      cy.get('[data-testid="manage-download-group"]').should('have.length', 2);
+      cy.get('@snapshot.all').should('have.length', 1);
+    });
+
+    it(`wraps ${type} destination badges with long names on a narrow screen`, () => {
+      cy.viewport(390, 844);
+      prepare(type);
+      const name = 'A very long configured destination name '.repeat(5).trim();
+      cy.intercept('GET', '/api/v1/media/100/downloads', {
+        groups: [{ ...groups(type)[1], name }],
+      }).as('snapshot');
+      cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}`);
+      cy.wait('@snapshot');
+      badge(name)
+        .should('be.visible')
+        .and(
+          'have.attr',
+          'href',
+          `/${type}/${type === 'movie' ? movieId : tvId}?manage=1`
+        );
+      cy.get('.media-status').then(($header) =>
+        expect($header[0].scrollWidth).to.be.at.most($header[0].clientWidth + 1)
+      );
+      badge(name).then(($badge) =>
+        expect($badge[0].getBoundingClientRect().right).to.be.at.most(390)
+      );
+    });
+
+    it(`retains the last ${type} snapshot after an API failure`, () => {
+      prepare(type);
+      let fail = false;
+      cy.intercept('GET', '/api/v1/media/100/downloads', (req) =>
+        req.reply(
+          fail
+            ? { statusCode: 500, body: { message: 'Unavailable' } }
+            : { groups: [groups(type)[1]] }
+        )
+      ).as('snapshot');
+      cy.clock(Date.now(), ['Date', 'setTimeout', 'clearTimeout']);
+      cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}`);
+      cy.wait('@snapshot');
+      badge('Independent A')
+        .should('be.visible')
+        .then(() => {
+          fail = true;
+        });
+      cy.tick(15000);
+      cy.wait('@snapshot').its('response.statusCode').should('eq', 500);
+      badge('Independent A').should('be.visible').and('contain.text', '· 2');
+    });
+  }
+
+  for (const type of ['movie', 'tv'] as const) {
+    // ADMIN and MANAGE_REQUESTS, matching the permission fixtures below.
+    for (const permissions of [2, 16]) {
+      it(`groups ${type} downloads by exact destination and deduplicates the 46-record season packs locally for ${permissions === 2 ? 'an admin' : 'a request manager'}`, () => {
+        cy.intercept('GET', '/api/v1/auth/me', { ...admin, permissions });
+        cy.viewport(390, 844);
+        prepare(type);
+        cy.intercept('GET', '/api/v1/media/100/downloads', {
+          groups: groups(type),
+        }).as('managementDownloads');
+        open(type);
+        cy.wait('@managementDownloads');
+        cy.get('[data-testid="manage-download-group"]').should(
+          'have.length',
+          5
+        );
+        cy.contains(
+          '[data-testid="manage-download-group"]',
+          'Independent A (Standard)'
+        ).within(() => {
+          cy.get('li').should('have.length', 2);
+          cy.contains('The Mentalist (2008) S01 Original release').should(
+            'be.visible'
+          );
+          cy.contains('The Mentalist (2008) S02 Original release').should(
+            'be.visible'
+          );
+          cy.contains('60%').should('be.visible');
+          cy.contains('paused').should('be.visible');
+        });
+        for (const name of [
+          'Native service (Standard)',
+          'Independent B (Standard)',
+          'Ultra HD (4K)',
+          'Native Ultra HD (4K)',
+        ]) {
+          cy.contains('[data-testid="manage-download-group"]', name)
+            .find('li')
+            .should('have.length', 1)
+            .find('.truncate')
+            .should('have.text', downloads(type)[0].title);
+        }
+        cy.get('.slideover').should('not.contain.text', ': Season 1 Episode 1');
+        for (const name of [
+          'Native service (Standard)',
+          'Independent A (Standard)',
+        ]) {
+          cy.contains('[data-testid="manage-download-group"]', name)
+            .find('li')
+            .first()
+            .scrollIntoView()
+            .trigger('mouseenter');
+          cy.get('[data-popper-placement]')
+            .should('be.visible')
+            .and('have.text', downloads(type)[0].title);
+          cy.contains('[data-testid="manage-download-group"]', name)
+            .find('li')
+            .first()
+            .trigger('mouseleave');
+        }
+        cy.get('.slideover').should('not.contain.text', 'Empty service');
+      });
+    }
+
+    // MANAGE_REQUESTS and REQUEST_ADVANCED.
+    for (const permissions of [16, 8192]) {
+      it(`preserves upstream ${type} download titles outside Manage with permissions ${permissions}`, () => {
+        cy.intercept('GET', '/api/v1/auth/me', { ...admin, permissions });
+        cy.viewport(1440, 1000);
+        prepare(type, true);
+        cy.intercept('GET', '/api/v1/media/100/downloads', { groups: [] }).as(
+          'managementDownloads'
+        );
+        cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}`);
+        cy.wait('@managementTitle');
+        cy.get('.slideover').should('not.exist');
+        cy.get('.media-status > :first-child').trigger('mouseenter');
+        cy.get('[data-popper-placement] .truncate')
+          .should('be.visible')
+          .and(
+            'have.text',
+            type === 'movie'
+              ? 'Correction Movie'
+              : 'Correction Series: Season 1 Episode 1'
+          );
+        cy.get('[data-popper-placement]').should(
+          'not.contain.text',
+          downloads(type)[0].title
+        );
+        cy.get('@managementDownloads.all').should(
+          'have.length',
+          permissions === 16 ? 1 : 0
+        );
+      });
+    }
+
+    it(`does not let REQUEST_ADVANCED bypass ${type} management release-title authorization`, () => {
+      cy.intercept('GET', '/api/v1/auth/me', {
+        ...admin,
+        permissions: 8192, // REQUEST_ADVANCED
+      });
+      prepare(type, true);
+      cy.intercept('GET', '/api/v1/media/100/downloads', {
+        groups: groups(type),
+      }).as('managementDownloads');
+      // The existing deep link can open the panel shell. Its native fallback
+      // still exercises the opt-in without authorizing the management API.
+      open(type);
+      cy.get('[data-testid="manage-download-group"] .truncate').should(
+        'have.text',
+        type === 'movie'
+          ? 'Correction Movie'
+          : 'Correction Series: Season 1 Episode 1'
+      );
+      cy.get('[data-testid="manage-download-group"]').should(
+        'not.contain.text',
+        downloads(type)[0].title
+      );
+      cy.get('@managementDownloads.all').should('have.length', 0);
+    });
+
+    it(`shares one ${type} snapshot schedule with Manage and keeps refreshing after close`, () => {
+      prepare(type);
+      let current: MediaDownloadsResponse['groups'] = [];
+      let calls = 0;
+      cy.intercept('GET', '/api/v1/media/100/downloads', (req) => {
+        calls++;
+        req.reply({ groups: current });
+      }).as('managementDownloads');
+      cy.clock(Date.now(), ['Date', 'setTimeout', 'clearTimeout']);
+      open(type);
+      cy.wait('@managementDownloads');
+      cy.get('[data-testid="manage-download-group"]')
+        .should('not.exist')
+        .then(() => {
+          current = [groups(type)[1]];
+        });
+      cy.tick(14999);
+      cy.then(() => expect(calls).to.eq(1));
+      cy.tick(1);
+      cy.wait('@managementDownloads');
+      cy.contains(
+        '[data-testid="manage-download-group"]',
+        'Independent A (Standard)'
+      )
+        .find('li')
+        .should('have.length', 2);
+      cy.tick(15000);
+      cy.wait('@managementDownloads');
+      cy.then(() => {
+        current = [
+          {
+            ...groups(type)[1],
+            name: 'Renamed destination',
+            status: 5,
+            downloads: [],
+          },
+        ];
+      });
+      cy.get('button[aria-label="Close panel"]').click();
+      cy.tick(15000);
+      cy.wait('@managementDownloads');
+      badge('Renamed destination').should('contain.text', 'Available');
+      cy.get('.media-status').should('not.contain.text', 'Independent A');
+      cy.tick(15000);
+      cy.wait('@managementDownloads');
+      cy.then(() => expect(calls).to.eq(5));
+      // Let Headless UI finish its requestAnimationFrame exit transition.
+      cy.clock().then((clock) => clock.restore());
+      cy.get('.slideover').should('not.exist');
+    });
+  }
+
+  it('preserves native progress during initial loading and reports a failed request', () => {
+    prepare('movie', true);
+    cy.intercept('GET', '/api/v1/media/100/downloads', {
+      statusCode: 500,
+      delay: 1000,
+      body: { message: 'Unavailable' },
+    }).as('managementDownloads');
+    open('movie');
+    cy.contains(
+      '[data-testid="manage-download-group"]',
+      'The Mentalist'
+    ).should('be.visible');
+    cy.wait('@managementDownloads');
+    cy.get('.slideover [role="alert"]').should(
+      'contain',
+      'Something went wrong'
+    );
+    cy.get('[data-testid="manage-download-group"] li').should('have.length', 1);
+  });
+
+  it('reuses the refreshed shared snapshot on reopening without another request', () => {
+    prepare('movie');
+    cy.clock(Date.now(), ['Date', 'setTimeout', 'clearTimeout']);
+    cy.intercept('GET', '/api/v1/media/100/downloads', {
+      groups: [groups('movie')[1]],
+    }).as('firstDownloads');
+    open('movie');
+    cy.wait('@firstDownloads');
+    cy.contains(
+      '[data-testid="manage-download-group"]',
+      'Independent A'
+    ).should('be.visible');
+    cy.intercept('GET', '/api/v1/media/100/downloads', {
+      body: { groups: [] },
+    }).as('newDownloads');
+    cy.tick(15000);
+    cy.wait('@newDownloads');
+    cy.get('[data-testid="manage-download-group"]').should('not.exist');
+    // Use real time for the panel's CSS/rAF leave transition. Other scenarios
+    // above verify that the shared timer continues while Manage is closed.
+    cy.clock().then((clock) => clock.restore());
+    cy.get('button[aria-label="Close panel"]').click();
+    cy.get('.slideover').should('not.exist');
+    cy.get('[data-testid="manage-movie-button"]').click();
+    cy.get('[data-testid="manage-download-group"]').should('not.exist');
+    cy.get('@newDownloads.all').should('have.length', 1);
+  });
+});
 
 const movieId = 438148;
 const tvId = 66732;

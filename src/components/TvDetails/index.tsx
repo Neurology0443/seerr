@@ -27,6 +27,7 @@ import StatusBadge from '@app/components/StatusBadge';
 import Season from '@app/components/TvDetails/Season';
 import useDeepLinks from '@app/hooks/useDeepLinks';
 import useLocale from '@app/hooks/useLocale';
+import useMediaDownloads from '@app/hooks/useMediaDownloads';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
 import { Permission, UserType, useUser } from '@app/hooks/useUser';
@@ -152,6 +153,34 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
   const { data: ratingData } = useSWR<RTRating>(
     `/api/v1/tv/${router.query.tvId}/ratings`
   );
+
+  const { data: downloadData, error: downloadError } = useMediaDownloads(
+    data?.id === Number(router.query.tvId) ? data.mediaInfo?.id : undefined
+  );
+  const nativeDownloadGroup = downloadData?.groups.find(
+    (group) =>
+      !group.isIndependent &&
+      !group.is4k &&
+      group.serverId === data?.mediaInfo?.serviceId
+  );
+  const native4kDownloadGroup = downloadData?.groups.find(
+    (group) =>
+      !group.isIndependent &&
+      group.is4k &&
+      group.serverId === data?.mediaInfo?.serviceId4k
+  );
+  const independentGroups =
+    downloadData?.groups.filter(
+      (group) =>
+        group.isIndependent &&
+        ([
+          MediaStatus.PROCESSING,
+          MediaStatus.PARTIALLY_AVAILABLE,
+          MediaStatus.AVAILABLE,
+        ].includes(group.status) ||
+          ([MediaStatus.UNKNOWN, MediaStatus.DELETED].includes(group.status) &&
+            group.downloads.length > 0))
+    ) ?? [];
 
   const sortedCrew = useMemo(
     () => sortCrewPriority(data?.credits.crew ?? []),
@@ -533,6 +562,8 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
         onCancel={() => setShowRequestModal(false)}
       />
       <ManageSlideOver
+        downloadData={downloadData}
+        downloadError={downloadError}
         data={data}
         mediaType="tv"
         onClose={() => {
@@ -562,13 +593,23 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
             priority
           />
         </div>
-        <div className="media-title">
-          <div className="media-status">
+        <div className="media-title min-w-0 max-w-full">
+          <div className="media-status flex flex-wrap justify-center gap-2 !space-x-0 xl:justify-start">
             <StatusBadge
-              status={data.mediaInfo?.status}
-              downloadItem={data.mediaInfo?.downloadStatus}
+              status={nativeDownloadGroup?.status ?? data.mediaInfo?.status}
+              downloadItem={
+                nativeDownloadGroup?.downloads ?? data.mediaInfo?.downloadStatus
+              }
+              destinationName={nativeDownloadGroup?.name}
+              showReleaseTitle={!!nativeDownloadGroup}
               title={data.name}
-              inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
+              inProgress={
+                (
+                  nativeDownloadGroup?.downloads ??
+                  data.mediaInfo?.downloadStatus ??
+                  []
+                ).length > 0
+              }
               tmdbId={data.mediaInfo?.tmdbId}
               mediaType="tv"
               plexUrl={plexUrl}
@@ -586,12 +627,23 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 }
               ) && (
                 <StatusBadge
-                  status={data.mediaInfo?.status4k}
-                  downloadItem={data.mediaInfo?.downloadStatus4k}
+                  status={
+                    native4kDownloadGroup?.status ?? data.mediaInfo?.status4k
+                  }
+                  downloadItem={
+                    native4kDownloadGroup?.downloads ??
+                    data.mediaInfo?.downloadStatus4k
+                  }
+                  destinationName={native4kDownloadGroup?.name}
+                  showReleaseTitle={!!native4kDownloadGroup}
                   title={data.name}
                   is4k
                   inProgress={
-                    (data.mediaInfo?.downloadStatus4k ?? []).length > 0
+                    (
+                      native4kDownloadGroup?.downloads ??
+                      data.mediaInfo?.downloadStatus4k ??
+                      []
+                    ).length > 0
                   }
                   tmdbId={data.mediaInfo?.tmdbId}
                   mediaType="tv"
@@ -599,6 +651,21 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                   serviceUrl={data.mediaInfo?.serviceUrl4k}
                 />
               )}
+            {independentGroups.map((group) => (
+              <StatusBadge
+                key={group.serverId}
+                status={group.status}
+                downloadItem={group.downloads}
+                destinationName={group.name}
+                is4k={group.is4k}
+                isIndependent
+                showReleaseTitle
+                inProgress={group.downloads.length > 0}
+                mediaType="tv"
+                tmdbId={data.id}
+                title={data.name}
+              />
+            ))}
           </div>
           <h1 data-testid="media-title">
             {data.name}{' '}

@@ -229,22 +229,32 @@ describe('destination removal management', () => {
 
   it('confirms and removes exact EN, then refreshes targets and media details', () => {
     setupManagement();
-    cy.intercept('DELETE', '/api/v1/media/100/file?serverId=2', {
+    cy.intercept('DELETE', '/api/v1/media/*/file*', {
       statusCode: 204,
     }).as('remove');
     cy.contains('[data-testid="manage-destination"]', 'EN (4K)').within(() => {
-      cy.contains('button', 'Remove from Radarr').click();
-      cy.contains(
-        'button',
-        'Remove this movie and its files from Radarr destination "EN"?'
-      )
-        .should('be.visible')
-        .click();
+      cy.contains('button', 'Remove from Radarr').as('removeButton').click();
+      cy.get('@removeButton')
+        .children('span')
+        .children('div')
+        .last()
+        .should('contain.text', 'Are you sure?')
+        .and('have.class', 'translate-y-0')
+        .and('have.css', 'opacity', '1');
+      cy.get('@remove.all').should('have.length', 0);
+      cy.get('@removeButton').click();
     });
-    cy.wait('@remove').its('request.url').should('not.contain', 'is4k');
+    cy.wait('@remove')
+      .its('request.url')
+      .should(
+        'eq',
+        `${Cypress.config('baseUrl')}/api/v1/media/100/file?serverId=2`
+      )
+      .and('not.contain', 'is4k');
     cy.wait('@targets');
     cy.wait('@mediaDetails');
     cy.get('[data-testid="manage-destination"]').should('not.exist');
+    cy.get('@remove.all').should('have.length', 1);
   });
 
   it('reports independent HTTP 404 as an error and keeps management open', () => {
@@ -254,8 +264,15 @@ describe('destination removal management', () => {
       body: { message: 'Missing target' },
     }).as('remove');
     cy.contains('[data-testid="manage-destination"]', 'EN (4K)').within(() => {
-      cy.contains('button', 'Remove from Radarr').click();
-      cy.contains('button', 'Remove this movie and its files').click();
+      cy.contains('button', 'Remove from Radarr').as('removeButton').click();
+      cy.get('@removeButton')
+        .children('span')
+        .children('div')
+        .last()
+        .should('contain.text', 'Are you sure?')
+        .and('have.class', 'translate-y-0')
+        .and('have.css', 'opacity', '1');
+      cy.get('@removeButton').click();
     });
     cy.wait('@remove');
     cy.contains('Something went wrong while removing the media.').should(
@@ -306,33 +323,62 @@ describe('destination removal management', () => {
 
   it('RequestItem confirms exact EN and refreshes list, count, detail, media and targets', () => {
     setupRequestList();
-    cy.intercept('DELETE', '/api/v1/media/100/file?serverId=2', {
+    cy.intercept('DELETE', '/api/v1/media/*/file*', {
       statusCode: 204,
     }).as('remove');
-    cy.contains('button', 'Remove from Radarr').click();
-    cy.contains(
-      'button',
-      'Remove this movie and its files from Radarr destination "EN"?'
-    ).click();
-    cy.wait('@remove');
+    cy.contains('button', 'Remove from Radarr').as('removeButton').click();
+    cy.get('@removeButton')
+      .children('span')
+      .children('div')
+      .last()
+      .should('contain.text', 'Are you sure?')
+      .and('have.class', 'translate-y-0')
+      .and('have.css', 'opacity', '1');
+    cy.get('@remove.all').should('have.length', 0);
+    cy.get('@removeButton').click();
+    cy.wait('@remove')
+      .its('request.url')
+      .should(
+        'eq',
+        `${Cypress.config('baseUrl')}/api/v1/media/100/file?serverId=2`
+      )
+      .and('not.contain', 'is4k');
     cy.wait('@list');
     cy.wait('@count');
     cy.wait('@detail');
     cy.wait('@movie');
+    cy.get('@remove.all').should('have.length', 1);
   });
 
   it('RequestItem preserves native is4k removal', () => {
     setupRequestList(false);
-    cy.intercept('DELETE', '/api/v1/media/100/file?is4k=false', {
+    cy.intercept('DELETE', '/api/v1/media/*/file*', {
       statusCode: 204,
     }).as('nativeRemove');
     cy.contains('button', 'Remove from Radarr')
       .as('nativeRemoveButton')
       .click();
-    cy.get('@nativeRemoveButton').should('contain', 'Are you sure?').click();
+    cy.get('@nativeRemoveButton')
+      .children('span')
+      .children('div')
+      .last()
+      .should('contain.text', 'Are you sure?')
+      .and('have.class', 'translate-y-0')
+      .and('have.css', 'opacity', '1');
+    cy.get('@nativeRemove.all').should('have.length', 0);
+    cy.get('@nativeRemoveButton').click();
     cy.wait('@nativeRemove')
       .its('request.url')
-      .should('not.contain', 'serverId');
+      .should(
+        'eq',
+        `${Cypress.config('baseUrl')}/api/v1/media/100/file?is4k=false`
+      )
+      .and('not.contain', 'serverId');
+    cy.wait('@list');
+    cy.wait('@count');
+    cy.wait('@detail');
+    cy.wait('@movie');
+    cy.get('@nativeRemove.all').should('have.length', 1);
   });
 
   it('RequestItem reports independent deletion failure', () => {
@@ -340,8 +386,15 @@ describe('destination removal management', () => {
     cy.intercept('DELETE', '/api/v1/media/100/file?serverId=2', {
       statusCode: 404,
     }).as('remove');
-    cy.contains('button', 'Remove from Radarr').click();
-    cy.contains('button', 'Remove this movie and its files').click();
+    cy.contains('button', 'Remove from Radarr').as('removeButton').click();
+    cy.get('@removeButton')
+      .children('span')
+      .children('div')
+      .last()
+      .should('contain.text', 'Are you sure?')
+      .and('have.class', 'translate-y-0')
+      .and('have.css', 'opacity', '1');
+    cy.get('@removeButton').click();
     cy.wait('@remove');
     cy.contains('Something went wrong while removing the media.').should(
       'be.visible'

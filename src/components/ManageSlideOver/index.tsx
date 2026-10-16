@@ -15,6 +15,7 @@ import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import { deduplicateDownloads } from '@app/utils/downloads';
 import { Bars4Icon, ServerIcon } from '@heroicons/react/24/outline';
 import {
   CheckCircleIcon,
@@ -28,28 +29,19 @@ import {
   MediaType,
 } from '@server/constants/media';
 import { MediaServerType } from '@server/constants/server';
-import type { MediaWatchDataResponse } from '@server/interfaces/api/mediaInterfaces';
-import type { DownloadingItem } from '@server/lib/downloadtracker';
+import type {
+  MediaDownloadsResponse,
+  MediaWatchDataResponse,
+} from '@server/interfaces/api/mediaInterfaces';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
 import axios from 'axios';
 import Link from 'next/link';
 import { useIntl } from 'react-intl';
-import useSWR from 'swr';
+import useSWR, { useSWRConfig } from 'swr';
 
 import type { JSX } from 'react';
-
-const filterDuplicateDownloads = (
-  items: DownloadingItem[] = []
-): DownloadingItem[] => {
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    if (seen.has(item.downloadId)) return false;
-    seen.add(item.downloadId);
-    return true;
-  });
-};
 
 const messages = defineMessages('components.ManageSlideOver', {
   manageModalTitle: 'Manage {mediaType}',
@@ -64,8 +56,6 @@ const messages = defineMessages('components.ManageSlideOver', {
     '* This will irreversibly remove all data for this {mediaType}, including any requests. If this item exists in your {mediaServerName} library, the media information will be recreated during the next scan.',
   manageModalClearDestinationWarning:
     'This also purges multi-destination tracking data. Clear Data does not delete media files from Radarr/Sonarr.',
-  removeDestinationConfirm:
-    'Remove this {mediaType} and its files from {arr} destination "{name}"?',
   standard: 'Standard',
   manageModalRemoveMediaWarning:
     '* This will irreversibly remove this {mediaType} from {arr}, including all files.',
@@ -99,6 +89,8 @@ interface ManageSlideOverProps {
   show?: boolean;
   onClose: () => void;
   revalidate: () => void;
+  downloadData?: MediaDownloadsResponse;
+  downloadError?: unknown;
 }
 
 interface ManageSlideOverMovieProps extends ManageSlideOverProps {
@@ -117,6 +109,8 @@ const ManageSlideOver = ({
   onClose,
   data,
   revalidate,
+  downloadData,
+  downloadError,
 }: ManageSlideOverMovieProps | ManageSlideOverTvProps) => {
   const { user: currentUser, hasPermission } = useUser();
   const intl = useIntl();
@@ -136,11 +130,38 @@ const ManageSlideOver = ({
   const { data: sonarrData } = useSWR<SonarrSettings[]>(
     hasPermission(Permission.ADMIN) ? '/api/v1/settings/sonarr' : null
   );
+  const { mutate } = useSWRConfig();
+  const downloadsKey = data.mediaInfo?.id
+    ? `/api/v1/media/${data.mediaInfo.id}/downloads`
+    : null;
+
+  const nativeDownloads = [
+    {
+      serverId: data.mediaInfo?.serviceId,
+      name: undefined,
+      is4k: false,
+      downloads: data.mediaInfo?.downloadStatus ?? [],
+    },
+    {
+      serverId: data.mediaInfo?.serviceId4k,
+      name: undefined,
+      is4k: true,
+      downloads: data.mediaInfo?.downloadStatus4k ?? [],
+    },
+  ].filter((group) => group.downloads.length > 0);
+  const downloadGroups = downloadData?.groups ?? nativeDownloads;
+
+  const invalidateDownloads = () => {
+    if (downloadsKey)
+      void mutate(downloadsKey, undefined, { revalidate: true });
+  };
 
   const deleteMedia = async () => {
     if (data.mediaInfo) {
       try {
         await axios.delete(`/api/v1/media/${data.mediaInfo.id}`);
+        if (downloadsKey)
+          void mutate(downloadsKey, undefined, { revalidate: false });
         revalidate();
         onClose();
       } catch {
@@ -175,6 +196,7 @@ const ManageSlideOver = ({
       if (serverId !== undefined) {
         revalidateRequestData({ mediaType, tmdbId: data.id });
       }
+      invalidateDownloads();
       revalidate();
       onClose();
     }
@@ -234,6 +256,7 @@ const ManageSlideOver = ({
           seasons: data.seasons.filter((season) => season.seasonNumber !== 0),
         }),
       });
+      invalidateDownloads();
       revalidate();
     }
   };
@@ -273,39 +296,57 @@ const ManageSlideOver = ({
       subText={isMovie(data) ? data.title : data.name}
     >
       <div className="space-y-6">
-        {((data?.mediaInfo?.downloadStatus ?? []).length > 0 ||
-          (data?.mediaInfo?.downloadStatus4k ?? []).length > 0) && (
+        {(downloadGroups.some((group) => group.downloads.length > 0) ||
+          !!downloadError) && (
           <div>
             <h3 className="mb-2 text-xl font-bold">
               {intl.formatMessage(messages.downloadstatus)}
             </h3>
-            <div className="overflow-hidden rounded-md border border-gray-700 shadow">
-              <ul>
-                {filterDuplicateDownloads(data.mediaInfo?.downloadStatus).map(
-                  (status, index) => (
-                    <Tooltip
-                      key={`dl-status-${status.externalId}-${index}`}
-                      content={status.title}
-                    >
-                      <li className="border-b border-gray-700 last:border-b-0">
-                        <DownloadBlock downloadItem={status} />
-                      </li>
-                    </Tooltip>
-                  )
-                )}
-                {filterDuplicateDownloads(data.mediaInfo?.downloadStatus4k).map(
-                  (status, index) => (
-                    <Tooltip
-                      key={`dl-status-4k-${status.externalId}-${index}`}
-                      content={status.title}
-                    >
-                      <li className="border-b border-gray-700 last:border-b-0">
-                        <DownloadBlock downloadItem={status} is4k />
-                      </li>
-                    </Tooltip>
-                  )
-                )}
-              </ul>
+            {!!downloadError && (
+              <p role="alert" className="mb-2 text-sm text-red-400">
+                {intl.formatMessage(globalMessages.error)}
+              </p>
+            )}
+            <div className="space-y-3">
+              {downloadGroups
+                .filter((group) => group.downloads.length > 0)
+                .map((group) => (
+                  <div
+                    key={`${group.serverId}-${group.is4k}`}
+                    data-testid="manage-download-group"
+                  >
+                    {group.name && (
+                      <h4 className="mb-2 break-words font-semibold">
+                        {group.name} (
+                        {group.is4k
+                          ? '4K'
+                          : intl.formatMessage(messages.standard)}
+                        )
+                      </h4>
+                    )}
+                    <div className="overflow-hidden rounded-md border border-gray-700 shadow">
+                      <ul>
+                        {deduplicateDownloads(group.downloads).map(
+                          ({ item: status, key }) => (
+                            <Tooltip
+                              key={`${group.serverId}-${key}`}
+                              content={status.title}
+                            >
+                              <li className="border-b border-gray-700 last:border-b-0">
+                                <DownloadBlock
+                                  downloadItem={status}
+                                  is4k={group.is4k}
+                                  title={isMovie(data) ? data.title : data.name}
+                                  showReleaseTitle
+                                />
+                              </li>
+                            </Tooltip>
+                          )
+                        )}
+                      </ul>
+                    </div>
+                  </div>
+                ))}
             </div>
           </div>
         )}
@@ -723,29 +764,35 @@ const ManageSlideOver = ({
                     </a>
                   )}
                   {target.canRemove && (
-                    <ConfirmButton
-                      onClick={() => deleteMediaFile(false, target.serverId)}
-                      confirmText={intl.formatMessage(
-                        messages.removeDestinationConfirm,
-                        {
-                          mediaType: intl.formatMessage(
-                            mediaType === 'movie'
-                              ? messages.movie
-                              : messages.tvshow
-                          ),
-                          arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
-                          name: target.name,
-                        }
-                      )}
-                      className="min-h-20 w-full"
-                    >
-                      <TrashIcon />
-                      <span>
-                        {intl.formatMessage(messages.removearr, {
-                          arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
-                        })}
-                      </span>
-                    </ConfirmButton>
+                    <div>
+                      <ConfirmButton
+                        onClick={() => deleteMediaFile(false, target.serverId)}
+                        confirmText={intl.formatMessage(
+                          globalMessages.areyousure
+                        )}
+                        className="w-full"
+                      >
+                        <TrashIcon />
+                        <span>
+                          {intl.formatMessage(messages.removearr, {
+                            arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+                          })}
+                        </span>
+                      </ConfirmButton>
+                      <div className="mt-1 text-xs text-gray-400">
+                        {intl.formatMessage(
+                          messages.manageModalRemoveMediaWarning,
+                          {
+                            mediaType: intl.formatMessage(
+                              mediaType === 'movie'
+                                ? messages.movie
+                                : messages.tvshow
+                            ),
+                            arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+                          }
+                        )}
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>
