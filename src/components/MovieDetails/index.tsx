@@ -138,15 +138,13 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
     mutate: revalidate,
   } = useSWR<MovieDetailsType>(`/api/v1/movie/${router.query.movieId}`, {
     fallbackData: movie,
-    refreshInterval: hasPermission(Permission.MANAGE_REQUESTS)
-      ? 0
-      : refreshIntervalHelper(
-          {
-            downloadStatus: movie?.mediaInfo?.downloadStatus,
-            downloadStatus4k: movie?.mediaInfo?.downloadStatus4k,
-          },
-          15000
-        ),
+    refreshInterval: refreshIntervalHelper(
+      {
+        downloadStatus: movie?.mediaInfo?.downloadStatus,
+        downloadStatus4k: movie?.mediaInfo?.downloadStatus4k,
+      },
+      15000
+    ),
   });
 
   const { data: ratingData } = useSWR<RatingResponse>(
@@ -158,11 +156,15 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
   );
   const nativeDownloadGroup = downloadData?.groups.find(
     (group) =>
-      !group.isIndependent && group.serverId === data?.mediaInfo?.serviceId
+      !group.isIndependent &&
+      !group.is4k &&
+      group.serverId === data?.mediaInfo?.serviceId
   );
   const native4kDownloadGroup = downloadData?.groups.find(
     (group) =>
-      !group.isIndependent && group.serverId === data?.mediaInfo?.serviceId4k
+      !group.isIndependent &&
+      group.is4k &&
+      group.serverId === data?.mediaInfo?.serviceId4k
   );
   const independentGroups =
     downloadData?.groups.filter(

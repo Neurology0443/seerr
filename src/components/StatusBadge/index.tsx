@@ -181,6 +181,12 @@ const StatusBadge = ({
   if (destinationName !== undefined) {
     const active = summary.count > 0;
     if (
+      !isIndependent &&
+      (status === MediaStatus.UNKNOWN || status === undefined)
+    )
+      return null;
+    if (
+      isIndependent &&
       (status === MediaStatus.UNKNOWN ||
         status === MediaStatus.DELETED ||
         status === undefined) &&
@@ -215,6 +221,9 @@ const StatusBadge = ({
                 {is4k ? '4K' : intl.formatMessage(messages.standard)})
               </div>
               <div>{label}</div>
+              {!isIndependent && mediaLinkDescription && (
+                <div>{mediaLinkDescription}</div>
+              )}
               <div>{intl.formatMessage(messages.noactivedownloads)}</div>
             </div>
           )

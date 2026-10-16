@@ -208,6 +208,55 @@ for (const type of [MediaType.MOVIE, MediaType.TV]) {
       );
     });
 
+    for (const sameExternalId of [false, true]) {
+      it(`keeps native Standard/4K slots separate with one server and ${sameExternalId ? 'identical' : 'different'} external IDs`, async () => {
+        const { media, queues, servers, external, update } =
+          await setupDownloads();
+        servers.push(removalServer(7, false, !sameExternalId));
+        const standard = { ...queues.get(99)![0], externalId: 100 };
+        const ultraHd = { ...standard, externalId: 200, downloadId: '4k-hash' };
+        queues.set(7, [standard, ultraHd]);
+        await getRepository(Media).update(media.id, {
+          serviceId: 7,
+          serviceId4k: 7,
+          externalServiceId: 100,
+          externalServiceId4k: sameExternalId ? 100 : 200,
+          status: MediaStatus.AVAILABLE,
+          status4k: MediaStatus.PROCESSING,
+        });
+        const before = await removalSnapshot();
+        const response = await request(app).get(`/media/${media.id}/downloads`);
+        assert.equal(response.status, 200);
+        const native = response.body.groups.filter(
+          (group: { isIndependent: boolean }) => !group.isIndependent
+        );
+        assert.equal(native.length, 2);
+        assert.deepEqual(native, [
+          {
+            serverId: 7,
+            name: servers.at(-1)!.name,
+            is4k: false,
+            isIndependent: false,
+            status: MediaStatus.AVAILABLE,
+            downloads: JSON.parse(JSON.stringify([standard])),
+          },
+          {
+            serverId: 7,
+            name: servers.at(-1)!.name,
+            is4k: true,
+            isIndependent: false,
+            status: MediaStatus.PROCESSING,
+            downloads: JSON.parse(
+              JSON.stringify([sameExternalId ? standard : ultraHd])
+            ),
+          },
+        ]);
+        assert.deepEqual(await removalSnapshot(), before);
+        assert.equal(external.mock.callCount(), 0);
+        assert.equal(update.mock.callCount(), 0);
+      });
+    }
+
     it('does not depend on request completion', async () => {
       const { media } = await setupDownloads();
       const before = (await request(app).get(`/media/${media.id}/downloads`))

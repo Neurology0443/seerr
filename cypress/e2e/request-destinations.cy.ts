@@ -142,6 +142,27 @@ describe('Management downloads', () => {
   const badge = (name: string) =>
     cy.contains('.media-status > a, .media-status > span', name);
 
+  it('preserves native DELETED visibility and UNKNOWN hiding with a destination name', () => {
+    prepare('movie');
+    cy.intercept('GET', '/api/v1/media/100/downloads', {
+      groups: [
+        { ...groups('movie')[0], status: 7, downloads: [] },
+        { ...groups('movie')[4], name: 'Native unknown', status: 1 },
+      ],
+    }).as('snapshot');
+    cy.visit(`/movie/${movieId}`);
+    cy.wait(['@managementTitle', '@snapshot']);
+    badge('Native service')
+      .should('be.visible')
+      .and('contain.text', 'Deleted')
+      .and('have.attr', 'href', `/movie/${movieId}?manage=1`)
+      .trigger('mouseenter');
+    cy.get('[data-popper-placement]').should('contain.text', 'Manage Movie');
+    cy.get('.media-status').should('not.contain.text', 'Native unknown');
+    badge('Native service').trigger('mouseleave').click();
+    cy.get('.slideover').should('be.visible');
+  });
+
   for (const type of ['movie', 'tv'] as const) {
     for (const permissions of [2, 16]) {
       it(`shows isolated ${type} destination badges and compact tooltips with permissions ${permissions}`, () => {
@@ -243,7 +264,14 @@ describe('Management downloads', () => {
         }).as('snapshot');
         cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}`);
         cy.wait(['@managementTitle', '@snapshot']);
-        badge('Native service').should('contain.text', 'Available');
+        badge('Native service')
+          .should('contain.text', 'Available')
+          .trigger('mouseenter');
+        cy.get('[data-popper-placement]').should(
+          'contain.text',
+          type === 'movie' ? 'Manage Movie' : 'Manage Series'
+        );
+        badge('Native service').trigger('mouseleave');
         badge('Native Ultra HD').should(
           'contain.text',
           '4K Partially Available'
@@ -316,6 +344,64 @@ describe('Management downloads', () => {
         cy.get('@snapshot.all').should('have.length', 1);
       });
     }
+
+    it(`selects distinct native ${type} Standard/4K slots sharing one server`, () => {
+      cy.viewport(1440, 1000);
+      const title = visitMedia(
+        type,
+        [],
+        false,
+        true,
+        undefined,
+        [1, 2],
+        false,
+        true
+      );
+      cy.intercept(
+        'GET',
+        `/api/v1/${type}/${type === 'movie' ? movieId : tvId}`,
+        {
+          ...title,
+          mediaInfo: { ...title.mediaInfo, serviceId: 7, serviceId4k: 7 },
+        }
+      ).as('managementTitle');
+      const native = { ...groups(type)[0], serverId: 7, name: 'Shared native' };
+      cy.intercept('GET', '/api/v1/media/100/downloads', {
+        groups: [
+          // Put 4K first so selection cannot depend on response ordering.
+          {
+            ...native,
+            is4k: true,
+            status: 3,
+            downloads: downloads(type, 2, 23),
+          },
+          { ...native, status: 5, downloads: downloads(type, 1, 23) },
+        ],
+      }).as('snapshot');
+      cy.visit(`/${type}/${type === 'movie' ? movieId : tvId}`);
+      cy.wait(['@managementTitle', '@snapshot']);
+      const standard = () =>
+        cy.contains('.media-status a', /^Available\s*·\s*Shared native/);
+      const ultraHd = () =>
+        cy.contains('.media-status a', /^4K Processing\s*·\s*Shared native/);
+      standard().should('be.visible').trigger('mouseenter');
+      cy.get('[data-popper-placement] li').should('have.length', 1);
+      cy.get('[data-popper-placement]')
+        .should('contain.text', 'Shared native (Standard)')
+        .and('contain.text', 'S01 Original release')
+        .and('not.contain.text', 'S02 Original release');
+      standard().trigger('mouseleave');
+      ultraHd().should('be.visible').trigger('mouseenter');
+      cy.get('[data-popper-placement] li').should('have.length', 1);
+      cy.get('[data-popper-placement]')
+        .should('contain.text', 'Shared native (4K)')
+        .and('contain.text', 'S02 Original release')
+        .and('not.contain.text', 'S01 Original release');
+      ultraHd().trigger('mouseleave').click();
+      cy.get('.slideover').should('be.visible');
+      cy.get('[data-testid="manage-download-group"]').should('have.length', 2);
+      cy.get('@snapshot.all').should('have.length', 1);
+    });
 
     it(`wraps ${type} destination badges with long names on a narrow screen`, () => {
       cy.viewport(390, 844);
@@ -531,8 +617,10 @@ describe('Management downloads', () => {
       cy.get('.media-status').should('not.contain.text', 'Independent A');
       cy.tick(15000);
       cy.wait('@managementDownloads');
-      cy.get('.slideover').should('not.exist');
       cy.then(() => expect(calls).to.eq(5));
+      // Let Headless UI finish its requestAnimationFrame exit transition.
+      cy.clock().then((clock) => clock.restore());
+      cy.get('.slideover').should('not.exist');
     });
   }
 

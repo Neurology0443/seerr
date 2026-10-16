@@ -141,15 +141,13 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
     mutate: revalidate,
   } = useSWR<TvDetailsType>(`/api/v1/tv/${router.query.tvId}`, {
     fallbackData: tv,
-    refreshInterval: hasPermission(Permission.MANAGE_REQUESTS)
-      ? 0
-      : refreshIntervalHelper(
-          {
-            downloadStatus: tv?.mediaInfo?.downloadStatus,
-            downloadStatus4k: tv?.mediaInfo?.downloadStatus4k,
-          },
-          15000
-        ),
+    refreshInterval: refreshIntervalHelper(
+      {
+        downloadStatus: tv?.mediaInfo?.downloadStatus,
+        downloadStatus4k: tv?.mediaInfo?.downloadStatus4k,
+      },
+      15000
+    ),
   });
 
   const { data: ratingData } = useSWR<RTRating>(
@@ -161,11 +159,15 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
   );
   const nativeDownloadGroup = downloadData?.groups.find(
     (group) =>
-      !group.isIndependent && group.serverId === data?.mediaInfo?.serviceId
+      !group.isIndependent &&
+      !group.is4k &&
+      group.serverId === data?.mediaInfo?.serviceId
   );
   const native4kDownloadGroup = downloadData?.groups.find(
     (group) =>
-      !group.isIndependent && group.serverId === data?.mediaInfo?.serviceId4k
+      !group.isIndependent &&
+      group.is4k &&
+      group.serverId === data?.mediaInfo?.serviceId4k
   );
   const independentGroups =
     downloadData?.groups.filter(

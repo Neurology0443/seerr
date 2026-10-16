@@ -96,6 +96,105 @@ describe('Destination-aware TV snapshots', () => {
       cy.intercept('GET', `/api/v1/tv/${id}/request-targets`, []);
   });
 
+  for (const permissions of [2, 48]) {
+    it(`preserves native polling alongside the shared snapshot with permissions ${permissions}`, () => {
+      cy.intercept('GET', '/api/v1/auth/me', {
+        id: 1,
+        permissions,
+        userType: 1,
+        warnings: [],
+      });
+      const first = fixture(66732, 100, 'First series');
+      const second = fixture(66733, 200, 'Polling series');
+      const download = {
+        mediaType: 'tv',
+        externalId: 100,
+        downloadId: 'native',
+        title: 'Native release',
+        size: 100,
+        sizeLeft: 40,
+        status: 'downloading',
+        timeLeft: '00:10:00',
+        estimatedCompletionTime: '2030-01-01T00:00:00Z',
+      };
+      const initial = {
+        ...second,
+        mediaInfo: { ...second.mediaInfo, downloadStatus: [download] },
+      };
+      let details = initial;
+      let destination = 'Independent before refresh';
+      cy.intercept('GET', '/api/v1/tv/66732', first).as('firstTitle');
+      cy.intercept('GET', '/api/v1/tv/66733', (req) => req.reply(details)).as(
+        'polledTitle'
+      );
+      cy.intercept('GET', '/api/v1/media/100/downloads', { groups: [] });
+      cy.intercept('GET', '/api/v1/media/200/downloads', (req) =>
+        req.reply({
+          groups: [
+            {
+              serverId: 2,
+              name: destination,
+              is4k: false,
+              isIndependent: true,
+              status: 5,
+              downloads: [],
+            },
+          ],
+        })
+      ).as('polledSnapshot');
+      cy.intercept('GET', '/api/v1/media/200/watch_data', {});
+      let appProps: Record<string, unknown>;
+      cy.intercept('GET', '/_next/data/**/tv/66733.json*', (req) =>
+        req.reply({
+          ...appProps,
+          pageProps: { tv: initial },
+          __N_SSP: true,
+        })
+      );
+      cy.clock(Date.now(), ['Date', 'setTimeout', 'clearTimeout']);
+      cy.visit('/tv/66732');
+      cy.wait('@firstTitle');
+      cy.window().then((win) => {
+        appProps = (
+          win as unknown as {
+            __NEXT_DATA__: { props: Record<string, unknown> };
+          }
+        ).__NEXT_DATA__.props;
+      });
+      cy.get('.media-status a[href="/tv/66733"]').click();
+      cy.wait(['@polledTitle', '@polledSnapshot']);
+      cy.contains('.media-status a', 'Independent before refresh').click();
+      cy.get('.slideover').should('be.visible');
+      cy.get('@polledSnapshot.all').should('have.length', 1);
+      cy.then(() => {
+        details = {
+          ...initial,
+          name: 'Refreshed series',
+          mediaInfo: { ...initial.mediaInfo, status: 5, downloadStatus: [] },
+        };
+        destination = 'Independent after refresh';
+      });
+      cy.tick(14999);
+      cy.get('@polledTitle.all').should('have.length', 1);
+      cy.get('@polledSnapshot.all').should('have.length', 1);
+      cy.tick(1);
+      cy.wait(['@polledTitle', '@polledSnapshot']);
+      cy.get('[data-testid="media-title"]').should(
+        'contain.text',
+        'Refreshed series'
+      );
+      cy.contains('.media-status a', /^Available$/).should('be.visible');
+      cy.get('.media-status').should(
+        'contain.text',
+        'Independent after refresh'
+      );
+      cy.tick(15000);
+      cy.wait(['@polledTitle', '@polledSnapshot']);
+      cy.get('@polledTitle.all').should('have.length', 3);
+      cy.get('@polledSnapshot.all').should('have.length', 3);
+    });
+  }
+
   it('clears the previous media snapshot during client navigation and revalidates renamed destinations', () => {
     const first = fixture(66732, 100, 'First series');
     const second = fixture(66733, 200, 'Second series');

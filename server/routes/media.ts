@@ -60,24 +60,15 @@ mediaRoutes.get<{ id: string }, MediaDownloadsResponse>(
           externalId > 0
             ? ((is4k ? media.downloadStatus4k : media.downloadStatus) ?? [])
             : [];
-        if (
-          is4k &&
-          serverId === media.serviceId &&
-          externalId === media.externalServiceId
-        )
-          continue;
         if (server) {
-          const existing = groups.find((group) => group.serverId === server.id);
-          if (existing) existing.downloads.push(...downloads);
-          else
-            groups.push({
-              serverId: server.id,
-              name: server.name,
-              is4k: server.is4k,
-              isIndependent: false,
-              status: is4k ? media.status4k : media.status,
-              downloads: [...downloads],
-            });
+          groups.push({
+            serverId: server.id,
+            name: server.name,
+            is4k,
+            isIndependent: false,
+            status: is4k ? media.status4k : media.status,
+            downloads: [...downloads],
+          });
         }
       }
 
