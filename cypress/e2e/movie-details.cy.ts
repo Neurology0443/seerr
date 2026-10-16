@@ -138,4 +138,75 @@ describe('Manage Movie visibility', () => {
     visit(title(1, [], false));
     cy.get('[data-testid=manage-movie-button]').should('not.exist');
   });
+
+  it('uses exact native snapshots and preserves playback navigation beside independent badges', () => {
+    cy.clock(Date.now(), ['Date', 'setTimeout', 'clearTimeout']);
+    cy.intercept('GET', '/api/v1/settings/public', (req) => {
+      // Login may have cached the unmodified public settings. A 304 response
+      // would keep that cached body instead of this scenario's 4K fixture.
+      delete req.headers['if-none-match'];
+      delete req.headers['if-modified-since'];
+      req.continue((res) => Object.assign(res.body, { movie4kEnabled: true }));
+    }).as('publicSettings');
+    const data = title(3);
+    const fixture = {
+      ...data,
+      mediaInfo: {
+        ...data.mediaInfo,
+        serviceId: 1,
+        serviceId4k: 2,
+        mediaUrl: 'https://native.example/movie/100',
+        mediaUrl4k: 'https://native.example/movie/100-4k',
+      },
+    };
+    cy.intercept('GET', '/api/v1/media/100/downloads', {
+      groups: [
+        {
+          serverId: 1,
+          name: 'Native standard',
+          is4k: false,
+          isIndependent: false,
+          status: 5,
+          downloads: [],
+        },
+        {
+          serverId: 2,
+          name: 'Native 4K',
+          is4k: true,
+          isIndependent: false,
+          status: 4,
+          downloads: [],
+        },
+        {
+          serverId: 3,
+          name: 'Independent movie',
+          is4k: false,
+          isIndependent: true,
+          status: 3,
+          downloads: [],
+        },
+      ],
+    }).as('snapshot');
+    visit(fixture, 2);
+    cy.wait('@snapshot');
+    cy.tick(2000);
+    cy.window().then((win) => {
+      win.dispatchEvent(new win.Event('offline'));
+      win.dispatchEvent(new win.Event('online'));
+    });
+    cy.tick(0);
+    cy.wait('@publicSettings')
+      .its('response.body.movie4kEnabled')
+      .should('eq', true);
+    cy.tick(0);
+    cy.contains('.media-status a', 'Native standard')
+      .should('contain.text', 'Available')
+      .and('have.attr', 'href', 'https://native.example/movie/100');
+    cy.contains('.media-status a', 'Native 4K')
+      .should('contain.text', '4K Partially Available')
+      .and('have.attr', 'href', 'https://native.example/movie/100-4k');
+    cy.contains('.media-status a', 'Independent movie')
+      .should('contain.text', 'Processing')
+      .and('have.attr', 'href', `/movie/${id}?manage=1`);
+  });
 });

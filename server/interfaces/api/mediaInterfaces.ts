@@ -1,3 +1,4 @@
+import type { MediaStatus } from '@server/constants/media';
 import type Media from '@server/entity/Media';
 import type { User } from '@server/entity/User';
 import type { DownloadingItem } from '@server/lib/downloadtracker';
@@ -8,6 +9,7 @@ export interface MediaDownloadGroup {
   name: string;
   is4k: boolean;
   isIndependent: boolean;
+  status: MediaStatus;
   downloads: DownloadingItem[];
 }
 

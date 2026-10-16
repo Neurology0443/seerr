@@ -55,20 +55,18 @@ mediaRoutes.get<{ id: string }, MediaDownloadsResponse>(
             server.id === serverId && !server.independentRequestDestination
         );
         const downloads =
-          (is4k ? media.downloadStatus4k : media.downloadStatus) ?? [];
+          typeof externalId === 'number' &&
+          Number.isSafeInteger(externalId) &&
+          externalId > 0
+            ? ((is4k ? media.downloadStatus4k : media.downloadStatus) ?? [])
+            : [];
         if (
           is4k &&
           serverId === media.serviceId &&
           externalId === media.externalServiceId
         )
           continue;
-        if (
-          server &&
-          typeof externalId === 'number' &&
-          Number.isSafeInteger(externalId) &&
-          externalId > 0 &&
-          downloads.length
-        ) {
+        if (server) {
           const existing = groups.find((group) => group.serverId === server.id);
           if (existing) existing.downloads.push(...downloads);
           else
@@ -77,6 +75,7 @@ mediaRoutes.get<{ id: string }, MediaDownloadsResponse>(
               name: server.name,
               is4k: server.is4k,
               isIndependent: false,
+              status: is4k ? media.status4k : media.status,
               downloads: [...downloads],
             });
         }
@@ -92,25 +91,23 @@ mediaRoutes.get<{ id: string }, MediaDownloadsResponse>(
             server.independentRequestDestination === true
         );
         const externalId = destination.externalServiceId;
-        if (
-          !server ||
+        if (!server) continue;
+        const downloads =
           typeof externalId !== 'number' ||
           !Number.isSafeInteger(externalId) ||
           externalId <= 0
-        )
-          continue;
-        const downloads =
-          media.mediaType === MediaType.TV
-            ? downloadTracker.getSeriesProgress(server.id, externalId)
-            : downloadTracker.getMovieProgress(server.id, externalId);
-        if (downloads.length)
-          groups.push({
-            serverId: server.id,
-            name: server.name,
-            is4k: server.is4k,
-            isIndependent: true,
-            downloads,
-          });
+            ? []
+            : media.mediaType === MediaType.TV
+              ? downloadTracker.getSeriesProgress(server.id, externalId)
+              : downloadTracker.getMovieProgress(server.id, externalId);
+        groups.push({
+          serverId: server.id,
+          name: server.name,
+          is4k: server.is4k,
+          isIndependent: true,
+          status: destination.status,
+          downloads,
+        });
       }
       return res.json({ groups });
     } catch (e) {

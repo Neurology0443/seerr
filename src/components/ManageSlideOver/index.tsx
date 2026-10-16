@@ -15,6 +15,7 @@ import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import { deduplicateDownloads } from '@app/utils/downloads';
 import { Bars4Icon, ServerIcon } from '@heroicons/react/24/outline';
 import {
   CheckCircleIcon,
@@ -32,7 +33,6 @@ import type {
   MediaDownloadsResponse,
   MediaWatchDataResponse,
 } from '@server/interfaces/api/mediaInterfaces';
-import type { DownloadingItem } from '@server/lib/downloadtracker';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
@@ -41,18 +41,7 @@ import Link from 'next/link';
 import { useIntl } from 'react-intl';
 import useSWR, { useSWRConfig } from 'swr';
 
-import { useEffect, type JSX } from 'react';
-
-const filterDuplicateDownloads = (
-  items: DownloadingItem[] = []
-): DownloadingItem[] => {
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    if (seen.has(item.downloadId)) return false;
-    seen.add(item.downloadId);
-    return true;
-  });
-};
+import type { JSX } from 'react';
 
 const messages = defineMessages('components.ManageSlideOver', {
   manageModalTitle: 'Manage {mediaType}',
@@ -100,6 +89,8 @@ interface ManageSlideOverProps {
   show?: boolean;
   onClose: () => void;
   revalidate: () => void;
+  downloadData?: MediaDownloadsResponse;
+  downloadError?: unknown;
 }
 
 interface ManageSlideOverMovieProps extends ManageSlideOverProps {
@@ -118,6 +109,8 @@ const ManageSlideOver = ({
   onClose,
   data,
   revalidate,
+  downloadData,
+  downloadError,
 }: ManageSlideOverMovieProps | ManageSlideOverTvProps) => {
   const { user: currentUser, hasPermission } = useUser();
   const intl = useIntl();
@@ -141,19 +134,6 @@ const ManageSlideOver = ({
   const downloadsKey = data.mediaInfo?.id
     ? `/api/v1/media/${data.mediaInfo.id}/downloads`
     : null;
-  const canManageDownloads = hasPermission(Permission.MANAGE_REQUESTS);
-  const { data: downloadData, error: downloadError } =
-    useSWR<MediaDownloadsResponse>(
-      show && canManageDownloads ? downloadsKey : null,
-      { refreshInterval: 15000, dedupingInterval: 0 }
-    );
-  // Each opening starts with a fresh management snapshot. Mutating also
-  // discards any request still in flight when the panel closes.
-  useEffect(() => {
-    if ((!show || !canManageDownloads) && downloadsKey) {
-      void mutate(downloadsKey, undefined, { revalidate: false });
-    }
-  }, [show, canManageDownloads, downloadsKey, mutate]);
 
   const nativeDownloads = [
     {
@@ -276,6 +256,7 @@ const ManageSlideOver = ({
           seasons: data.seasons.filter((season) => season.seasonNumber !== 0),
         }),
       });
+      invalidateDownloads();
       revalidate();
     }
   };
@@ -316,12 +297,12 @@ const ManageSlideOver = ({
     >
       <div className="space-y-6">
         {(downloadGroups.some((group) => group.downloads.length > 0) ||
-          downloadError) && (
+          !!downloadError) && (
           <div>
             <h3 className="mb-2 text-xl font-bold">
               {intl.formatMessage(messages.downloadstatus)}
             </h3>
-            {downloadError && (
+            {!!downloadError && (
               <p role="alert" className="mb-2 text-sm text-red-400">
                 {intl.formatMessage(globalMessages.error)}
               </p>
@@ -345,10 +326,10 @@ const ManageSlideOver = ({
                     )}
                     <div className="overflow-hidden rounded-md border border-gray-700 shadow">
                       <ul>
-                        {filterDuplicateDownloads(group.downloads).map(
-                          (status) => (
+                        {deduplicateDownloads(group.downloads).map(
+                          ({ item: status, key }) => (
                             <Tooltip
-                              key={`${group.serverId}-${status.downloadId}`}
+                              key={`${group.serverId}-${key}`}
                               content={status.title}
                             >
                               <li className="border-b border-gray-700 last:border-b-0">

@@ -1297,7 +1297,7 @@ components:
               type: number
     MediaDownloadGroup:
       type: object
-      required: [serverId, name, is4k, isIndependent, downloads]
+      required: [serverId, name, is4k, isIndependent, status, downloads]
       properties:
         serverId:
           type: integer
@@ -1307,6 +1307,9 @@ components:
           type: boolean
         isIndependent:
           type: boolean
+        status:
+          type: integer
+          description: Persisted native media or independent destination status, regardless of queue activity.
         downloads:
           type: array
           items:
@@ -7584,7 +7587,7 @@ paths:
             minimum: 1
       responses:
         '200':
-          description: Configured destinations containing active downloads
+          description: Configured native linkages and persisted independent destinations, including empty download queues
           content:
             application/json:
               schema:
