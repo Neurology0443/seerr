@@ -1295,6 +1295,30 @@ components:
               type: number
             id:
               type: number
+    MediaDownloadGroup:
+      type: object
+      required: [serverId, name, is4k, isIndependent, downloads]
+      properties:
+        serverId:
+          type: integer
+        name:
+          type: string
+        is4k:
+          type: boolean
+        isIndependent:
+          type: boolean
+        downloads:
+          type: array
+          items:
+            $ref: '#/components/schemas/DownloadingItem'
+    MediaDownloadsResponse:
+      type: object
+      required: [groups]
+      properties:
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/MediaDownloadGroup'
     MediaRequestTarget:
       type: object
       nullable: true
@@ -7544,6 +7568,33 @@ paths:
       responses:
         '204':
           description: Succesfully removed media item
+  /media/{mediaId}/downloads:
+    get:
+      summary: Get cached media downloads by destination
+      description: Reads cached DownloadTracker progress for exact native and independent destinations, regardless of requests or requested seasons. Requires `MANAGE_REQUESTS`. Does not contact Radarr/Sonarr or change availability.
+      tags:
+        - media
+      parameters:
+        - in: path
+          name: mediaId
+          description: Internal Media ID (not a TMDB ID)
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: Configured destinations containing active downloads
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MediaDownloadsResponse'
+        '400':
+          description: Invalid media ID
+        '403':
+          description: Permission denied
+        '404':
+          description: Media not found
   /media/{mediaId}/file:
     delete:
       summary: Delete media file

@@ -163,16 +163,62 @@ class ServarrBase<QueueItemAppendT> extends ExternalAPI {
 
   public getQueue = async (): Promise<(QueueItem & QueueItemAppendT)[]> => {
     try {
-      const response = await this.axios.get<QueueResponse<QueueItemAppendT>>(
-        `/queue`,
-        {
-          params: {
-            includeEpisode: true,
-          },
+      const requestedPageSize = 100;
+      const fetchPage = async (page: number) => {
+        const response = await this.axios.get<QueueResponse<QueueItemAppendT>>(
+          '/queue',
+          {
+            params: {
+              includeEpisode: true,
+              pageSize: requestedPageSize,
+              page,
+            },
+          }
+        );
+        const data = response.data;
+        if (
+          !data ||
+          data.page !== page ||
+          !Number.isSafeInteger(data.pageSize) ||
+          data.pageSize <= 0 ||
+          !Number.isSafeInteger(data.totalRecords) ||
+          data.totalRecords < 0 ||
+          !Array.isArray(data.records) ||
+          data.records.length !==
+            Math.min(
+              data.pageSize,
+              Math.max(0, data.totalRecords - (page - 1) * data.pageSize)
+            ) ||
+          data.records.some(
+            (record) =>
+              !record ||
+              typeof record !== 'object' ||
+              !Number.isSafeInteger(record.id)
+          )
+        ) {
+          throw new Error(`Invalid queue response on page ${page}`);
         }
-      );
+        return data;
+      };
 
-      return response.data.records;
+      const firstPage = await fetchPage(1);
+      const totalPages = Math.ceil(firstPage.totalRecords / firstPage.pageSize);
+      const records = [...firstPage.records];
+      for (let page = 2; page <= totalPages; page++) {
+        const response = await fetchPage(page);
+        if (
+          response.pageSize !== firstPage.pageSize ||
+          response.totalRecords !== firstPage.totalRecords
+        ) {
+          throw new Error(`Queue pagination changed on page ${page}`);
+        }
+        records.push(...response.records);
+      }
+      // Repeated pages are an incomplete snapshot, even if their lengths match.
+      if (new Set(records.map((record) => record.id)).size !== records.length) {
+        throw new Error('Queue pagination returned duplicate records');
+      }
+      return records;
     } catch (e) {
       throw new Error(
         `[${this.apiName}] Failed to retrieve queue: ${e.message}`,

@@ -1,6 +1,19 @@
 import type Media from '@server/entity/Media';
 import type { User } from '@server/entity/User';
+import type { DownloadingItem } from '@server/lib/downloadtracker';
 import type { PaginatedResponse } from './common';
+
+export interface MediaDownloadGroup {
+  serverId: number;
+  name: string;
+  is4k: boolean;
+  isIndependent: boolean;
+  downloads: DownloadingItem[];
+}
+
+export interface MediaDownloadsResponse {
+  groups: MediaDownloadGroup[];
+}
 
 export interface MediaResultsResponse extends PaginatedResponse {
   results: Media[];

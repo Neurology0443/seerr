@@ -13,6 +13,169 @@ function getAxios(radarr: RadarrAPI): AxiosInstance {
   return (radarr as unknown as { axios: AxiosInstance }).axios;
 }
 
+describe('RadarrAPI complete queue pagination', () => {
+  afterEach(() => mock.restoreAll());
+
+  const queueRecord = (id: number) => ({
+    id,
+    movieId: 7,
+    title: 'Original release title',
+    downloadId: 'season-pack',
+    size: 100,
+    sizeleft: 40,
+    episode: { id, seasonNumber: 1, episodeNumber: id },
+  });
+
+  for (const [totalRecords, pageSize] of [
+    [0, 100],
+    [46, 100],
+    [100, 100],
+    [101, 100],
+    [257, 100],
+    [46, 10],
+  ]) {
+    it(`returns all ${totalRecords} records with effective page size ${pageSize}`, async () => {
+      const api = buildRadarr();
+      const records = Array.from({ length: totalRecords }, (_, index) =>
+        queueRecord(index + 1)
+      );
+      const get = mock.method(
+        getAxios(api),
+        'get',
+        async (
+          url: string,
+          config: {
+            params: { page: number; pageSize: number; includeEpisode: boolean };
+          }
+        ) => {
+          assert.equal(url, '/queue');
+          assert.equal(config.params.includeEpisode, true);
+          assert.equal(config.params.pageSize, 100);
+          const page = config.params.page;
+          return {
+            data: {
+              page,
+              pageSize,
+              totalRecords,
+              records: records.slice((page - 1) * pageSize, page * pageSize),
+            },
+          };
+        }
+      );
+      assert.deepEqual(await api.getQueue(), records);
+      assert.equal(
+        get.mock.callCount(),
+        Math.max(1, Math.ceil(totalRecords / pageSize))
+      );
+      assert.deepEqual(
+        get.mock.calls.map((call) => call.arguments[1]?.params.page),
+        Array.from({ length: get.mock.callCount() }, (_, i) => i + 1)
+      );
+    });
+  }
+
+  it('rejects the entire retrieval if a later page fails, preserving error context', async () => {
+    const api = buildRadarr();
+    const failure = new Error('later page failed');
+    mock.method(
+      getAxios(api),
+      'get',
+      async (_url: string, config: { params: { page: number } }) => {
+        if (config.params.page === 2) throw failure;
+        return {
+          data: {
+            page: 1,
+            pageSize: 100,
+            totalRecords: 101,
+            records: Array.from({ length: 100 }, (_, i) => queueRecord(i)),
+          },
+        };
+      }
+    );
+    await assert.rejects(
+      api.getQueue(),
+      (error: Error & { cause?: unknown }) => {
+        assert.match(
+          error.message,
+          /\[Radarr\] Failed to retrieve queue: later page failed/
+        );
+        assert.equal(error.cause, failure);
+        return true;
+      }
+    );
+  });
+
+  for (const invalid of [
+    null,
+    { pageSize: undefined },
+    { pageSize: 0 },
+    { pageSize: -1 },
+    { pageSize: 1.5 },
+    { totalRecords: -1 },
+    { totalRecords: Infinity },
+    { totalRecords: 1.5 },
+    { page: 2 },
+    { records: null },
+    { records: [{}] },
+    { records: [] },
+  ]) {
+    it(`rejects invalid first-page metadata ${JSON.stringify(invalid)} without looping`, async () => {
+      const api = buildRadarr();
+      const get = mock.method(getAxios(api), 'get', async () => ({
+        data:
+          invalid === null
+            ? null
+            : {
+                page: 1,
+                pageSize: 100,
+                totalRecords: 1,
+                records: [queueRecord(1)],
+                ...invalid,
+              },
+      }));
+      await assert.rejects(api.getQueue(), /Failed to retrieve queue/);
+      assert.equal(get.mock.callCount(), 1);
+    });
+  }
+
+  for (const invalid of [
+    { page: 1 },
+    { totalRecords: 201 },
+    { pageSize: 50 },
+    { records: [] },
+    { records: [queueRecord(1)] },
+  ]) {
+    it(`rejects inconsistent or repeated later pages ${JSON.stringify(invalid)}`, async () => {
+      const api = buildRadarr();
+      const get = mock.method(
+        getAxios(api),
+        'get',
+        async (_url: string, config: { params: { page: number } }) => ({
+          data:
+            config.params.page === 1
+              ? {
+                  page: 1,
+                  pageSize: 100,
+                  totalRecords: 101,
+                  records: Array.from({ length: 100 }, (_, i) =>
+                    queueRecord(i + 1)
+                  ),
+                }
+              : {
+                  page: 2,
+                  pageSize: 100,
+                  totalRecords: 101,
+                  records: [queueRecord(101)],
+                  ...invalid,
+                },
+        })
+      );
+      await assert.rejects(api.getQueue(), /Failed to retrieve queue/);
+      assert.equal(get.mock.callCount(), 2);
+    });
+  }
+});
+
 describe('RadarrAPI removeMovie', () => {
   afterEach(() => mock.restoreAll());
 

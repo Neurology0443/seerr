@@ -28,7 +28,10 @@ import {
   MediaType,
 } from '@server/constants/media';
 import { MediaServerType } from '@server/constants/server';
-import type { MediaWatchDataResponse } from '@server/interfaces/api/mediaInterfaces';
+import type {
+  MediaDownloadsResponse,
+  MediaWatchDataResponse,
+} from '@server/interfaces/api/mediaInterfaces';
 import type { DownloadingItem } from '@server/lib/downloadtracker';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import type { MovieDetails } from '@server/models/Movie';
@@ -36,9 +39,9 @@ import type { TvDetails } from '@server/models/Tv';
 import axios from 'axios';
 import Link from 'next/link';
 import { useIntl } from 'react-intl';
-import useSWR from 'swr';
+import useSWR, { useSWRConfig } from 'swr';
 
-import type { JSX } from 'react';
+import { useEffect, type JSX } from 'react';
 
 const filterDuplicateDownloads = (
   items: DownloadingItem[] = []
@@ -134,11 +137,51 @@ const ManageSlideOver = ({
   const { data: sonarrData } = useSWR<SonarrSettings[]>(
     hasPermission(Permission.ADMIN) ? '/api/v1/settings/sonarr' : null
   );
+  const { mutate } = useSWRConfig();
+  const downloadsKey = data.mediaInfo?.id
+    ? `/api/v1/media/${data.mediaInfo.id}/downloads`
+    : null;
+  const canManageDownloads = hasPermission(Permission.MANAGE_REQUESTS);
+  const { data: downloadData, error: downloadError } =
+    useSWR<MediaDownloadsResponse>(
+      show && canManageDownloads ? downloadsKey : null,
+      { refreshInterval: 15000, dedupingInterval: 0 }
+    );
+  // Each opening starts with a fresh management snapshot. Mutating also
+  // discards any request still in flight when the panel closes.
+  useEffect(() => {
+    if ((!show || !canManageDownloads) && downloadsKey) {
+      void mutate(downloadsKey, undefined, { revalidate: false });
+    }
+  }, [show, canManageDownloads, downloadsKey, mutate]);
+
+  const nativeDownloads = [
+    {
+      serverId: data.mediaInfo?.serviceId,
+      name: undefined,
+      is4k: false,
+      downloads: data.mediaInfo?.downloadStatus ?? [],
+    },
+    {
+      serverId: data.mediaInfo?.serviceId4k,
+      name: undefined,
+      is4k: true,
+      downloads: data.mediaInfo?.downloadStatus4k ?? [],
+    },
+  ].filter((group) => group.downloads.length > 0);
+  const downloadGroups = downloadData?.groups ?? nativeDownloads;
+
+  const invalidateDownloads = () => {
+    if (downloadsKey)
+      void mutate(downloadsKey, undefined, { revalidate: true });
+  };
 
   const deleteMedia = async () => {
     if (data.mediaInfo) {
       try {
         await axios.delete(`/api/v1/media/${data.mediaInfo.id}`);
+        if (downloadsKey)
+          void mutate(downloadsKey, undefined, { revalidate: false });
         revalidate();
         onClose();
       } catch {
@@ -173,6 +216,7 @@ const ManageSlideOver = ({
       if (serverId !== undefined) {
         revalidateRequestData({ mediaType, tmdbId: data.id });
       }
+      invalidateDownloads();
       revalidate();
       onClose();
     }
@@ -271,39 +315,57 @@ const ManageSlideOver = ({
       subText={isMovie(data) ? data.title : data.name}
     >
       <div className="space-y-6">
-        {((data?.mediaInfo?.downloadStatus ?? []).length > 0 ||
-          (data?.mediaInfo?.downloadStatus4k ?? []).length > 0) && (
+        {(downloadGroups.some((group) => group.downloads.length > 0) ||
+          downloadError) && (
           <div>
             <h3 className="mb-2 text-xl font-bold">
               {intl.formatMessage(messages.downloadstatus)}
             </h3>
-            <div className="overflow-hidden rounded-md border border-gray-700 shadow">
-              <ul>
-                {filterDuplicateDownloads(data.mediaInfo?.downloadStatus).map(
-                  (status, index) => (
-                    <Tooltip
-                      key={`dl-status-${status.externalId}-${index}`}
-                      content={status.title}
-                    >
-                      <li className="border-b border-gray-700 last:border-b-0">
-                        <DownloadBlock downloadItem={status} />
-                      </li>
-                    </Tooltip>
-                  )
-                )}
-                {filterDuplicateDownloads(data.mediaInfo?.downloadStatus4k).map(
-                  (status, index) => (
-                    <Tooltip
-                      key={`dl-status-4k-${status.externalId}-${index}`}
-                      content={status.title}
-                    >
-                      <li className="border-b border-gray-700 last:border-b-0">
-                        <DownloadBlock downloadItem={status} is4k />
-                      </li>
-                    </Tooltip>
-                  )
-                )}
-              </ul>
+            {downloadError && (
+              <p role="alert" className="mb-2 text-sm text-red-400">
+                {intl.formatMessage(globalMessages.error)}
+              </p>
+            )}
+            <div className="space-y-3">
+              {downloadGroups
+                .filter((group) => group.downloads.length > 0)
+                .map((group) => (
+                  <div
+                    key={`${group.serverId}-${group.is4k}`}
+                    data-testid="manage-download-group"
+                  >
+                    {group.name && (
+                      <h4 className="mb-2 break-words font-semibold">
+                        {group.name} (
+                        {group.is4k
+                          ? '4K'
+                          : intl.formatMessage(messages.standard)}
+                        )
+                      </h4>
+                    )}
+                    <div className="overflow-hidden rounded-md border border-gray-700 shadow">
+                      <ul>
+                        {filterDuplicateDownloads(group.downloads).map(
+                          (status) => (
+                            <Tooltip
+                              key={`${group.serverId}-${status.downloadId}`}
+                              content={status.title}
+                            >
+                              <li className="border-b border-gray-700 last:border-b-0">
+                                <DownloadBlock
+                                  downloadItem={status}
+                                  is4k={group.is4k}
+                                  title={isMovie(data) ? data.title : data.name}
+                                  showReleaseTitle
+                                />
+                              </li>
+                            </Tooltip>
+                          )
+                        )}
+                      </ul>
+                    </div>
+                  </div>
+                ))}
             </div>
           </div>
         )}

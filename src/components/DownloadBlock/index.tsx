@@ -13,20 +13,25 @@ interface DownloadBlockProps {
   downloadItem: DownloadingItem;
   is4k?: boolean;
   title?: string;
+  showReleaseTitle?: boolean;
 }
 
 const DownloadBlock = ({
   downloadItem,
   is4k = false,
   title,
+  showReleaseTitle = false,
 }: DownloadBlockProps) => {
   const intl = useIntl();
   const { hasPermission } = useUser();
+  const canShowReleaseTitle =
+    hasPermission(Permission.ADMIN) ||
+    (showReleaseTitle && hasPermission(Permission.MANAGE_REQUESTS));
 
   return (
     <div className="p-4">
       <div className="mb-2 w-56 truncate text-sm sm:w-80 md:w-full">
-        {hasPermission(Permission.ADMIN)
+        {canShowReleaseTitle
           ? downloadItem.title
           : downloadItem.episode
             ? intl.formatMessage(messages.formattedTitle, {

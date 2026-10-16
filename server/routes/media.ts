@@ -9,11 +9,13 @@ import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import Season from '@server/entity/Season';
 import { User } from '@server/entity/User';
 import type {
+  MediaDownloadsResponse,
   MediaResultsResponse,
   MediaWatchDataResponse,
 } from '@server/interfaces/api/mediaInterfaces';
 import { notifyDeclinedRequests } from '@server/lib/destinationAvailability';
 import { persistConfirmedDestinationRemoval } from '@server/lib/destinationRemoval';
+import downloadTracker from '@server/lib/downloadtracker';
 import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -25,6 +27,97 @@ import type { FindOneOptions } from 'typeorm';
 import { EntityNotFoundError, In, IsNull, Not } from 'typeorm';
 
 const mediaRoutes = Router();
+
+mediaRoutes.get<{ id: string }, MediaDownloadsResponse>(
+  '/:id/downloads',
+  isAuthenticated(Permission.MANAGE_REQUESTS),
+  async (req, res, next) => {
+    const id = Number(req.params.id);
+    if (!/^\d+$/.test(req.params.id) || !Number.isSafeInteger(id) || id <= 0) {
+      return next({ status: 400, message: 'Invalid media ID' });
+    }
+    try {
+      const media = await getRepository(Media).findOneBy({ id });
+      if (!media) return next({ status: 404, message: 'Media not found' });
+
+      const servers =
+        media.mediaType === MediaType.TV
+          ? getSettings().sonarr
+          : getSettings().radarr;
+      const groups: MediaDownloadsResponse['groups'] = [];
+      for (const is4k of [false, true]) {
+        const serverId = is4k ? media.serviceId4k : media.serviceId;
+        const externalId = is4k
+          ? media.externalServiceId4k
+          : media.externalServiceId;
+        const server = servers.find(
+          (server) =>
+            server.id === serverId && !server.independentRequestDestination
+        );
+        const downloads =
+          (is4k ? media.downloadStatus4k : media.downloadStatus) ?? [];
+        if (
+          is4k &&
+          serverId === media.serviceId &&
+          externalId === media.externalServiceId
+        )
+          continue;
+        if (
+          server &&
+          typeof externalId === 'number' &&
+          Number.isSafeInteger(externalId) &&
+          externalId > 0 &&
+          downloads.length
+        ) {
+          const existing = groups.find((group) => group.serverId === server.id);
+          if (existing) existing.downloads.push(...downloads);
+          else
+            groups.push({
+              serverId: server.id,
+              name: server.name,
+              is4k: server.is4k,
+              isIndependent: false,
+              downloads: [...downloads],
+            });
+        }
+      }
+
+      const destinations = await getRepository(MediaDestinationStatus).findBy({
+        mediaId: id,
+      });
+      for (const destination of destinations) {
+        const server = servers.find(
+          (server) =>
+            server.id === destination.serverId &&
+            server.independentRequestDestination === true
+        );
+        const externalId = destination.externalServiceId;
+        if (
+          !server ||
+          typeof externalId !== 'number' ||
+          !Number.isSafeInteger(externalId) ||
+          externalId <= 0
+        )
+          continue;
+        const downloads =
+          media.mediaType === MediaType.TV
+            ? downloadTracker.getSeriesProgress(server.id, externalId)
+            : downloadTracker.getMovieProgress(server.id, externalId);
+        if (downloads.length)
+          groups.push({
+            serverId: server.id,
+            name: server.name,
+            is4k: server.is4k,
+            isIndependent: true,
+            downloads,
+          });
+      }
+      return res.json({ groups });
+    } catch (e) {
+      return next(e);
+    }
+  }
+);
 
 mediaRoutes.get('/', async (req, res, next) => {
   const mediaRepository = getRepository(Media);
