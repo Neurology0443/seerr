@@ -276,27 +276,12 @@ blocklistRoutes.delete(
     }
 
     try {
-      const blocklisteRepository = getRepository(Blocklist);
-
-      const blocklistItem = await blocklisteRepository.findOneOrFail({
-        where: {
-          tmdbId: Number(req.params.id),
-          mediaType,
-        },
+      await dataSource.transaction(async (em) => {
+        const blocklistItem = await em.getRepository(Blocklist).findOneOrFail({
+          where: { tmdbId: Number(req.params.id), mediaType },
+        });
+        await Blocklist.removeFromBlocklist(blocklistItem, em);
       });
-
-      await blocklisteRepository.remove(blocklistItem);
-
-      const mediaRepository = getRepository(Media);
-
-      const mediaItem = await mediaRepository.findOneOrFail({
-        where: {
-          tmdbId: Number(req.params.id),
-          mediaType: req.query.mediaType as MediaType,
-        },
-      });
-
-      await mediaRepository.remove(mediaItem);
 
       return res.status(204).send();
     } catch (e) {
@@ -326,27 +311,15 @@ blocklistRoutes.delete(
 
       await dataSource.transaction(async (em) => {
         const blocklistRepository = em.getRepository(Blocklist);
-        const mediaRepository = em.getRepository(Media);
+        for (const part of collection.parts) {
+          const blocklistItem = await blocklistRepository.findOne({
+            where: { tmdbId: part.id, mediaType: MediaType.MOVIE },
+          });
 
-        await Promise.all(
-          collection.parts.map(async (part) => {
-            const blocklistItem = await blocklistRepository.findOne({
-              where: { tmdbId: part.id, mediaType: MediaType.MOVIE },
-            });
-
-            if (blocklistItem) {
-              await blocklistRepository.remove(blocklistItem);
-
-              const mediaItem = await mediaRepository.findOne({
-                where: { tmdbId: part.id, mediaType: MediaType.MOVIE },
-              });
-
-              if (mediaItem) {
-                await mediaRepository.remove(mediaItem);
-              }
-            }
-          })
-        );
+          if (blocklistItem) {
+            await Blocklist.removeFromBlocklist(blocklistItem, em);
+          }
+        }
       });
 
       return res.status(204).send();

@@ -8,10 +8,12 @@ import {
   MediaType,
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import { Blocklist } from '@server/entity/Blocklist';
 import Media from '@server/entity/Media';
 import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import {
+  BlocklistedMediaError,
   DuplicateMediaRequestError,
   MediaRequest,
   NoSeasonsAvailableError,
@@ -44,7 +46,10 @@ const externalApiGetMock = mock.method(
     return {
       id: tmdbId,
       external_ids: {},
-      seasons: [1, 2, 3].map((season_number) => ({ season_number })),
+      seasons: [1, 2, 3].map((season_number) => ({
+        season_number,
+        episode_count: 10,
+      })),
       // Skips getMovie's localized fallback call
       videos: { results: [{ type: 'Trailer', key: 'trailer' }] },
     };
@@ -209,6 +214,46 @@ function rejections(results: PromiseSettledResult<MediaRequest>[]) {
 }
 
 describe('MediaRequest.request', () => {
+  it('DT-001 permits an auto-request after its independent target is DELETED', async () => {
+    configureIndependentServers();
+    const requester = await seedRequester(5);
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 98801,
+        mediaType: MediaType.MOVIE,
+        status: MediaStatus.UNKNOWN,
+        status4k: MediaStatus.UNKNOWN,
+      })
+    );
+    const previous = await getRepository(MediaRequest).save(
+      new MediaRequest({
+        media,
+        type: MediaType.MOVIE,
+        requestedBy: requester,
+        serverId: 101,
+        is4k: false,
+        isAutoRequest: true,
+        status: MediaRequestStatus.COMPLETED,
+      })
+    );
+    await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 101,
+        status: MediaStatus.DELETED,
+      })
+    );
+    const created = await MediaRequest.request(
+      {
+        mediaId: media.tmdbId,
+        mediaType: MediaType.MOVIE,
+      },
+      requester,
+      { isAutoRequest: true }
+    );
+    assert.equal(created.serverId, 101);
+    assert.notEqual(created.id, previous.id);
+  });
   it('rejects the second of two concurrent requests at the movie quota', async () => {
     const requestRepository = getRepository(MediaRequest);
     const requester = await seedRequester(1);
@@ -960,4 +1005,235 @@ describe('MediaRequest.request', () => {
       Notification.MEDIA_APPROVED
     );
   });
+});
+
+describe('PR8 real auto-request creation', () => {
+  for (const independent of [false, true]) {
+    it(`persists one Standard default target (independent=${independent})`, async () => {
+      configureIndependentServers();
+      getSettings().radarr[0].independentRequestDestination = independent;
+      const requester = await seedRequester(5);
+      const created = await MediaRequest.request(
+        { mediaId: 98802, mediaType: MediaType.MOVIE, is4k: false },
+        requester,
+        { isAutoRequest: true }
+      );
+      assert.equal(created.serverId, 101);
+      assert.equal(created.is4k, false);
+      assert.equal(created.isAutoRequest, true);
+      assert.equal(await getRepository(MediaRequest).count(), 1);
+    });
+  }
+
+  it('blocks across defaults until the original destination is DELETED, then uses the new default', async () => {
+    configureIndependentServers();
+    const requester = await seedRequester(5);
+    const previous = await MediaRequest.request(
+      { mediaId: 98803, mediaType: MediaType.MOVIE },
+      requester,
+      { isAutoRequest: true }
+    );
+    await getRepository(MediaRequest).update(previous.id, {
+      status: MediaRequestStatus.COMPLETED,
+    });
+    const destination = await getRepository(
+      MediaDestinationStatus
+    ).findOneByOrFail({ mediaId: previous.media.id, serverId: 101 });
+    getSettings().radarr[0].isDefault = false;
+    getSettings().radarr[1].isDefault = true;
+    for (const status of [
+      MediaStatus.AVAILABLE,
+      MediaStatus.PROCESSING,
+      MediaStatus.UNKNOWN,
+    ]) {
+      await getRepository(MediaDestinationStatus).update(destination.id, {
+        status,
+      });
+      await assert.rejects(
+        () =>
+          MediaRequest.request(
+            { mediaId: 98803, mediaType: MediaType.MOVIE },
+            requester,
+            { isAutoRequest: true }
+          ),
+        DuplicateMediaRequestError
+      );
+    }
+    await getRepository(MediaDestinationStatus).update(destination.id, {
+      status: MediaStatus.DELETED,
+    });
+    const created = await MediaRequest.request(
+      { mediaId: 98803, mediaType: MediaType.MOVIE },
+      requester,
+      { isAutoRequest: true }
+    );
+    assert.equal(created.serverId, 102);
+    assert.equal(
+      (await getRepository(MediaRequest).findOneByOrFail({ id: previous.id }))
+        .serverId,
+      101
+    );
+    assert.equal(await getRepository(MediaRequest).count(), 2);
+  });
+
+  for (const mediaType of [MediaType.MOVIE, MediaType.TV]) {
+    it(`rejects authoritative Blocklist membership for ${mediaType}`, async () => {
+      configureIndependentServers();
+      const requester = await seedRequester(5);
+      await Blocklist.addToBlocklist({
+        blocklistRequest: { tmdbId: 98804, mediaType },
+      });
+      await getRepository(Media).update(
+        { tmdbId: 98804 },
+        { status: MediaStatus.UNKNOWN, status4k: MediaStatus.UNKNOWN }
+      );
+      await assert.rejects(
+        () =>
+          MediaRequest.request(
+            { mediaId: 98804, mediaType, seasons: 'all' },
+            requester
+          ),
+        BlocklistedMediaError
+      );
+      assert.equal(await getRepository(MediaRequest).count(), 0);
+    });
+  }
+
+  it('TV all filters only occupied and non-requestable seasons of the resolved target', async () => {
+    configureIndependentServers();
+    const requester = await seedRequester(5);
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 98805,
+        mediaType: MediaType.TV,
+        status: MediaStatus.AVAILABLE,
+      })
+    );
+    const destinations = await getRepository(MediaDestinationStatus).save(
+      [201, 202].map(
+        (serverId) =>
+          new MediaDestinationStatus({
+            mediaId: media.id,
+            serverId,
+            status: MediaStatus.PARTIALLY_AVAILABLE,
+          })
+      )
+    );
+    await getRepository(MediaDestinationSeasonStatus).save([
+      new MediaDestinationSeasonStatus({
+        destinationStatusId: destinations[0].id,
+        seasonNumber: 1,
+        status: MediaStatus.AVAILABLE,
+      }),
+      new MediaDestinationSeasonStatus({
+        destinationStatusId: destinations[1].id,
+        seasonNumber: 3,
+        status: MediaStatus.AVAILABLE,
+      }),
+    ]);
+    await getRepository(MediaRequest).save(
+      new MediaRequest({
+        media,
+        type: MediaType.TV,
+        serverId: 201,
+        requestedBy: requester,
+        is4k: false,
+        status: MediaRequestStatus.PENDING,
+        seasons: [
+          new SeasonRequest({
+            seasonNumber: 2,
+            status: MediaRequestStatus.PENDING,
+          }),
+        ],
+      })
+    );
+    const created = await MediaRequest.request(
+      { mediaId: media.tmdbId, mediaType: MediaType.TV, seasons: 'all' },
+      requester,
+      { isAutoRequest: true }
+    );
+    assert.equal(created.serverId, 201);
+    assert.deepEqual(
+      created.seasons.map((s) => s.seasonNumber),
+      [3]
+    );
+    // A different user avoids the historical auto-request guard and exercises empty-season handling.
+    const other = await createRequester('tv-other@seerr.dev');
+    await assert.rejects(
+      () =>
+        MediaRequest.request(
+          { mediaId: media.tmdbId, mediaType: MediaType.TV, seasons: 'all' },
+          other,
+          { isAutoRequest: true }
+        ),
+      NoSeasonsAvailableError
+    );
+    assert.equal(await getRepository(MediaRequest).count(), 2);
+  });
+
+  it('native TV all retains its existing season selection and quota checks', async () => {
+    const requester = await seedRequester(5);
+    const created = await MediaRequest.request(
+      { mediaId: 98806, mediaType: MediaType.TV, seasons: 'all' },
+      requester,
+      { isAutoRequest: true }
+    );
+    assert.deepEqual(
+      created.seasons.map((s) => s.seasonNumber),
+      [1, 2, 3]
+    );
+    assert.equal(created.serverId, 20);
+    assert.equal(created.is4k, false);
+  });
+});
+
+describe('PR8 auto-request native rules', () => {
+  for (const independent of [false, true]) {
+    it(`enforces TV all quotas and preserves special-episode filtering (independent=${independent})`, async (t) => {
+      configureIndependentServers();
+      getSettings().sonarr[0].independentRequestDestination = independent;
+      const requester = await seedRequester(5);
+      requester.tvQuotaLimit = 2;
+      await getRepository(User).save(requester);
+      t.mock.method(
+        ExternalAPI.prototype as unknown as {
+          get: (endpoint: string) => Promise<unknown>;
+        },
+        'get',
+        async () => ({
+          id: 98807,
+          external_ids: {},
+          keywords: { results: [] },
+          seasons: [0, 1, 2, 3].map((season_number) => ({
+            season_number,
+            episode_count: 10,
+          })),
+        })
+      );
+      const body = {
+        mediaId: 98807,
+        mediaType: MediaType.TV,
+        seasons: 'all' as const,
+      };
+      await assert.rejects(
+        () => MediaRequest.request(body, requester, { isAutoRequest: true }),
+        QuotaRestrictedError
+      );
+      assert.equal(await getRepository(MediaRequest).count(), 0);
+      requester.tvQuotaLimit = 5;
+      await getRepository(User).save(requester);
+      const oldSpecials = getSettings().main.enableSpecialEpisodes;
+      t.after(() => {
+        getSettings().main.enableSpecialEpisodes = oldSpecials;
+      });
+      getSettings().main.enableSpecialEpisodes = false;
+      const created = await MediaRequest.request(body, requester, {
+        isAutoRequest: true,
+      });
+      assert.deepEqual(
+        created.seasons.map((s) => s.seasonNumber),
+        [1, 2, 3]
+      );
+    });
+  }
 });

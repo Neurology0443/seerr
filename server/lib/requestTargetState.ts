@@ -78,6 +78,7 @@ export const getConfiguredRequestTargetState = ({
   nativeStatus,
   activeRequests = [],
   seasonNumber,
+  isBlocklisted = false,
 }: {
   media?: Media;
   server: DVRSettings;
@@ -85,6 +86,7 @@ export const getConfiguredRequestTargetState = ({
   nativeStatus?: MediaStatus;
   activeRequests?: ClassifiedRequestTarget[];
   seasonNumber?: number;
+  isBlocklisted?: boolean;
 }): {
   isIndependent: boolean;
   status: MediaStatus;
@@ -117,7 +119,8 @@ export const getConfiguredRequestTargetState = ({
   return {
     isIndependent,
     status,
-    requestable: isRequestableDestinationStatus(status) && !occupied,
+    requestable:
+      !isBlocklisted && isRequestableDestinationStatus(status) && !occupied,
   };
 };
 

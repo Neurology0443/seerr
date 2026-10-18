@@ -4,6 +4,7 @@ import { type RatingResponse } from '@server/api/ratings';
 import TheMovieDb from '@server/api/themoviedb';
 import { MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import { Blocklist } from '@server/entity/Blocklist';
 import Media from '@server/entity/Media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import { Watchlist } from '@server/entity/Watchlist';
@@ -35,6 +36,9 @@ movieRoutes.get<{ id: string }, MovieRequestTarget[]>(
         },
         relations: { requests: true },
       });
+      const isBlocklisted = await getRepository(Blocklist).exists({
+        where: { tmdbId: Number(req.params.id), mediaType: MediaType.MOVIE },
+      });
       const destinations = media
         ? await getRepository(MediaDestinationStatus).find({
             where: { mediaId: media.id },
@@ -48,6 +52,7 @@ movieRoutes.get<{ id: string }, MovieRequestTarget[]>(
       const targets = await Promise.all(
         getSettings().radarr.map(async (server) => {
           const state = getConfiguredRequestTargetState({
+            isBlocklisted,
             media: media ?? undefined,
             server,
             destinationStatus: destinations.find(

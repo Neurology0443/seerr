@@ -5,6 +5,7 @@ import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import type { TmdbKeyword } from '@server/api/themoviedb/interfaces';
 import { MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import { Blocklist } from '@server/entity/Blocklist';
 import Media from '@server/entity/Media';
 import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
@@ -56,6 +57,9 @@ tvRoutes.get<{ id: string }, TvRequestTarget[]>(
         where: { tmdbId: Number(req.params.id), mediaType: MediaType.TV },
         relations: { requests: true },
       });
+      const isBlocklisted = await getRepository(Blocklist).exists({
+        where: { tmdbId: Number(req.params.id), mediaType: MediaType.TV },
+      });
       const destinations = media
         ? await getRepository(MediaDestinationStatus).find({
             where: { mediaId: media.id },
@@ -83,6 +87,7 @@ tvRoutes.get<{ id: string }, TvRequestTarget[]>(
           );
           const seasons = seasonNumbers.map((seasonNumber) => {
             const state = getConfiguredRequestTargetState({
+              isBlocklisted,
               server,
               destinationStatus: destinationSeasons.find(
                 (season) =>
@@ -103,6 +108,7 @@ tvRoutes.get<{ id: string }, TvRequestTarget[]>(
             };
           });
           const parentState = getConfiguredRequestTargetState({
+            isBlocklisted,
             media: media ?? undefined,
             server,
             destinationStatus: destination?.status,

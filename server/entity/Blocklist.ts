@@ -55,6 +55,26 @@ export class Blocklist implements BlocklistItem {
     Object.assign(this, init);
   }
 
+  public static async removeFromBlocklist(
+    blocklist: Blocklist,
+    manager: EntityManager
+  ): Promise<void> {
+    await manager.getRepository(Blocklist).remove(blocklist);
+    // There is no durable indication that a Media row was created solely as a
+    // Blocklist placeholder. Retain it rather than risk cascading useful data.
+    const mediaRepository = manager.getRepository(Media);
+    for (const status of ['status', 'status4k'] as const) {
+      await mediaRepository.update(
+        {
+          tmdbId: blocklist.tmdbId,
+          mediaType: blocklist.mediaType,
+          [status]: MediaStatus.BLOCKLISTED,
+        },
+        { [status]: MediaStatus.UNKNOWN }
+      );
+    }
+  }
+
   public static async addToBlocklist(
     {
       blocklistRequest,

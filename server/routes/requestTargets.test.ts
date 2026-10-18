@@ -11,6 +11,7 @@ import {
   MediaType,
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import { Blocklist } from '@server/entity/Blocklist';
 import Media from '@server/entity/Media';
 import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
@@ -656,6 +657,77 @@ describe('management projection without requests', () => {
           target.isIndependent,
           target.requestable,
         ])
+      );
+    });
+  }
+});
+
+describe('PR8 global Blocklist request targets', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    it(`blocks all ${type} targets and seasons without changing destination state`, async () => {
+      getSettings().radarr = [
+        radarr(1, { isDefault: true }),
+        radarr(2, { independentRequestDestination: true }),
+        radarr(3, { independentRequestDestination: true }),
+      ];
+      getSettings().sonarr = [
+        sonarr(1, { isDefault: true }),
+        sonarr(2, { independentRequestDestination: true }),
+        sonarr(3, { independentRequestDestination: true }),
+      ];
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 77001,
+          mediaType: type,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      const destination = await getRepository(MediaDestinationStatus).save(
+        new MediaDestinationStatus({
+          mediaId: media.id,
+          serverId: 2,
+          status: MediaStatus.UNKNOWN,
+        })
+      );
+      await getRepository(MediaDestinationSeasonStatus).save(
+        new MediaDestinationSeasonStatus({
+          destinationStatusId: destination.id,
+          seasonNumber: 1,
+          status: MediaStatus.DELETED,
+        })
+      );
+      await Blocklist.addToBlocklist({
+        blocklistRequest: { tmdbId: media.tmdbId, mediaType: type },
+      });
+      // Blocklist remains authoritative when native availability changes.
+      await getRepository(Media).update(media.id, {
+        status: MediaStatus.UNKNOWN,
+        status4k: MediaStatus.UNKNOWN,
+      });
+      const agent = await login();
+      const response = await agent.get(
+        `/${type}/${media.tmdbId}/request-targets`
+      );
+      assert.equal(response.status, 200);
+      assert.equal(response.body.length, 3);
+      for (const target of response.body) {
+        assert.equal(target.requestable, false);
+        for (const season of target.seasons ?? [])
+          assert.equal(season.requestable, false);
+      }
+      assert.deepEqual(
+        await getRepository(MediaDestinationStatus).findOneByOrFail({
+          id: destination.id,
+        }),
+        destination
+      );
+      assert.equal(
+        (
+          await getRepository(MediaDestinationSeasonStatus).findOneByOrFail({
+            destinationStatusId: destination.id,
+          })
+        ).status,
+        MediaStatus.DELETED
       );
     });
   }

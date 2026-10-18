@@ -1,6 +1,7 @@
 import PlexTvAPI from '@server/api/plextv';
 import { MediaStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import { Blocklist } from '@server/entity/Blocklist';
 import Media from '@server/entity/Media';
 import {
   BlocklistedMediaError,
@@ -13,6 +14,10 @@ import {
 import { User } from '@server/entity/User';
 import logger from '@server/logger';
 import { Permission } from './permissions';
+import {
+  getAutoRequestTargetStatus,
+  resolveRequestTarget,
+} from './requestTarget';
 
 class WatchlistSync {
   public async syncWatchlist() {
@@ -89,31 +94,25 @@ class WatchlistSync {
             .getMany()
         : [];
 
-    const autoRequestedTmdbIds = new Set(
-      existingAutoRequests
-        .filter(
-          (r) => r.media != null && r.media.status !== MediaStatus.DELETED
-        )
-        .map((r) => `${r.media.mediaType}:${r.media.tmdbId}`)
-    );
+    const autoRequestedTmdbIds = new Set<string>();
+    for (const request of existingAutoRequests) {
+      if (
+        request.media &&
+        (await getAutoRequestTargetStatus(
+          request,
+          requestRepository.manager
+        )) !== MediaStatus.DELETED
+      ) {
+        autoRequestedTmdbIds.add(
+          `${request.media.mediaType}:${request.media.tmdbId}`
+        );
+      }
+    }
 
     const unavailableItems = response.items.filter((i) => {
       const itemMediaType = i.type === 'show' ? MediaType.TV : MediaType.MOVIE;
 
-      return (
-        !autoRequestedTmdbIds.has(`${itemMediaType}:${i.tmdbId}`) &&
-        !mediaItems.find(
-          (m) =>
-            m.tmdbId === i.tmdbId &&
-            m.mediaType === itemMediaType &&
-            (m.status === MediaStatus.BLOCKLISTED ||
-              (itemMediaType === MediaType.MOVIE &&
-                m.status !== MediaStatus.UNKNOWN &&
-                m.status !== MediaStatus.DELETED) ||
-              (itemMediaType === MediaType.TV &&
-                m.status === MediaStatus.AVAILABLE))
-        )
-      );
+      return !autoRequestedTmdbIds.has(`${itemMediaType}:${i.tmdbId}`);
     });
 
     for (const mediaItem of unavailableItems) {
@@ -137,6 +136,31 @@ class WatchlistSync {
           ) ||
             !user.settings?.watchlistSyncTv) &&
             mediaItem.type === 'show')
+        ) {
+          continue;
+        }
+
+        const mediaType =
+          mediaItem.type === 'show' ? MediaType.TV : MediaType.MOVIE;
+        const media = mediaItems.find(
+          (m) => m.tmdbId === mediaItem.tmdbId && m.mediaType === mediaType
+        );
+        if (
+          await getRepository(Blocklist).exists({
+            where: { tmdbId: mediaItem.tmdbId, mediaType },
+          })
+        ) {
+          continue;
+        }
+        const target = resolveRequestTarget({ mediaType, is4k: false });
+        if (
+          media &&
+          (media.status === MediaStatus.BLOCKLISTED ||
+            (!target.isIndependent &&
+              (mediaType === MediaType.MOVIE
+                ? media.status !== MediaStatus.UNKNOWN &&
+                  media.status !== MediaStatus.DELETED
+                : media.status === MediaStatus.AVAILABLE)))
         ) {
           continue;
         }
