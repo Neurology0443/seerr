@@ -14,6 +14,10 @@ import { IssueCommentSubscriber } from '@server/subscriber/IssueCommentSubscribe
 import { IssueSubscriber } from '@server/subscriber/IssueSubscriber';
 import { setupTestDb } from '@server/test/db';
 import {
+  removalSnapshot,
+  seedRemoval,
+} from '@server/test/fixtures/destinationRemoval';
+import {
   assertNoCredentials,
   seedUserSettings,
 } from '@server/test/userSettings';
@@ -246,5 +250,34 @@ describe('GET /issueComment/:commentId', () => {
     assert.strictEqual(res.body.user.email, 'demo@seerr.dev');
     assert.ok(!('settings' in res.body.user));
     assertNoCredentials(res.body);
+  });
+});
+
+describe('PR8 global Issue isolation', () => {
+  it('creation, comments, resolving, reopening and deletion preserve destinations and requests', async () => {
+    const { media } = await seedRemoval(MediaType.TV);
+    const before = await removalSnapshot();
+    const agent = await loginAs('admin@seerr.dev', 'test1234');
+    const created = await agent.post('/issue').send({
+      issueType: IssueType.VIDEO,
+      message: 'FR playback issue',
+      mediaId: media.id,
+    });
+    assert.equal(created.status, 201);
+    assert.ok(!('serverId' in created.body));
+    assert.ok(!('destinationStatusId' in created.body));
+    const id = created.body.id;
+    assert.equal(
+      (
+        await agent
+          .post(`/issue/${id}/comment`)
+          .send({ message: 'More details' })
+      ).status,
+      200
+    );
+    assert.equal((await agent.post(`/issue/${id}/resolved`)).status, 200);
+    assert.equal((await agent.post(`/issue/${id}/open`)).status, 200);
+    assert.equal((await agent.delete(`/issue/${id}`)).status, 204);
+    assert.deepEqual(await removalSnapshot(), before);
   });
 });

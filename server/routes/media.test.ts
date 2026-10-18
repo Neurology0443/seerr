@@ -1152,3 +1152,62 @@ describe('native compatibility and Clear Data', () => {
     assert.equal(calls.length, 0);
   });
 });
+
+describe('PR8 native administrative availability', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    for (const is4k of [false, true]) {
+      it(`marks only native ${type} availability (4K=${is4k}) even with an independent serverId`, async () => {
+        const { media } = await seedRemoval(type);
+        await getRepository(Media).update(media.id, {
+          status: MediaStatus.UNKNOWN,
+          status4k: MediaStatus.UNKNOWN,
+        });
+        await getRepository(MediaDestinationStatus).update(
+          { mediaId: media.id, serverId: 2 },
+          { status: MediaStatus.PROCESSING }
+        );
+        if (type === MediaType.TV) {
+          const destination = await getRepository(
+            MediaDestinationStatus
+          ).findOneByOrFail({ mediaId: media.id, serverId: 2 });
+          await getRepository(MediaDestinationSeasonStatus).update(
+            { destinationStatusId: destination.id, seasonNumber: 2 },
+            { status: MediaStatus.UNKNOWN }
+          );
+        }
+        const before = await removalSnapshot();
+        const response = await request(app)
+          .post(`/media/${media.id}/available`)
+          .send({
+            is4k,
+            serverId: 2,
+            seasons: [{ seasonNumber: 1 }, { seasonNumber: 2 }],
+          });
+        assert.equal(response.status, 200);
+        const after = await removalSnapshot();
+        assert.equal(
+          after.media[0][is4k ? 'status4k' : 'status'],
+          MediaStatus.AVAILABLE
+        );
+        assert.equal(
+          after.media[0][is4k ? 'status' : 'status4k'],
+          MediaStatus.UNKNOWN
+        );
+        if (type === MediaType.TV) {
+          assert.equal(after.media[0].seasons.length, 2);
+          for (const season of after.media[0].seasons)
+            assert.equal(
+              season[is4k ? 'status4k' : 'status'],
+              MediaStatus.AVAILABLE
+            );
+        }
+        assert.deepEqual(after.destinations, before.destinations);
+        assert.deepEqual(after.seasons, before.seasons);
+        assert.deepEqual(
+          after.requests.map((r) => [r.id, r.status, r.serverId]),
+          before.requests.map((r) => [r.id, r.status, r.serverId])
+        );
+      });
+    }
+  }
+});

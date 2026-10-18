@@ -9,7 +9,6 @@ import type {
 import { MediaType } from '@server/constants/media';
 import dataSource from '@server/datasource';
 import { Blocklist } from '@server/entity/Blocklist';
-import Media from '@server/entity/Media';
 import type {
   RunnableScanner,
   StatusBase,
@@ -230,21 +229,20 @@ class BlocklistedTagProcessor implements RunnableScanner<StatusBase> {
   }
 
   private async cleanBlocklist(em: EntityManager) {
-    // Remove blocklist and media entries blocklisted by tags
-    const mediaRepository = em.getRepository(Media);
-    const mediaToRemove = await mediaRepository
-      .createQueryBuilder('media')
-      .innerJoinAndSelect(
-        Blocklist,
-        'blist',
-        'blist.tmdbId = media.tmdbId AND blist.mediaType = media.mediaType'
-      )
-      .where(`blist.blocklistedTags IS NOT NULL`)
-      .getMany();
-
-    // Batch removes so the query doesn't get too large
-    for (let i = 0; i < mediaToRemove.length; i += 500) {
-      await mediaRepository.remove(mediaToRemove.slice(i, i + 500)); // This also deletes the blocklist entries via cascading
+    const repository = em.getRepository(Blocklist);
+    // Each batch is removed, so no offset is needed.
+    while (true) {
+      const entries = await repository
+        .createQueryBuilder('blocklist')
+        .where('blocklist.blocklistedTags IS NOT NULL')
+        .orderBy('blocklist.id', 'ASC')
+        .take(500)
+        .getMany();
+      if (entries.length === 0) return;
+      for (const entry of entries) {
+        if (!this.running) throw new AbortTransaction();
+        await Blocklist.removeFromBlocklist(entry, em);
+      }
     }
   }
 }

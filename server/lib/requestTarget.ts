@@ -1,4 +1,4 @@
-import { MediaType } from '@server/constants/media';
+import { MediaStatus, MediaType } from '@server/constants/media';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import {
@@ -7,6 +7,7 @@ import {
   type RadarrSettings,
   type SonarrSettings,
 } from '@server/lib/settings';
+import logger from '@server/logger';
 import type { EntityManager } from 'typeorm';
 
 export class RequestTargetError extends Error {}
@@ -145,6 +146,33 @@ export const isNativeRequest = async (
 ): Promise<boolean> => !(await isIndependentRequest(request, manager));
 
 export const getConfiguredRequestServer = findConfiguredServer;
+
+// Historical auto-requests must never be interpreted using today's default.
+export const getAutoRequestTargetStatus = async (
+  request: Pick<MediaRequest, 'type' | 'serverId' | 'media' | 'is4k'>,
+  manager: EntityManager
+): Promise<MediaStatus> => {
+  if (await isIndependentRequest(request, manager)) {
+    const destination = await manager
+      .getRepository(MediaDestinationStatus)
+      .findOne({
+        where: { mediaId: request.media.id, serverId: request.serverId },
+      });
+    return destination?.status ?? MediaStatus.UNKNOWN;
+  }
+  if (request.serverId != null && !findConfiguredServer(request)) {
+    logger.warn(
+      'Preserving auto-request with ambiguous historical destination',
+      {
+        label: 'Watchlist Sync',
+        serverId: request.serverId,
+        mediaId: request.media.id,
+      }
+    );
+    return MediaStatus.UNKNOWN;
+  }
+  return request.media[request.is4k ? 'status4k' : 'status'];
+};
 
 export const getRequestTargetName = (
   request: Pick<MediaRequest, 'type' | 'serverId'>

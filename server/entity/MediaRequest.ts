@@ -1,4 +1,6 @@
+import { getMetadataProvider } from '@server/api/metadata';
 import TheMovieDb from '@server/api/themoviedb';
+import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -14,6 +16,7 @@ import {
   isRequestableDestinationStatus,
 } from '@server/lib/requestSlot';
 import {
+  getAutoRequestTargetStatus,
   getRequestTargetName,
   isIndependentRequest,
   isNativeRequest,
@@ -44,6 +47,7 @@ import {
   RelationCount,
   UpdateDateColumn,
 } from 'typeorm';
+import { Blocklist } from './Blocklist';
 import Media from './Media';
 import { MediaDestinationSeasonStatus } from './MediaDestinationSeasonStatus';
 import { MediaDestinationStatus } from './MediaDestinationStatus';
@@ -217,6 +221,18 @@ export class MediaRequest {
       relations: ['requests'],
     });
 
+    if (
+      (await getRepository(Blocklist).exists({
+        where: {
+          tmdbId: requestBody.mediaId,
+          mediaType: requestBody.mediaType,
+        },
+      })) ||
+      media?.status === MediaStatus.BLOCKLISTED
+    ) {
+      throw new BlocklistedMediaError('This media is blocklisted.');
+    }
+
     if (!media) {
       media = new Media({
         tmdbId: tmdbMedia.id,
@@ -234,16 +250,6 @@ export class MediaRequest {
         mediaType: requestBody.mediaType,
       });
     } else {
-      if (media.status === MediaStatus.BLOCKLISTED) {
-        logger.warn('Request for media blocked due to being blocklisted', {
-          tmdbId: tmdbMedia.id,
-          mediaType: requestBody.mediaType,
-          label: 'Media Request',
-        });
-
-        throw new BlocklistedMediaError('This media is blocklisted.');
-      }
-
       if (
         !target.isIndependent &&
         (media.status === MediaStatus.UNKNOWN ||
@@ -272,6 +278,27 @@ export class MediaRequest {
       .andWhere('media.mediaType = :mediaType', {
         mediaType: requestBody.mediaType,
       });
+
+    // Automatic duplicate protection spans destinations; slot occupancy does not.
+    const historicalAutoRequests = options.isAutoRequest
+      ? await existingQuery
+          .clone()
+          .andWhere('request.isAutoRequest = :auto', { auto: true })
+          .andWhere('request.requestedBy = :userId', { userId: requestUser.id })
+          .getMany()
+      : [];
+    for (const previous of historicalAutoRequests) {
+      if (
+        (await getAutoRequestTargetStatus(
+          previous,
+          requestRepository.manager
+        )) !== MediaStatus.DELETED
+      ) {
+        throw new DuplicateMediaRequestError(
+          'Auto-request for this media and user already exists.'
+        );
+      }
+    }
 
     existingQuery = target.isIndependent
       ? existingQuery.andWhere('request.serverId = :serverId', {
@@ -317,18 +344,19 @@ export class MediaRequest {
 
       // If an existing auto-request for this media exists from the same user,
       // don't allow a new one.
-      const statusKey = requestBody.is4k ? 'status4k' : 'status';
-      if (
-        existing.find(
-          (r) =>
-            r.requestedBy.id === requestUser.id &&
-            r.isAutoRequest &&
-            r.media?.[statusKey] !== MediaStatus.DELETED
-        )
-      ) {
-        throw new DuplicateMediaRequestError(
-          'Auto-request for this media and user already exists.'
-        );
+      for (const previous of existing.filter(
+        (r) => r.requestedBy.id === requestUser.id && r.isAutoRequest
+      )) {
+        if (
+          (await getAutoRequestTargetStatus(
+            previous,
+            requestRepository.manager
+          )) !== MediaStatus.DELETED
+        ) {
+          throw new DuplicateMediaRequestError(
+            'Auto-request for this media and user already exists.'
+          );
+        }
       }
     }
 
@@ -458,15 +486,27 @@ export class MediaRequest {
       const tmdbMediaShow = tmdbMedia as Awaited<
         ReturnType<typeof tmdb.getTvShow>
       >;
-      let requestedSeasons =
-        requestBody.seasons === 'all'
-          ? tmdbMediaShow.seasons
-              .filter(
-                (season) =>
-                  season.season_number !== 0 && season.episode_count > 0
-              )
-              .map((season) => season.season_number)
-          : (requestBody.seasons as number[]);
+      let requestedSeasons = requestBody.seasons as number[];
+      if (requestBody.seasons === 'all') {
+        const metadataProvider = await getMetadataProvider(
+          tmdbMediaShow.keywords.results.some(
+            (keyword) => keyword.id === ANIME_KEYWORD_ID
+          )
+            ? 'anime'
+            : 'tv'
+        );
+        const show = await metadataProvider.getTvShow({
+          tvId: requestBody.mediaId,
+        });
+        requestedSeasons = show.seasons
+          .filter(
+            (season) =>
+              Number.isInteger(season.season_number) &&
+              season.season_number >= 0 &&
+              season.episode_count > 0
+          )
+          .map((season) => season.season_number);
+      }
       if (!settings.main.enableSpecialEpisodes) {
         requestedSeasons = requestedSeasons.filter((sn) => sn > 0);
       }

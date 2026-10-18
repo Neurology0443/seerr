@@ -4,6 +4,7 @@ import {
   MediaStatus as S,
 } from '@server/constants/media';
 import dataSource, { getRepository } from '@server/datasource';
+import { Blocklist } from '@server/entity/Blocklist';
 import Media from '@server/entity/Media';
 import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
@@ -274,7 +275,7 @@ describe('Quick Request local visibility', () => {
         )
       );
       // TypeORM also batches the existing MediaRequest seasonCount relation.
-      assert.equal(queries.length, 5);
+      assert.equal(queries.length, 6);
       assert.ok(queries.every((query) => query.startsWith('SELECT')));
       assert.ok(items.every((item) => item.quickRequestable === undefined));
       queries.length = 0;
@@ -299,5 +300,95 @@ describe('Quick Request local visibility', () => {
     } finally {
       spy.mock.restore();
     }
+  });
+});
+
+describe('PR8 Quick Request authoritative Blocklist', () => {
+  for (const type of [MediaType.MOVIE, MediaType.TV]) {
+    for (const independent of [false, true]) {
+      it(`blocks ${type} on ${independent ? 'independent' : 'native'} targets after native status changes`, async () => {
+        const key = type === MediaType.MOVIE ? 'radarr' : 'sonarr';
+        getSettings()[key] = [server(1, independent)];
+        const m = await media(type);
+        if (independent)
+          await destination(
+            m,
+            1,
+            S.UNKNOWN,
+            type === MediaType.TV ? [[1, S.UNKNOWN]] : []
+          );
+        else if (type === MediaType.TV)
+          await getRepository(Season).save(
+            new Season({
+              media: Promise.resolve(m),
+              seasonNumber: 1,
+              status: S.UNKNOWN,
+            })
+          );
+        assert.equal(await project(m), true);
+        await Blocklist.addToBlocklist({
+          blocklistRequest: { tmdbId: m.tmdbId, mediaType: type },
+        });
+        await getRepository(Media).update(m.id, {
+          status: S.UNKNOWN,
+          status4k: S.UNKNOWN,
+        });
+        const queries: string[] = [];
+        const spy = mock.method(
+          dataSource.logger,
+          'logQuery',
+          (query: string) => queries.push(query)
+        );
+        try {
+          // The input deliberately retains UNKNOWN: the native-status shortcut cannot help.
+          assert.equal(m.status, S.UNKNOWN);
+          assert.equal(await project(m), false);
+          assert.ok(queries.every((query) => query.startsWith('SELECT')));
+        } finally {
+          spy.mock.restore();
+        }
+      });
+    }
+  }
+
+  it('batches exact media identities across mixed results, including media without a local Media row', async () => {
+    getSettings().radarr = [server(1, true)];
+    getSettings().sonarr = [server(1, true)];
+    const movie = await media();
+    const tv = await media(MediaType.TV);
+    const entries = await getRepository(Blocklist).save([
+      new Blocklist({ tmdbId: movie.tmdbId, mediaType: MediaType.MOVIE }),
+      new Blocklist({ tmdbId: 456, mediaType: MediaType.TV }),
+    ]);
+    const items = [
+      result(movie),
+      result(tv),
+      { ...result(undefined, 'tv'), id: 456 },
+      { ...result(), id: 789 },
+    ];
+    const queries: string[] = [];
+    const spy = mock.method(dataSource.logger, 'logQuery', (query: string) =>
+      queries.push(query)
+    );
+    try {
+      const projected = await enrichQuickRequestVisibility(items, user());
+      assert.deepEqual(
+        projected.map((item) => item.quickRequestable),
+        [false, true, false, true]
+      );
+      assert.equal(
+        queries.filter((query) => query.includes('FROM "blocklist"')).length,
+        1
+      );
+      assert.ok(items.every((item) => item.quickRequestable === undefined));
+    } finally {
+      spy.mock.restore();
+    }
+    await getRepository(Blocklist).remove(entries);
+    assert.ok(
+      (await enrichQuickRequestVisibility(items, user())).every(
+        (item) => item.quickRequestable
+      )
+    );
   });
 });

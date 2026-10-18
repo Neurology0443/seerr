@@ -1,5 +1,6 @@
 import { MediaStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import { Blocklist } from '@server/entity/Blocklist';
 import Media from '@server/entity/Media';
 import { MediaDestinationSeasonStatus } from '@server/entity/MediaDestinationSeasonStatus';
 import { MediaDestinationStatus } from '@server/entity/MediaDestinationStatus';
@@ -68,6 +69,18 @@ export const enrichQuickRequestVisibility = async <T extends Results>(
           .filter((id): id is number => id !== undefined)
       ),
     ];
+    const blocklistedMedia = eligible.length
+      ? await getRepository(Blocklist)
+          .createQueryBuilder('blocklist')
+          .select(['blocklist.tmdbId', 'blocklist.mediaType'])
+          .where('blocklist.tmdbId IN (:...tmdbIds)', {
+            tmdbIds: [...new Set(eligible.map((result) => result.id))],
+          })
+          .getMany()
+      : [];
+    const blocklistedIdentities = new Set(
+      blocklistedMedia.map((item) => `${item.mediaType}:${item.tmdbId}`)
+    );
     // QueryBuilder does not load eager seasons. Load only native seasons here,
     // without users, downloads, or management relations from the original lookup.
     const [requests, destinations, nativeMedia, destinationSeasons] =
@@ -144,6 +157,9 @@ export const enrichQuickRequestVisibility = async <T extends Results>(
       if (!eligibleSet.has(result))
         return { ...result, quickRequestable: false };
       const media = result.mediaInfo;
+      const isBlocklisted = blocklistedIdentities.has(
+        `${result.mediaType}:${result.id}`
+      );
       const mediaRequests = media ? (requestsByMedia.get(media.id) ?? []) : [];
       // Batch-safe isIndependentRequest semantics: configured role first,
       // otherwise a retained destination row identifies a deleted server.
@@ -182,6 +198,7 @@ export const enrichQuickRequestVisibility = async <T extends Results>(
           return inventory.some(
             (seasonNumber) =>
               getConfiguredRequestTargetState({
+                isBlocklisted,
                 media,
                 server,
                 activeRequests,
@@ -199,6 +216,7 @@ export const enrichQuickRequestVisibility = async <T extends Results>(
         }
         // Empty TV inventory retains the controlled parent-state fallback.
         return getConfiguredRequestTargetState({
+          isBlocklisted,
           media,
           server,
           activeRequests,
