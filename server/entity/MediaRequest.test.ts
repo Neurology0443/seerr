@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { beforeEach, describe, it, mock } from 'node:test';
 
 import ExternalAPI from '@server/api/externalapi';
+import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
+import Tvdb from '@server/api/tvdb';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -20,15 +22,17 @@ import {
   QuotaRestrictedError,
   RequestPermissionError,
 } from '@server/entity/MediaRequest';
+import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import { Notification } from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
 import { RequestTargetError } from '@server/lib/requestTarget';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
-import { getSettings } from '@server/lib/settings';
+import { MetadataProviderType, getSettings } from '@server/lib/settings';
 import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
+import type { TestContext } from 'node:test';
 
 // get is a prototype method unlike getMovie, and replaces the cache lookup too
 const externalApiGetMock = mock.method(
@@ -46,6 +50,7 @@ const externalApiGetMock = mock.method(
     return {
       id: tmdbId,
       external_ids: {},
+      keywords: { results: [] },
       seasons: [1, 2, 3].map((season_number) => ({
         season_number,
         episode_count: 10,
@@ -67,6 +72,11 @@ setupTestDb();
 beforeEach(() => {
   externalApiGetMock.resetCalls();
   sendNotificationMock.resetCalls();
+  getSettings().metadataSettings = {
+    tv: MetadataProviderType.TMDB,
+    anime: MetadataProviderType.TMDB,
+  };
+  getSettings().main.enableSpecialEpisodes = false;
   getSettings().radarr = [
     {
       id: 10,
@@ -1235,5 +1245,319 @@ describe('PR8 auto-request native rules', () => {
         [1, 2, 3]
       );
     });
+  }
+});
+
+function configureAllSeasonMetadata(
+  t: TestContext,
+  {
+    tv = MetadataProviderType.TVDB,
+    anime = MetadataProviderType.TMDB,
+    isAnime = false,
+    specials = false,
+    specialEpisodes = 1,
+    fallback,
+  }: {
+    tv?: MetadataProviderType;
+    anime?: MetadataProviderType;
+    isAnime?: boolean;
+    specials?: boolean;
+    specialEpisodes?: number;
+    fallback?: 'initialization' | 'metadata';
+  } = {}
+) {
+  getSettings().metadataSettings = { tv, anime };
+  getSettings().main.enableSpecialEpisodes = specials;
+  t.mock.method(
+    ExternalAPI.prototype as unknown as {
+      get: (endpoint: string) => Promise<unknown>;
+    },
+    'get',
+    async (endpoint: string) => ({
+      id: Number(endpoint.replace('/tv/', '')),
+      external_ids: { tvdb_id: 1234 },
+      keywords: { results: isAnime ? [{ id: ANIME_KEYWORD_ID }] : [] },
+      videos: { results: [{ type: 'Trailer', key: 'trailer' }] },
+      seasons: [-1, 0, 1, 1.5, 2, 4].map((season_number) => ({
+        season_number,
+        episode_count:
+          season_number === 4 ? 0 : season_number === 0 ? specialEpisodes : 10,
+      })),
+    })
+  );
+  const tvdb = new Tvdb();
+  t.mock.method(tvdb, 'login', async () => ({ token: 'test-token' }));
+  Object.defineProperty(tvdb, 'get', {
+    value: async () => {
+      if (fallback === 'metadata')
+        throw new Error('TheTVDB metadata unavailable');
+      return {
+        data: {
+          id: 1234,
+          seasons: [0, 1, 2, 3, 4].map((number) => ({
+            number,
+            type: { type: 'official' },
+          })),
+          episodes: [...(specialEpisodes ? [0] : []), 1, 2, 3].map(
+            (seasonNumber) => ({ seasonNumber })
+          ),
+        },
+      };
+    },
+  });
+  return t.mock.method(Tvdb, 'getInstance', async () => {
+    if (fallback === 'initialization')
+      throw new Error('TheTVDB initialization unavailable');
+    return tvdb;
+  });
+}
+
+async function persistedSeasonNumbers(created: MediaRequest) {
+  const persisted = await getRepository(MediaRequest).findOneByOrFail({
+    id: created.id,
+  });
+  return persisted.seasons
+    .map((season) => season.seasonNumber)
+    .sort((a, b) => a - b);
+}
+
+describe('PR8 corrected TV all inventory', () => {
+  for (const independent of [false, true]) {
+    it(`persists TheTVDB-only seasons (independent=${independent})`, async (t) => {
+      configureAllSeasonMetadata(t);
+      if (independent) configureIndependentServers();
+      const requester = await seedRequester(5);
+      const created = await MediaRequest.request(
+        { mediaId: 99001, mediaType: MediaType.TV, seasons: 'all' },
+        requester,
+        { isAutoRequest: true }
+      );
+      assert.deepEqual(await persistedSeasonNumbers(created), [1, 2, 3]);
+      assert.equal(created.serverId, independent ? 201 : 20);
+    });
+  }
+
+  it('filters the configured provider inventory on FR while leaving EN independently requestable', async (t) => {
+    configureAllSeasonMetadata(t);
+    configureIndependentServers();
+    const requester = await seedRequester(5);
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 99002,
+        mediaType: MediaType.TV,
+        status: MediaStatus.AVAILABLE,
+      })
+    );
+    const fr = await getRepository(MediaDestinationStatus).save(
+      new MediaDestinationStatus({
+        mediaId: media.id,
+        serverId: 201,
+        status: MediaStatus.PARTIALLY_AVAILABLE,
+      })
+    );
+    await getRepository(MediaDestinationSeasonStatus).save(
+      [1, 2].map(
+        (seasonNumber) =>
+          new MediaDestinationSeasonStatus({
+            destinationStatusId: fr.id,
+            seasonNumber,
+            status: MediaStatus.AVAILABLE,
+          })
+      )
+    );
+    const body = {
+      mediaId: media.tmdbId,
+      mediaType: MediaType.TV,
+      seasons: 'all' as const,
+    };
+    const frRequest = await MediaRequest.request(body, requester, {
+      isAutoRequest: true,
+    });
+    assert.deepEqual(await persistedSeasonNumbers(frRequest), [3]);
+    // Explicitly requesting another destination remains independent of FR auto-history.
+    const enRequest = await MediaRequest.request(
+      { ...body, serverId: 202 },
+      requester
+    );
+    assert.deepEqual(await persistedSeasonNumbers(enRequest), [1, 2, 3]);
+    assert.equal(
+      (await getRepository(Media).findOneByOrFail({ id: media.id })).status,
+      MediaStatus.AVAILABLE
+    );
+    assert.deepEqual(
+      (
+        await getRepository(MediaDestinationSeasonStatus).findBy({
+          destinationStatusId: fr.id,
+        })
+      )
+        .filter((s) => s.seasonNumber < 3)
+        .map((s) => s.status),
+      [MediaStatus.AVAILABLE, MediaStatus.AVAILABLE]
+    );
+    const other = await createRequester('all-inventory-other@seerr.dev');
+    await assert.rejects(
+      () => MediaRequest.request(body, other),
+      NoSeasonsAvailableError
+    );
+    assert.equal(await getRepository(MediaRequest).count(), 2);
+  });
+
+  it('uses TMDB when configured and does not resolve another provider for explicit seasons', async (t) => {
+    const tvdb = configureAllSeasonMetadata(t, {
+      tv: MetadataProviderType.TMDB,
+    });
+    const requester = await seedRequester(5);
+    const created = await MediaRequest.request(
+      { mediaId: 99003, mediaType: MediaType.TV, seasons: 'all' },
+      requester
+    );
+    assert.deepEqual(await persistedSeasonNumbers(created), [1, 2]);
+    assert.equal(tvdb.mock.callCount(), 0);
+    getSettings().metadataSettings.tv = MetadataProviderType.TVDB;
+    const explicit = await MediaRequest.request(
+      { mediaId: 99003, mediaType: MediaType.TV, seasons: [7] },
+      requester
+    );
+    assert.deepEqual(await persistedSeasonNumbers(explicit), [7]);
+    assert.equal(tvdb.mock.callCount(), 0);
+  });
+
+  for (const animeProvider of [
+    MetadataProviderType.TMDB,
+    MetadataProviderType.TVDB,
+  ]) {
+    it(`respects the separate anime provider (${animeProvider})`, async (t) => {
+      const tvdb = configureAllSeasonMetadata(t, {
+        tv:
+          animeProvider === MetadataProviderType.TMDB
+            ? MetadataProviderType.TVDB
+            : MetadataProviderType.TMDB,
+        anime: animeProvider,
+        isAnime: true,
+      });
+      const requester = await seedRequester(5);
+      const created = await MediaRequest.request(
+        { mediaId: 99005, mediaType: MediaType.TV, seasons: 'all' },
+        requester
+      );
+      assert.deepEqual(
+        await persistedSeasonNumbers(created),
+        animeProvider === MetadataProviderType.TVDB ? [1, 2, 3] : [1, 2]
+      );
+      assert.equal(
+        tvdb.mock.callCount(),
+        animeProvider === MetadataProviderType.TVDB ? 1 : 0
+      );
+    });
+  }
+
+  for (const fallback of ['initialization', 'metadata'] as const) {
+    it(`retains TMDB fallback on TheTVDB ${fallback} failure`, async (t) => {
+      configureAllSeasonMetadata(t, { fallback });
+      const requester = await seedRequester(5);
+      const created = await MediaRequest.request(
+        { mediaId: 99006, mediaType: MediaType.TV, seasons: 'all' },
+        requester
+      );
+      assert.deepEqual(await persistedSeasonNumbers(created), [1, 2]);
+    });
+  }
+
+  for (const independent of [false, true]) {
+    for (const provider of [
+      MetadataProviderType.TMDB,
+      MetadataProviderType.TVDB,
+    ]) {
+      for (const specials of [false, true]) {
+        it(`persists eligible specials only when enabled (independent=${independent}, provider=${provider}, enabled=${specials})`, async (t) => {
+          configureAllSeasonMetadata(t, { tv: provider, specials });
+          if (independent) configureIndependentServers();
+          const requester = await seedRequester(5);
+          const created = await MediaRequest.request(
+            { mediaId: 99007, mediaType: MediaType.TV, seasons: 'all' },
+            requester,
+            { isAutoRequest: true }
+          );
+          const regular =
+            provider === MetadataProviderType.TVDB ? [1, 2, 3] : [1, 2];
+          assert.deepEqual(
+            await persistedSeasonNumbers(created),
+            specials ? [0, ...regular] : regular
+          );
+        });
+      }
+    }
+  }
+
+  for (const specialState of ['empty', 'available', 'active'] as const) {
+    for (const independent of [false, true]) {
+      it(`excludes ${specialState} specials on the resolved target (independent=${independent})`, async (t) => {
+        configureAllSeasonMetadata(t, {
+          specials: true,
+          specialEpisodes: specialState === 'empty' ? 0 : 1,
+        });
+        if (independent) configureIndependentServers();
+        const requester = await seedRequester(5);
+        const media = await getRepository(Media).save(
+          new Media({
+            tmdbId: 99008,
+            mediaType: MediaType.TV,
+            status: MediaStatus.UNKNOWN,
+          })
+        );
+        const serverId = independent ? 201 : 20;
+        if (specialState === 'available') {
+          if (independent) {
+            const destination = await getRepository(
+              MediaDestinationStatus
+            ).save(
+              new MediaDestinationStatus({
+                mediaId: media.id,
+                serverId,
+                status: MediaStatus.PARTIALLY_AVAILABLE,
+              })
+            );
+            await getRepository(MediaDestinationSeasonStatus).save(
+              new MediaDestinationSeasonStatus({
+                destinationStatusId: destination.id,
+                seasonNumber: 0,
+                status: MediaStatus.AVAILABLE,
+              })
+            );
+          } else {
+            await getRepository(Season).save(
+              new Season({
+                media: Promise.resolve(media),
+                seasonNumber: 0,
+                status: MediaStatus.AVAILABLE,
+              })
+            );
+          }
+        } else if (specialState === 'active') {
+          await getRepository(MediaRequest).save(
+            new MediaRequest({
+              media,
+              type: MediaType.TV,
+              serverId,
+              is4k: false,
+              requestedBy: requester,
+              status: MediaRequestStatus.PENDING,
+              seasons: [
+                new SeasonRequest({
+                  seasonNumber: 0,
+                  status: MediaRequestStatus.PENDING,
+                }),
+              ],
+            })
+          );
+        }
+        const created = await MediaRequest.request(
+          { mediaId: media.tmdbId, mediaType: MediaType.TV, seasons: 'all' },
+          requester,
+          { isAutoRequest: true }
+        );
+        assert.deepEqual(await persistedSeasonNumbers(created), [1, 2, 3]);
+      });
+    }
   }
 });

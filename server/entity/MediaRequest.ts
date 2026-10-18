@@ -1,4 +1,6 @@
+import { getMetadataProvider } from '@server/api/metadata';
 import TheMovieDb from '@server/api/themoviedb';
+import { ANIME_KEYWORD_ID } from '@server/api/themoviedb/constants';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -484,15 +486,27 @@ export class MediaRequest {
       const tmdbMediaShow = tmdbMedia as Awaited<
         ReturnType<typeof tmdb.getTvShow>
       >;
-      let requestedSeasons =
-        requestBody.seasons === 'all'
-          ? tmdbMediaShow.seasons
-              .filter(
-                (season) =>
-                  season.season_number !== 0 && season.episode_count > 0
-              )
-              .map((season) => season.season_number)
-          : (requestBody.seasons as number[]);
+      let requestedSeasons = requestBody.seasons as number[];
+      if (requestBody.seasons === 'all') {
+        const metadataProvider = await getMetadataProvider(
+          tmdbMediaShow.keywords.results.some(
+            (keyword) => keyword.id === ANIME_KEYWORD_ID
+          )
+            ? 'anime'
+            : 'tv'
+        );
+        const show = await metadataProvider.getTvShow({
+          tvId: requestBody.mediaId,
+        });
+        requestedSeasons = show.seasons
+          .filter(
+            (season) =>
+              Number.isInteger(season.season_number) &&
+              season.season_number >= 0 &&
+              season.episode_count > 0
+          )
+          .map((season) => season.season_number);
+      }
       if (!settings.main.enableSpecialEpisodes) {
         requestedSeasons = requestedSeasons.filter((sn) => sn > 0);
       }
