@@ -11,8 +11,26 @@ const migrationRoot = path.resolve(__dirname, '../migration');
 const destinationMigration = '1791000000000-AddMediaDestinationTables.ts';
 const destinationTables = ['media_destination', 'media_destination_season'];
 
+async function getApplicationTables(queryRunner: QueryRunner) {
+  if (queryRunner.connection.options.type !== 'postgres') {
+    return queryRunner.getTables();
+  }
+
+  // TypeORM 0.3.31 includes system schemas when getTables() has no arguments.
+  const tables: { table_schema: string; table_name: string }[] =
+    await queryRunner.query(`
+      SELECT table_schema, table_name
+      FROM information_schema.tables
+      WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+      ORDER BY table_name
+    `);
+  return queryRunner.getTables(
+    tables.map((table) => `${table.table_schema}.${table.table_name}`)
+  );
+}
+
 async function snapshotNative(queryRunner: QueryRunner) {
-  const tables = (await queryRunner.getTables())
+  const tables = (await getApplicationTables(queryRunner))
     .filter((table) => !destinationTables.includes(table.name))
     .sort((a, b) => a.name.localeCompare(b.name));
   return {
@@ -112,7 +130,7 @@ async function verifyMigrations(options: DataSourceOptions, t: TestContext) {
       async () => {
         assert.deepEqual(await snapshotNative(db), before);
         assert.deepEqual(
-          (await db.getTables()).map((table) => table.name).sort(),
+          (await getApplicationTables(db)).map((table) => table.name).sort(),
           [...before.tableNames, ...destinationTables].sort()
         );
         for (const [name, columns, unique, foreignKey] of [
@@ -373,16 +391,19 @@ it(
         ),
         [{ datname: 'postgres' }, { datname: 'seerr_migration_control' }]
       );
-      const queryRunner = control.createQueryRunner();
-      try {
-        assert.deepEqual(
-          await queryRunner.getTables(),
-          [],
-          'The disposable control database must be empty.'
-        );
-      } finally {
-        await queryRunner.release();
-      }
+      // Inspect every non-system schema, including views and sequences, so a
+      // populated control DB cannot pass by hiding objects outside public.
+      assert.deepEqual(
+        await control.query(`
+          SELECT n.nspname AS "schema", c.relname AS "name", c.relkind AS "kind"
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+          ORDER BY n.nspname, c.relname
+        `),
+        [],
+        'The disposable control database must be empty.'
+      );
       await control.query(`CREATE DATABASE "${database}" TEMPLATE template0`);
       created = true;
       await verifyMigrations({ ...options, database }, t);
