@@ -79,5 +79,13 @@ jobs:
           SEERR_MIGRATION_PG_PASSWORD: pr9-${{ github.run_id }}-${{ github.run_attempt }}
         run: pnpm test
 
+      - name: PostgreSQL request list/count SQL regression
+        env:
+          CI: true
+          SEERR_REQUEST_PG_DISPOSABLE: 'true'
+          SEERR_REQUEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          SEERR_REQUEST_PG_PASSWORD: pr9-${{ github.run_id }}-${{ github.run_attempt }}
+        run: pnpm test server/routes/requestStatusSql.test.ts
+
       - name: Build
         run: pnpm build
