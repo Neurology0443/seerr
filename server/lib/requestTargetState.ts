@@ -272,6 +272,9 @@ export const addEffectiveTargetStatusJoin = <Entity extends ObjectLiteral>(
   const requestAlias = aliases.request ?? 'request';
   const mediaAlias = aliases.media ?? 'media';
   const destinationAlias = aliases.destination ?? 'targetDestination';
+  // TypeORM's property replacement can miss identifiers followed by a newline.
+  const destinationColumn = (column: string) =>
+    `${query.escape(destinationAlias)}.${query.escape(column)}`;
   const settings = getSettings();
   const configuredRadarrIds = settings.radarr.map((server) => server.id);
   const configuredSonarrIds = settings.sonarr.map((server) => server.id);
@@ -286,7 +289,7 @@ export const addEffectiveTargetStatusJoin = <Entity extends ObjectLiteral>(
     .leftJoin(
       MediaDestinationStatus,
       destinationAlias,
-      `${destinationAlias}.mediaId = ${mediaAlias}.id AND ${destinationAlias}.serverId = ${requestAlias}.serverId`
+      `${destinationColumn('mediaId')} = ${mediaAlias}.id AND ${destinationColumn('serverId')} = ${requestAlias}.serverId`
     )
     .setParameters({
       targetMovieType: MediaType.MOVIE,
@@ -314,9 +317,9 @@ export const addEffectiveTargetStatusJoin = <Entity extends ObjectLiteral>(
   const nativeStatus = `(CASE WHEN ${requestAlias}.is4k = :target4k THEN ${mediaAlias}.status4k ELSE ${mediaAlias}.status END)`;
 
   return `(CASE
-    WHEN ${configuredIndependent} THEN COALESCE(${destinationAlias}.status, :targetUnknownStatus)
+    WHEN ${configuredIndependent} THEN COALESCE(${destinationColumn('status')}, :targetUnknownStatus)
     WHEN ${configured} THEN ${nativeStatus}
-    WHEN ${destinationAlias}.id IS NOT NULL THEN ${destinationAlias}.status
+    WHEN ${destinationColumn('id')} IS NOT NULL THEN ${destinationColumn('status')}
     ELSE ${nativeStatus}
   END)`;
 };
