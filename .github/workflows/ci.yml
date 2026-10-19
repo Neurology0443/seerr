@@ -24,6 +24,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: seerr_migration_test
+          POSTGRES_PASSWORD: pr9-${{ github.run_id }}-${{ github.run_attempt }}
+          POSTGRES_DB: seerr_migration_control
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U seerr_migration_test -d seerr_migration_control"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -59,6 +74,9 @@ jobs:
       - name: Run tests
         env:
           CI: true
+          SEERR_MIGRATION_PG_DISPOSABLE: 'true'
+          SEERR_MIGRATION_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          SEERR_MIGRATION_PG_PASSWORD: pr9-${{ github.run_id }}-${{ github.run_attempt }}
         run: pnpm test
 
       - name: Build
