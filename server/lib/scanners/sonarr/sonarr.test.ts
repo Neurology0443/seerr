@@ -1499,6 +1499,29 @@ describe('Sonarr Scanner', () => {
   });
 
   describe('independent destination scanning', () => {
+    for (const statistics of [
+      { totalEpisodeCount: 10 },
+      { totalEpisodeCount: 10, episodeFileCount: '0' },
+      { totalEpisodeCount: '10', episodeFileCount: 10 },
+    ]) {
+      it(`preserves all state after malformed season inventory ${JSON.stringify(statistics)}`, async () => {
+        const { media } = await seedRemoval(MediaType.TV);
+        getSettings().sonarr = getSettings().sonarr.filter(
+          (server) => server.id === 2
+        );
+        getTvShowImpl = async () => fakeTmdbShow(media.tmdbId);
+        getSeriesImpl = async () => [
+          fakeSonarrSeries({
+            tvdbId: media.tvdbId,
+            seasons: [{ seasonNumber: 1, monitored: false, statistics }],
+          } as unknown as Partial<SonarrSeries>),
+        ];
+        const before = await removalSnapshot();
+        await runWithMockTimers(() => sonarrScanner.run());
+        assert.deepEqual(await removalSnapshot(), before);
+      });
+    }
+
     it('scans canonically equivalent native configurations separately under upstream raw deduplication', async () => {
       configureSonarr([
         { id: 28, hostname: 'localhost', port: 8989, baseUrl: '' },
@@ -2597,6 +2620,21 @@ describe('Sonarr Scanner', () => {
         ).status,
         MediaStatus.AVAILABLE
       );
+
+      for (const records of [[{}], [{ id: 1 }], [{ tvdbId: '4400' }]]) {
+        getLibrarySeriesByTvdbIdImpl = async () =>
+          records as unknown as SonarrSeries[];
+        await runWithMockTimers(() => sonarrScanner.run());
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              id: destination.id,
+            })
+          ).status,
+          MediaStatus.AVAILABLE,
+          `Invalid exact lookup must preserve availability: ${JSON.stringify(records)}`
+        );
+      }
 
       getSeriesImpl = async () => [];
       getLibrarySeriesByTvdbIdImpl = async () => [];

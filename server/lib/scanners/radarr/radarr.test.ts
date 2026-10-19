@@ -743,6 +743,28 @@ describe('Radarr Scanner', () => {
   });
 
   describe('independent destination scanning', () => {
+    for (const observation of [
+      { hasFile: undefined, monitored: false },
+      { hasFile: 'false', monitored: true },
+      { hasFile: false, monitored: undefined },
+    ]) {
+      it(`preserves all state after malformed movie inventory ${JSON.stringify(observation)}`, async () => {
+        const { media } = await seedRemoval();
+        getSettings().radarr = getSettings().radarr.filter(
+          (server) => server.id === 2
+        );
+        getMoviesImpl = async () => [
+          fakeRadarrMovie({
+            tmdbId: media.tmdbId,
+            ...observation,
+          } as unknown as Partial<RadarrMovie>),
+        ];
+        const before = await removalSnapshot();
+        await runWithMockTimers(() => radarrScanner.run());
+        assert.deepEqual(await removalSnapshot(), before);
+      });
+    }
+
     it('clears previous endpoint availability before an empty scan and rebuilds it only from fresh observations', async (t) => {
       const { media } = await seedRemoval(MediaType.MOVIE);
       const settings = getSettings();
@@ -1560,6 +1582,21 @@ describe('Radarr Scanner', () => {
         ).status,
         MediaStatus.AVAILABLE
       );
+
+      for (const records of [[{}], [{ id: 1 }], [{ tmdbId: '720' }]]) {
+        getLibraryMoviesByTmdbIdImpl = async () =>
+          records as unknown as RadarrMovie[];
+        await runWithMockTimers(() => radarrScanner.run());
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              id: destination.id,
+            })
+          ).status,
+          MediaStatus.AVAILABLE,
+          `Invalid exact lookup must preserve availability: ${JSON.stringify(records)}`
+        );
+      }
 
       getMoviesImpl = async () => [];
       getLibraryMoviesByTmdbIdImpl = async () => [];

@@ -119,6 +119,22 @@ class RadarrScanner
               ? beginDestinationScan(MediaType.MOVIE, server.id, server)
               : undefined;
           this.items = await this.radarrApi.getMovies();
+          if (
+            server.independentRequestDestination === true &&
+            (!Array.isArray(this.items) ||
+              this.items.some(
+                (movie) =>
+                  !movie ||
+                  !Number.isSafeInteger(movie.id) ||
+                  (movie.id ?? 0) <= 0 ||
+                  !Number.isSafeInteger(movie.tmdbId) ||
+                  movie.tmdbId <= 0 ||
+                  typeof movie.hasFile !== 'boolean' ||
+                  typeof movie.monitored !== 'boolean'
+              ))
+          ) {
+            throw new Error('Invalid independent Radarr inventory');
+          }
 
           const server4k = this.enable4kMovie && server.is4k;
           if (server.independentRequestDestination !== true) {
@@ -348,7 +364,17 @@ class RadarrScanner
             const exactMovies = await this.radarrApi.getLibraryMoviesByTmdbId(
               destination.media.tmdbId
             );
-            if (!Array.isArray(exactMovies)) {
+            if (
+              !Array.isArray(exactMovies) ||
+              exactMovies.some(
+                (movie) =>
+                  !movie ||
+                  !Number.isSafeInteger(movie.id) ||
+                  (movie.id ?? 0) <= 0 ||
+                  !Number.isSafeInteger(movie.tmdbId) ||
+                  movie.tmdbId <= 0
+              )
+            ) {
               return [];
             }
             if (
