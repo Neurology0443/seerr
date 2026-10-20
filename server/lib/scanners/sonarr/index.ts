@@ -153,11 +153,23 @@ class SonarrScanner
                           !Number.isSafeInteger(
                             season.statistics.episodeFileCount
                           ) ||
-                          season.statistics.episodeFileCount < 0))
+                          season.statistics.episodeFileCount < 0 ||
+                          // Both counters are calculated from the same episode rows in Sonarr.
+                          season.statistics.episodeFileCount >
+                            season.statistics.totalEpisodeCount))
                   )
               ))
           ) {
-            throw new Error('Invalid independent Sonarr inventory');
+            this.log(
+              `Invalid independent Sonarr inventory. Skipping server: ${server.name} (${server.id})`,
+              'warn'
+            );
+            destinationScan?.close();
+            destinationScan = undefined;
+            // Reset progress only; this inventory must never be reconciled.
+            this.items = [];
+            this.progress = 0;
+            continue;
           }
 
           const server4k = this.enable4kShow && server.is4k;

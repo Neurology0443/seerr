@@ -133,7 +133,16 @@ class RadarrScanner
                   typeof movie.monitored !== 'boolean'
               ))
           ) {
-            throw new Error('Invalid independent Radarr inventory');
+            this.log(
+              `Invalid independent Radarr inventory. Skipping server: ${server.name} (${server.id})`,
+              'warn'
+            );
+            destinationScan?.close();
+            destinationScan = undefined;
+            // Reset progress only; this inventory must never be reconciled.
+            this.items = [];
+            this.progress = 0;
+            continue;
           }
 
           const server4k = this.enable4kMovie && server.is4k;

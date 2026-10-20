@@ -655,6 +655,273 @@ it(`request SQL and destination reconciliation on real ${postgres ? 'PostgreSQL'
         }
       );
     }
+    for (const type of [M.MOVIE, M.TV]) {
+      const mediaId = type === M.MOVIE ? 3 : 4;
+      const invalidId = type === M.MOVIE ? 3 : 1;
+      const validId = type === M.MOVIE ? 2 : 3;
+      const requestId = type === M.MOVIE ? 5 : 17;
+      const scanner = type === M.MOVIE ? radarrScanner : sonarrScanner;
+      const configured = [invalidId, validId].map((id) => ({
+        ...server(id, true),
+        hostname: `correction-${id}`,
+        syncEnabled: true,
+      }));
+      getSettings().radarr = type === M.MOVIE ? configured : [];
+      getSettings().sonarr =
+        type === M.TV ? (configured as unknown as SonarrSettings[]) : [];
+      const destination = await dataSource
+        .getRepository(MediaDestinationStatus)
+        .findOneByOrFail({ mediaId, serverId: validId });
+      await dataSource
+        .getRepository(MediaDestinationStatus)
+        .update(destination.id, { status: S.PROCESSING });
+      if (type === M.TV)
+        await dataSource
+          .getRepository(MediaDestinationSeasonStatus)
+          .update(
+            { destinationStatusId: destination.id },
+            { status: S.PROCESSING }
+          );
+      const validInventory =
+        type === M.MOVIE
+          ? [
+              {
+                id: 52,
+                tmdbId: 92003,
+                titleSlug: 'valid',
+                hasFile: true,
+                monitored: true,
+              },
+            ]
+          : [
+              {
+                id: 52,
+                tvdbId: 92004,
+                titleSlug: 'valid',
+                monitored: true,
+                seasons: [
+                  {
+                    seasonNumber: 1,
+                    monitored: true,
+                    statistics: { totalEpisodeCount: 10, episodeFileCount: 10 },
+                  },
+                ],
+              },
+            ];
+      const invalidInventories = [
+        { label: 'malformed inventory', records: [{}] },
+        ...(type === M.TV
+          ? [
+              {
+                label: 'contradictory counters',
+                records: [
+                  {
+                    id: 51,
+                    tvdbId: 92004,
+                    titleSlug: 'invalid',
+                    monitored: true,
+                    seasons: [
+                      {
+                        seasonNumber: 1,
+                        monitored: false,
+                        statistics: {
+                          totalEpisodeCount: 10,
+                          episodeFileCount: 11,
+                        },
+                      },
+                    ],
+                  },
+                ],
+              },
+            ]
+          : []),
+      ];
+      const protectedSnapshot = async () => {
+        const rows = await reconciliationSnapshot();
+        return [
+          rows[0],
+          rows[3],
+          rows[1].filter((row: { id: number }) => row.id !== requestId),
+          rows[2].filter(
+            (row: { requestId: number }) => row.requestId !== requestId
+          ),
+          rows[4].filter((row: { id: number }) => row.id !== destination.id),
+          rows[5].filter(
+            (row: { destinationStatusId: number }) =>
+              row.destinationStatusId !== destination.id
+          ),
+        ];
+      };
+
+      for (const invalid of invalidInventories) {
+        await t.test(
+          `${type} ${invalid.label} preserves A while B synchronizes on consecutive runs`,
+          async (scenario) => {
+            const scanned: number[] = [];
+            let exactLookups = 0;
+            let observedInventory: unknown = validInventory;
+            t.mock.method(
+              axios,
+              'create',
+              (options: { baseURL?: string }) =>
+                ({
+                  interceptors: {
+                    request: { use: () => 0 },
+                    response: { use: () => 0 },
+                  },
+                  get: async (_url: string, config?: { params?: unknown }) => {
+                    if (config?.params) {
+                      exactLookups++;
+                      return { data: [] };
+                    }
+                    const id = options.baseURL?.includes(
+                      `correction-${invalidId}:`
+                    )
+                      ? invalidId
+                      : validId;
+                    scanned.push(id);
+                    return {
+                      data:
+                        id === invalidId ? invalid.records : observedInventory,
+                    };
+                  },
+                }) as unknown as AxiosInstance
+            );
+            const before = await protectedSnapshot();
+            if (type === M.TV && invalid.label === 'malformed inventory') {
+              for (const [label, fileCount, expected] of [
+                ['absent', undefined, S.PROCESSING],
+                ['partial', 3, S.PARTIALLY_AVAILABLE],
+              ] as const) {
+                await scenario.test(
+                  `valid B accepts ${label} statistics without completing an unsatisfied request`,
+                  async () => {
+                    observedInventory = [
+                      {
+                        id: 52,
+                        tvdbId: 92004,
+                        titleSlug: 'valid',
+                        monitored: true,
+                        seasons: [
+                          {
+                            seasonNumber: 1,
+                            monitored: true,
+                            statistics:
+                              fileCount === undefined
+                                ? undefined
+                                : {
+                                    totalEpisodeCount: 10,
+                                    episodeFileCount: fileCount,
+                                  },
+                          },
+                        ],
+                      },
+                    ];
+                    await runWithMockTimers(() => scanner.run());
+                    assert.deepEqual(scanned.slice(-2), [invalidId, validId]);
+                    assert.equal(
+                      (
+                        await dataSource
+                          .getRepository(MediaDestinationStatus)
+                          .findOneByOrFail({ id: destination.id })
+                      ).status,
+                      expected
+                    );
+                    assert.equal(
+                      (
+                        await dataSource
+                          .getRepository(MediaDestinationSeasonStatus)
+                          .findOneByOrFail({
+                            destinationStatusId: destination.id,
+                            seasonNumber: 1,
+                          })
+                      ).status,
+                      expected
+                    );
+                    assert.equal(
+                      (
+                        await dataSource
+                          .getRepository(MediaRequest)
+                          .findOneByOrFail({ id: requestId })
+                      ).status,
+                      R.APPROVED
+                    );
+                    assert.equal(
+                      (
+                        await dataSource
+                          .getRepository(SeasonRequest)
+                          .findOneByOrFail({ request: { id: requestId } })
+                      ).status,
+                      R.APPROVED
+                    );
+                    assert.deepEqual(await protectedSnapshot(), before);
+                  }
+                );
+              }
+              assert.deepEqual(scanned, [
+                invalidId,
+                validId,
+                invalidId,
+                validId,
+              ]);
+              scanned.length = 0;
+              observedInventory = validInventory;
+            }
+            for (let run = 1; run <= 2; run++) {
+              await runWithMockTimers(() => scanner.run());
+              assert.deepEqual(
+                scanned,
+                Array.from({ length: run }, () => [invalidId, validId]).flat()
+              );
+              assert.equal(
+                exactLookups,
+                0,
+                'Invalid A must not trigger orphan lookups.'
+              );
+              assert.equal(scanner.status().running, false);
+              assert.deepEqual(await protectedSnapshot(), before);
+              assert.equal(
+                (
+                  await dataSource
+                    .getRepository(MediaDestinationStatus)
+                    .findOneByOrFail({ id: destination.id })
+                ).status,
+                S.AVAILABLE
+              );
+              assert.equal(
+                (
+                  await dataSource
+                    .getRepository(MediaRequest)
+                    .findOneByOrFail({ id: requestId })
+                ).status,
+                R.COMPLETED
+              );
+              if (type === M.TV) {
+                assert.equal(
+                  (
+                    await dataSource
+                      .getRepository(MediaDestinationSeasonStatus)
+                      .findOneByOrFail({
+                        destinationStatusId: destination.id,
+                        seasonNumber: 1,
+                      })
+                  ).status,
+                  S.AVAILABLE
+                );
+                assert.equal(
+                  (
+                    await dataSource
+                      .getRepository(SeasonRequest)
+                      .findOneByOrFail({ request: { id: requestId } })
+                  ).status,
+                  R.COMPLETED
+                );
+              }
+            }
+          }
+        );
+      }
+    }
     await t.test(
       'reconciliation states survive closing and reopening the database',
       async () => {
