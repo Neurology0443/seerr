@@ -15,6 +15,7 @@
     "test": "node server/test/index.mts",
     "start": "NODE_ENV=production node dist/index.js",
     "i18n:extract": "ts-node --project server/tsconfig.json server/i18n/extractMessages.ts",
+    "migration:sqlite-to-postgres": "ts-node -r tsconfig-paths/register --files --project server/tsconfig.json server/scripts/migrateSqliteToPostgres.ts",
     "migration:generate": "ts-node -r tsconfig-paths/register --project server/tsconfig.json ./node_modules/typeorm/cli.js migration:generate -d server/datasource.ts",
     "migration:create": "ts-node -r tsconfig-paths/register --project server/tsconfig.json ./node_modules/typeorm/cli.js migration:create -d server/datasource.ts",
     "migration:run": "ts-node -r tsconfig-paths/register --project server/tsconfig.json ./node_modules/typeorm/cli.js migration:run -d server/datasource.ts",

@@ -87,5 +87,13 @@ jobs:
           SEERR_REQUEST_PG_PASSWORD: pr9-${{ github.run_id }}-${{ github.run_attempt }}
         run: pnpm test server/routes/requestStatusSql.test.ts
 
+      - name: Offline SQLite to PostgreSQL migration
+        env:
+          CI: true
+          SEERR_TRANSFER_PG_DISPOSABLE: 'true'
+          SEERR_TRANSFER_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          SEERR_TRANSFER_PG_PASSWORD: pr9-${{ github.run_id }}-${{ github.run_attempt }}
+        run: pnpm test server/test/sqliteToPostgresMigration.test.ts
+
       - name: Build
         run: pnpm build
