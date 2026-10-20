@@ -128,6 +128,49 @@ class SonarrScanner
               ? beginDestinationScan(MediaType.TV, server.id, server)
               : undefined;
           this.items = await this.sonarrApi.getSeries();
+          if (
+            server.independentRequestDestination === true &&
+            (!Array.isArray(this.items) ||
+              this.items.some(
+                (show) =>
+                  !show ||
+                  !Number.isSafeInteger(show.id) ||
+                  (show.id ?? 0) <= 0 ||
+                  !Number.isSafeInteger(show.tvdbId) ||
+                  show.tvdbId <= 0 ||
+                  !Array.isArray(show.seasons) ||
+                  show.seasons.some(
+                    (season) =>
+                      !season ||
+                      !Number.isSafeInteger(season.seasonNumber) ||
+                      season.seasonNumber < 0 ||
+                      typeof season.monitored !== 'boolean' ||
+                      (season.statistics != null &&
+                        (!Number.isSafeInteger(
+                          season.statistics.totalEpisodeCount
+                        ) ||
+                          season.statistics.totalEpisodeCount < 0 ||
+                          !Number.isSafeInteger(
+                            season.statistics.episodeFileCount
+                          ) ||
+                          season.statistics.episodeFileCount < 0 ||
+                          // Both counters are calculated from the same episode rows in Sonarr.
+                          season.statistics.episodeFileCount >
+                            season.statistics.totalEpisodeCount))
+                  )
+              ))
+          ) {
+            this.log(
+              `Invalid independent Sonarr inventory. Skipping server: ${server.name} (${server.id})`,
+              'warn'
+            );
+            destinationScan?.close();
+            destinationScan = undefined;
+            // Reset progress only; this inventory must never be reconciled.
+            this.items = [];
+            this.progress = 0;
+            continue;
+          }
 
           const server4k = this.enable4kShow && server.is4k;
           if (server.independentRequestDestination !== true) {
@@ -436,7 +479,17 @@ class SonarrScanner
           try {
             const exactSeries =
               await this.sonarrApi.getLibrarySeriesByTvdbId(tvdbId);
-            if (!Array.isArray(exactSeries)) {
+            if (
+              !Array.isArray(exactSeries) ||
+              exactSeries.some(
+                (show) =>
+                  !show ||
+                  !Number.isSafeInteger(show.id) ||
+                  (show.id ?? 0) <= 0 ||
+                  !Number.isSafeInteger(show.tvdbId) ||
+                  show.tvdbId <= 0
+              )
+            ) {
               return [];
             }
             if (exactSeries.some((show) => show.tvdbId === tvdbId)) {

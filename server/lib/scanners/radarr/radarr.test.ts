@@ -743,6 +743,102 @@ describe('Radarr Scanner', () => {
   });
 
   describe('independent destination scanning', () => {
+    it('skips only invalid independent inventory, closes its observation and scans the next server on every run', async (t) => {
+      const { media, destinations, requests } = await seedRemoval();
+      const settings = getSettings();
+      settings.radarr = [settings.radarr[1], settings.radarr[0]];
+      await getRepository(MediaDestinationStatus).update(destinations[0].id, {
+        status: MediaStatus.PROCESSING,
+      });
+      const before = await removalSnapshot();
+      const destinationLocks =
+        await import('@server/utils/destinationOperationLock');
+      const begin = destinationLocks.beginDestinationScan;
+      const observations: ReturnType<typeof begin>[] = [];
+      t.mock.method(
+        destinationLocks,
+        'beginDestinationScan',
+        (...args: Parameters<typeof begin>) => {
+          const observation = begin(...args);
+          observations.push(observation);
+          return observation;
+        }
+      );
+      const scanned: number[] = [];
+      let exactLookups = 0;
+      getMoviesImpl = async () => {
+        const id = radarrScanner.status().currentServer.id;
+        scanned.push(id);
+        if (id === 2) return [{}] as RadarrMovie[];
+        assert.ok(
+          observations
+            .slice(0, -1)
+            .every((observation) => !observation.isFresh(media.tmdbId)),
+          'The rejected observation must close before the next server is read.'
+        );
+        return [fakeRadarrMovie({ tmdbId: media.tmdbId })];
+      };
+      getLibraryMoviesByTmdbIdImpl = async () => {
+        exactLookups++;
+        return [];
+      };
+
+      for (let run = 1; run <= 2; run++) {
+        await runWithMockTimers(() => radarrScanner.run());
+        assert.deepEqual(
+          scanned,
+          Array.from({ length: run }, () => [2, 1]).flat()
+        );
+        assert.equal(observations.length, run * 2);
+        assert.ok(
+          observations.every(
+            (observation) => !observation.isFresh(media.tmdbId)
+          )
+        );
+        assert.equal(radarrScanner.status().running, false);
+        assert.equal(radarrScanner.status().total, 1);
+        assert.equal(
+          exactLookups,
+          0,
+          'Invalid A must never enter orphan reconciliation.'
+        );
+        const after = await removalSnapshot();
+        assert.deepEqual(after.media, before.media);
+        assert.deepEqual(after.destinations[1], before.destinations[1]);
+        assert.deepEqual(
+          after.requests.filter((row) => row.id !== requests[5].id),
+          before.requests.filter((row) => row.id !== requests[5].id)
+        );
+        assert.equal(after.destinations[0].status, MediaStatus.AVAILABLE);
+        assert.equal(
+          after.requests.find((row) => row.id === requests[5].id)?.status,
+          MediaRequestStatus.COMPLETED
+        );
+      }
+    });
+
+    for (const observation of [
+      { hasFile: undefined, monitored: false },
+      { hasFile: 'false', monitored: true },
+      { hasFile: false, monitored: undefined },
+    ]) {
+      it(`preserves all state after malformed movie inventory ${JSON.stringify(observation)}`, async () => {
+        const { media } = await seedRemoval();
+        getSettings().radarr = getSettings().radarr.filter(
+          (server) => server.id === 2
+        );
+        getMoviesImpl = async () => [
+          fakeRadarrMovie({
+            tmdbId: media.tmdbId,
+            ...observation,
+          } as unknown as Partial<RadarrMovie>),
+        ];
+        const before = await removalSnapshot();
+        await runWithMockTimers(() => radarrScanner.run());
+        assert.deepEqual(await removalSnapshot(), before);
+      });
+    }
+
     it('clears previous endpoint availability before an empty scan and rebuilds it only from fresh observations', async (t) => {
       const { media } = await seedRemoval(MediaType.MOVIE);
       const settings = getSettings();
@@ -1560,6 +1656,21 @@ describe('Radarr Scanner', () => {
         ).status,
         MediaStatus.AVAILABLE
       );
+
+      for (const records of [[{}], [{ id: 1 }], [{ tmdbId: '720' }]]) {
+        getLibraryMoviesByTmdbIdImpl = async () =>
+          records as unknown as RadarrMovie[];
+        await runWithMockTimers(() => radarrScanner.run());
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              id: destination.id,
+            })
+          ).status,
+          MediaStatus.AVAILABLE,
+          `Invalid exact lookup must preserve availability: ${JSON.stringify(records)}`
+        );
+      }
 
       getMoviesImpl = async () => [];
       getLibraryMoviesByTmdbIdImpl = async () => [];

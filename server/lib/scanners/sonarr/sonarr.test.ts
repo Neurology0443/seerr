@@ -1499,6 +1499,228 @@ describe('Sonarr Scanner', () => {
   });
 
   describe('independent destination scanning', () => {
+    it('skips only invalid independent inventory, closes its observation and scans the next server on every run', async (t) => {
+      const { media, destinations, requests } = await seedRemoval(MediaType.TV);
+      const settings = getSettings();
+      settings.sonarr = [settings.sonarr[1], settings.sonarr[0]];
+      await getRepository(MediaDestinationStatus).update(destinations[0].id, {
+        status: MediaStatus.PROCESSING,
+      });
+      await getRepository(MediaDestinationSeasonStatus).update(
+        { destinationStatusId: destinations[0].id, seasonNumber: 1 },
+        { status: MediaStatus.PROCESSING }
+      );
+      const completedSeason = await getRepository(
+        SeasonRequest
+      ).findOneByOrFail({ request: { id: requests[5].id } });
+      getTvShowImpl = async () => fakeTmdbShow(media.tmdbId);
+      const before = await removalSnapshot();
+      const destinationLocks =
+        await import('@server/utils/destinationOperationLock');
+      const begin = destinationLocks.beginDestinationScan;
+      const observations: ReturnType<typeof begin>[] = [];
+      t.mock.method(
+        destinationLocks,
+        'beginDestinationScan',
+        (...args: Parameters<typeof begin>) => {
+          const observation = begin(...args);
+          observations.push(observation);
+          return observation;
+        }
+      );
+      const scanned: number[] = [];
+      let exactLookups = 0;
+      getSeriesImpl = async () => {
+        const id = sonarrScanner.status().currentServer.id;
+        scanned.push(id);
+        if (id === 2) return [{}] as SonarrSeries[];
+        assert.ok(
+          observations
+            .slice(0, -1)
+            .every((observation) => !observation.isFresh(media.tmdbId)),
+          'The rejected observation must close before the next server is read.'
+        );
+        return [fakeSonarrSeries({ tvdbId: media.tvdbId })];
+      };
+      getLibrarySeriesByTvdbIdImpl = async () => {
+        exactLookups++;
+        return [];
+      };
+
+      for (let run = 1; run <= 2; run++) {
+        await runWithMockTimers(() => sonarrScanner.run());
+        assert.deepEqual(
+          scanned,
+          Array.from({ length: run }, () => [2, 1]).flat()
+        );
+        assert.equal(observations.length, run * 2);
+        assert.ok(
+          observations.every(
+            (observation) => !observation.isFresh(media.tmdbId)
+          )
+        );
+        assert.equal(sonarrScanner.status().running, false);
+        assert.equal(sonarrScanner.status().total, 1);
+        assert.equal(
+          exactLookups,
+          0,
+          'Invalid A must never enter orphan reconciliation.'
+        );
+        const after = await removalSnapshot();
+        assert.deepEqual(after.media, before.media);
+        assert.deepEqual(after.destinations[1], before.destinations[1]);
+        assert.deepEqual(
+          after.requests.filter((row) => row.id !== requests[5].id),
+          before.requests.filter((row) => row.id !== requests[5].id)
+        );
+        assert.deepEqual(
+          after.seasonRequests.filter((row) => row.id !== completedSeason.id),
+          before.seasonRequests.filter((row) => row.id !== completedSeason.id)
+        );
+        assert.equal(
+          after.seasonRequests.find((row) => row.id === completedSeason.id)
+            ?.status,
+          MediaRequestStatus.COMPLETED
+        );
+        assert.deepEqual(
+          after.seasons.filter(
+            (row) => row.destinationStatusId === destinations[1].id
+          ),
+          before.seasons.filter(
+            (row) => row.destinationStatusId === destinations[1].id
+          )
+        );
+        assert.equal(
+          after.destinations[0].status,
+          MediaStatus.PARTIALLY_AVAILABLE
+        );
+        assert.equal(
+          after.seasons.find(
+            (row) =>
+              row.destinationStatusId === destinations[0].id &&
+              row.seasonNumber === 1
+          )?.status,
+          MediaStatus.AVAILABLE
+        );
+        assert.equal(
+          after.requests.find((row) => row.id === requests[5].id)?.status,
+          MediaRequestStatus.COMPLETED
+        );
+      }
+    });
+
+    it('rejects contradictory Sonarr counters without changing any persisted state', async () => {
+      const { media } = await seedRemoval(MediaType.TV);
+      getSettings().sonarr = getSettings().sonarr.filter(
+        (server) => server.id === 2
+      );
+      getTvShowImpl = async () => fakeTmdbShow(media.tmdbId);
+      getSeriesImpl = async () => [
+        fakeSonarrSeries({
+          tvdbId: media.tvdbId,
+          seasons: [
+            {
+              seasonNumber: 1,
+              monitored: false,
+              statistics: { totalEpisodeCount: 10, episodeFileCount: 11 },
+            },
+          ],
+        } as Partial<SonarrSeries>),
+      ];
+      const before = await removalSnapshot();
+      await runWithMockTimers(() => sonarrScanner.run());
+      assert.deepEqual(await removalSnapshot(), before);
+    });
+
+    for (const [label, fileCount, expectedSeason, expectedRequest] of [
+      [
+        'absent',
+        undefined,
+        MediaStatus.PROCESSING,
+        MediaRequestStatus.APPROVED,
+      ],
+      [
+        'partial',
+        3,
+        MediaStatus.PARTIALLY_AVAILABLE,
+        MediaRequestStatus.APPROVED,
+      ],
+      ['full', 10, MediaStatus.AVAILABLE, MediaRequestStatus.COMPLETED],
+    ] as const) {
+      it(`accepts ${label} Sonarr statistics without affecting other destinations`, async () => {
+        const { media, destinations, requests } = await seedRemoval(
+          MediaType.TV
+        );
+        getSettings().sonarr = getSettings().sonarr.filter(
+          (server) => server.id === 2
+        );
+        await getRepository(MediaDestinationStatus).update(destinations[1].id, {
+          status: MediaStatus.PROCESSING,
+        });
+        await getRepository(MediaDestinationSeasonStatus).update(
+          { destinationStatusId: destinations[1].id, seasonNumber: 1 },
+          { status: MediaStatus.PROCESSING }
+        );
+        getTvShowImpl = async () => fakeTmdbShow(media.tmdbId);
+        const series = fakeSonarrSeries({ tvdbId: media.tvdbId });
+        if (fileCount === undefined) delete series.seasons[0].statistics;
+        else series.seasons[0].statistics!.episodeFileCount = fileCount;
+        getSeriesImpl = async () => [series];
+        const before = await removalSnapshot();
+        await runWithMockTimers(() => sonarrScanner.run());
+        const after = await removalSnapshot();
+        assert.deepEqual(after.media, before.media);
+        assert.deepEqual(after.destinations[0], before.destinations[0]);
+        assert.deepEqual(
+          after.seasons.filter(
+            (row) => row.destinationStatusId === destinations[0].id
+          ),
+          before.seasons.filter(
+            (row) => row.destinationStatusId === destinations[0].id
+          )
+        );
+        assert.deepEqual(
+          after.requests.filter((row) => row.id !== requests[0].id),
+          before.requests.filter((row) => row.id !== requests[0].id)
+        );
+        assert.equal(
+          after.seasons.find(
+            (row) =>
+              row.destinationStatusId === destinations[1].id &&
+              row.seasonNumber === 1
+          )?.status,
+          expectedSeason
+        );
+        assert.equal(
+          after.requests.find((row) => row.id === requests[0].id)?.status,
+          expectedRequest
+        );
+      });
+    }
+
+    for (const statistics of [
+      { totalEpisodeCount: 10 },
+      { totalEpisodeCount: 10, episodeFileCount: '0' },
+      { totalEpisodeCount: '10', episodeFileCount: 10 },
+    ]) {
+      it(`preserves all state after malformed season inventory ${JSON.stringify(statistics)}`, async () => {
+        const { media } = await seedRemoval(MediaType.TV);
+        getSettings().sonarr = getSettings().sonarr.filter(
+          (server) => server.id === 2
+        );
+        getTvShowImpl = async () => fakeTmdbShow(media.tmdbId);
+        getSeriesImpl = async () => [
+          fakeSonarrSeries({
+            tvdbId: media.tvdbId,
+            seasons: [{ seasonNumber: 1, monitored: false, statistics }],
+          } as unknown as Partial<SonarrSeries>),
+        ];
+        const before = await removalSnapshot();
+        await runWithMockTimers(() => sonarrScanner.run());
+        assert.deepEqual(await removalSnapshot(), before);
+      });
+    }
+
     it('scans canonically equivalent native configurations separately under upstream raw deduplication', async () => {
       configureSonarr([
         { id: 28, hostname: 'localhost', port: 8989, baseUrl: '' },
@@ -2597,6 +2819,21 @@ describe('Sonarr Scanner', () => {
         ).status,
         MediaStatus.AVAILABLE
       );
+
+      for (const records of [[{}], [{ id: 1 }], [{ tvdbId: '4400' }]]) {
+        getLibrarySeriesByTvdbIdImpl = async () =>
+          records as unknown as SonarrSeries[];
+        await runWithMockTimers(() => sonarrScanner.run());
+        assert.equal(
+          (
+            await getRepository(MediaDestinationStatus).findOneByOrFail({
+              id: destination.id,
+            })
+          ).status,
+          MediaStatus.AVAILABLE,
+          `Invalid exact lookup must preserve availability: ${JSON.stringify(records)}`
+        );
+      }
 
       getSeriesImpl = async () => [];
       getLibrarySeriesByTvdbIdImpl = async () => [];
