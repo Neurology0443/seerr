@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - feature/seerr-multi
+      - feature/seerr-multi-catalogue
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
