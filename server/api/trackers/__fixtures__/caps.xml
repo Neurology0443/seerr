@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<caps>
+  <limits max="100" default="50"/>
+  <searching>
+    <search available="yes" supportedParams="q,cat,limit,offset,apikey"/>
+    <movie-search available="yes" supportedParams="q,imdbid,tmdbid,cat,limit,offset,apikey"/>
+    <tv-search available="yes" supportedParams="q,season,ep,tvdbid,imdbid,cat,limit,offset,apikey"/>
+    <music-search available="yes" supportedParams="q,artist,album"/>
+    <book-search available="no" supportedParams="q,cat"/>
+  </searching>
+  <categories>
+    <category id="2000" name="Movies"><subcat id="2040" name="Movies/HD"/></category>
+    <category id="5000" name="TV"><subcat id="5070" name="TV/Anime"/></category>
+  </categories>
+</caps>
