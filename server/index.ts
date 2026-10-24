@@ -6,6 +6,10 @@ import { Session } from '@server/entity/Session';
 import { User } from '@server/entity/User';
 import { initI18n } from '@server/i18n';
 import { startJobs } from '@server/job/schedule';
+import {
+  initializeCatalogue,
+  registerCatalogueShutdown,
+} from '@server/lib/catalogue';
 import notificationManager from '@server/lib/notifications';
 import DiscordAgent from '@server/lib/notifications/agents/discord';
 import EmailAgent from '@server/lib/notifications/agents/email';
@@ -85,6 +89,9 @@ app
     // Load Settings
     const settings = await getSettings().load();
     restartFlag.initializeSettings(settings);
+
+    registerCatalogueShutdown();
+    await initializeCatalogue();
 
     initI18n();
 
