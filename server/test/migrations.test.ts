@@ -24,9 +24,35 @@ async function getApplicationTables(queryRunner: QueryRunner) {
       WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
       ORDER BY table_name
     `);
-  return queryRunner.getTables(
+  const metadata = await queryRunner.getTables(
     tables.map((table) => `${table.table_schema}.${table.table_name}`)
   );
+  // PostgreSQL introspection in TypeORM does not order columns. Compare the
+  // real physical order, rather than incidental catalog query result order.
+  const columns: {
+    table_name: string;
+    column_name: string;
+    ordinal_position: number;
+  }[] = await queryRunner.query(`
+    SELECT table_name, column_name, ordinal_position
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+    ORDER BY table_name, ordinal_position
+  `);
+  const positions = new Map(
+    columns.map((column) => [
+      `${column.table_name}.${column.column_name}`,
+      column.ordinal_position,
+    ])
+  );
+  for (const table of metadata) {
+    table.columns.sort(
+      (a, b) =>
+        positions.get(`${table.name}.${a.name}`)! -
+        positions.get(`${table.name}.${b.name}`)!
+    );
+  }
+  return metadata;
 }
 
 async function snapshotNative(queryRunner: QueryRunner) {
