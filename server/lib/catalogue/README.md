@@ -12,14 +12,19 @@ tables and migration journal. It does not change `search_path`.
 
 ## Initialization and migrations
 
-Backend startup initializes the catalogue after native storage and settings.
+Backend startup starts catalogue initialization independently after native storage
+and settings; it does not await its connection or migrations.
 Initialization creates the PostgreSQL schema before running its journal and
 versioned migrations. Concurrent calls share one initialization. On failure,
 native startup continues, the internal state is `unavailable` with a safe error
-phase, and connection access throws `CatalogueUnavailableError`. This is not an
+phase, an allowlisted driver error code when available and a static safe diagnostic.
+Connection access throws `CatalogueUnavailableError` until ready. This is not an
 empty or healthy catalogue. An explicit initialization can retry; PR1 has no
 automatic retry scheduler or catalogue API. SIGINT/SIGTERM attempt a bounded
-connection shutdown; `shutdownCatalogue()` is also available internally.
+connection shutdown; `shutdownCatalogue()` is also available internally. Shutdown
+prevents new initialization and waits for any pending attempt before closing its
+connection; a closed lifecycle cannot reopen itself. Failure diagnostics survive
+cleanup. Explicit retries apply only before shutdown.
 
 Run migrations independently from the repository root, using the same environment
 and configuration as the backend:

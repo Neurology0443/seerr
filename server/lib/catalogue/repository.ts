@@ -1,4 +1,5 @@
 import type { DataSource, EntityManager } from 'typeorm';
+import { In } from 'typeorm';
 import { catalogueEntityNames as names } from './entities';
 import type {
   CatalogueCategory,
@@ -223,6 +224,7 @@ export async function upsertObservedTorrents(
         row,
       ])
     );
+    const replacements: { torrentId: number; categories: number[] }[] = [];
     for (const record of batch) {
       const row = byIdentity.get(
         JSON.stringify([record.trackerId, record.canonicalGuid])
@@ -233,17 +235,33 @@ export async function upsertObservedTorrents(
         record.categories &&
         row.lastSeenAt.getTime() <= record.observedAt.getTime()
       ) {
-        const categories = manager.getRepository<CatalogueCategory>(
-          names.category
-        );
-        await categories.delete({ torrentId: row.id });
-        const ids = [...new Set(record.categories)];
-        if (ids.length)
-          await categories.insert(
-            ids.map((categoryId) => ({ torrentId: row.id, categoryId }))
-          );
+        replacements.push({
+          torrentId: row.id,
+          categories: [...new Set(record.categories)],
+        });
       }
       result.push(row);
+    }
+    if (replacements.length) {
+      const categories = manager.getRepository<CatalogueCategory>(
+        names.category
+      );
+      // Torrent batches bound the delete to 50 IDs. Bound insert parameters too:
+      // even a single torrent can have more categories than a SQLite window.
+      await categories.delete({
+        torrentId: In(replacements.map((row) => row.torrentId)),
+      });
+      let associations: { torrentId: number; categoryId: number }[] = [];
+      for (const { torrentId, categories: ids } of replacements) {
+        for (const categoryId of ids) {
+          associations.push({ torrentId, categoryId });
+          if (associations.length === 250) {
+            await categories.insert(associations);
+            associations = [];
+          }
+        }
+      }
+      if (associations.length) await categories.insert(associations);
     }
   }
   return result;

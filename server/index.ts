@@ -7,8 +7,8 @@ import { User } from '@server/entity/User';
 import { initI18n } from '@server/i18n';
 import { startJobs } from '@server/job/schedule';
 import {
-  initializeCatalogue,
   registerCatalogueShutdown,
+  startCatalogueInitialization,
 } from '@server/lib/catalogue';
 import notificationManager from '@server/lib/notifications';
 import DiscordAgent from '@server/lib/notifications/agents/discord';
@@ -91,7 +91,7 @@ app
     restartFlag.initializeSettings(settings);
 
     registerCatalogueShutdown();
-    await initializeCatalogue();
+    startCatalogueInitialization();
 
     initI18n();
 

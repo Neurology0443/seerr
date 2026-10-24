@@ -17,10 +17,26 @@ export async function initializeCatalogue(): Promise<boolean> {
       {
         label: 'Catalogue',
         phase: catalogue.getState().error,
+        code: catalogue.getState().code,
+        diagnostic: catalogue.getState().diagnostic,
       }
     );
   }
   return ready;
+}
+
+export function startCatalogueInitialization(): void {
+  void initializeCatalogue().catch(() => {
+    // Initialization records database failures itself. A reporting failure must
+    // not turn this independent task into an unhandled rejection at startup.
+    try {
+      logger.error('Catalogue initialization could not be reported', {
+        label: 'Catalogue',
+      });
+    } catch {
+      /* The lifecycle state remains available even if logging fails. */
+    }
+  });
 }
 
 // The native server has no shutdown coordinator. Preserve signal exit semantics

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { it, type TestContext } from 'node:test';
 import type { QueryRunner } from 'typeorm';
-import { DataSource } from 'typeorm';
+import { DataSource, In } from 'typeorm';
 import { createCatalogueDataSource } from './datasource';
 import { catalogueEntityNames as names } from './entities';
 import { CatalogueDatabase, CatalogueUnavailableError } from './lifecycle';
@@ -642,6 +642,144 @@ async function verifyStorage(
       }
     });
 
+    await t.test(
+      'category replacement uses bounded batches and rolls back completely',
+      async (t) => {
+        const records = Array.from({ length: 53 }, (_, i) => ({
+          ...observation('category-batch-' + i),
+          categories:
+            i === 0
+              ? Array.from({ length: 1005 }, (_, n) => 10000 + n)
+              : [5000, 5030, 5000],
+        }));
+        const writes: string[] = [];
+        const spy = t.mock.method(db.logger, 'logQuery', (sql: string) => {
+          if (/^(INSERT INTO|DELETE FROM) .*"torrent_categories"/.test(sql))
+            writes.push(sql);
+        });
+        let rows: CatalogueTorrent[];
+        try {
+          rows = await repository.persistPage(records, checkpoint('a', '5'));
+        } finally {
+          spy.mock.restore();
+        }
+        assert.equal(
+          writes.filter((sql) => sql.startsWith('DELETE')).length,
+          2
+        );
+        assert.equal(
+          writes.filter((sql) => sql.startsWith('INSERT')).length,
+          6
+        );
+        const categories = db.getRepository<CatalogueCategory>(names.category);
+        const snapshot = async () =>
+          (
+            await categories.find({
+              where: { torrentId: In(rows.map((row) => row.id)) },
+              order: { torrentId: 'ASC', categoryId: 'ASC' },
+            })
+          ).map(({ torrentId, categoryId }) => ({ torrentId, categoryId }));
+        const original = await snapshot();
+        assert.equal(
+          original.filter((row) => row.torrentId === rows[0].id).length,
+          1005
+        );
+        assert.equal(original.length, 1109);
+        const replacements = records.map((record, i) => ({
+          ...observation(record.canonicalGuid),
+          observedAt: later,
+          ...(i === 2 ? {} : { categories: i === 1 ? [] : [7000, 7100, 7000] }),
+        }));
+        await repository.persistPage(replacements, checkpoint('a', '6'));
+        const replaced = await snapshot();
+        assert.equal(
+          replaced.filter((row) => row.torrentId === rows[1].id).length,
+          0
+        );
+        assert.deepEqual(
+          replaced
+            .filter((row) => row.torrentId === rows[2].id)
+            .map((row) => row.categoryId),
+          [5000, 5030]
+        );
+        assert.deepEqual(
+          replaced
+            .filter((row) => row.torrentId === rows[0].id)
+            .map((row) => row.categoryId),
+          [7000, 7100]
+        );
+        await repository.persistPage(replacements, checkpoint('a', '6'));
+        assert.deepEqual(await snapshot(), replaced);
+
+        const createRunner = db.createQueryRunner.bind(db);
+        const queryMocks: { restore(): void }[] = [];
+        let insertCount = 0;
+        const runnerSpy = t.mock.method(
+          db,
+          'createQueryRunner',
+          (...args: Parameters<DataSource['createQueryRunner']>) => {
+            const runner = createRunner(...args);
+            const query = runner.query;
+            const mock = t.mock.method(
+              runner,
+              'query',
+              async (
+                sql: string,
+                parameters?: unknown[],
+                structured?: boolean
+              ) => {
+                if (
+                  /^INSERT INTO .*"torrent_categories"/.test(sql) &&
+                  ++insertCount === 2
+                )
+                  throw new Error('Synthetic category insert failure');
+                return Reflect.apply(query, runner, [
+                  sql,
+                  parameters,
+                  structured,
+                ]);
+              }
+            );
+            queryMocks.push(mock.mock);
+            return runner;
+          }
+        );
+        try {
+          await assert.rejects(
+            repository.persistPage(
+              [
+                { ...observation('category-rollback'), categories: [8000] },
+                ...records.map((record) => ({
+                  ...record,
+                  observedAt: new Date(later.getTime() + 1000),
+                  categories: [8000, 8100],
+                })),
+              ],
+              checkpoint('a', '7')
+            ),
+            /Synthetic category insert failure/
+          );
+        } finally {
+          runnerSpy.mock.restore();
+          for (const mock of queryMocks) mock.restore();
+        }
+        assert.equal(insertCount, 2);
+        assert.deepEqual(await snapshot(), replaced);
+        assert.equal(
+          await repository.findTorrentByGuid('a', 'category-rollback'),
+          null
+        );
+        assert.equal(
+          (await repository.findTorrent(rows[0].id))?.lastSeenAt.getTime(),
+          later.getTime()
+        );
+        assert.equal(
+          (await repository.findSyncState('a', 5000, 'recent'))?.checkpoint,
+          '6'
+        );
+      }
+    );
+
     const count = await db.getRepository(names.torrent).count();
     await database.shutdown();
     assert.throws(() => database.getConnection(), CatalogueUnavailableError);
@@ -658,12 +796,15 @@ async function verifyStorage(
       'migration down and recovery affect only catalogue tables',
       async () => {
         await db.undoLastMigration({ transaction: 'all' });
-        assert.equal(
-          await db
-            .createQueryRunner()
-            .hasTable(postgres ? 'catalogue.torrents' : 'torrents'),
-          false
-        );
+        const runner = db.createQueryRunner();
+        try {
+          assert.equal(
+            await runner.hasTable(postgres ? 'catalogue.torrents' : 'torrents'),
+            false
+          );
+        } finally {
+          await runner.release();
+        }
         assert.deepEqual(await nativeSnapshot(), before);
         assert.equal((await db.runMigrations()).length, 1);
       }
@@ -744,12 +885,13 @@ it('connection and migration failures remain observable, recoverable and isolate
       env: {},
     });
   };
-  const database = new CatalogueDatabase(factory);
+  let database = new CatalogueDatabase(factory);
   try {
     assert.equal(await database.initialize(), false);
     assert.deepEqual(database.getState(), {
       status: 'unavailable',
       error: 'connection',
+      diagnostic: 'Catalogue database connection failed',
     });
     assert.throws(() => database.getConnection(), CatalogueUnavailableError);
     assert.ok(!JSON.stringify(database.getState()).includes('DO-NOT-LOG'));
@@ -781,9 +923,12 @@ it('connection and migration failures remain observable, recoverable and isolate
     assert.deepEqual(broken.getState(), {
       status: 'unavailable',
       error: 'migration',
+      diagnostic: 'Catalogue database migration failed',
     });
     await broken.shutdown();
-    assert.equal(await database.initialize(), true);
+    const reopened = new CatalogueDatabase(factory);
+    assert.equal(await reopened.initialize(), true);
+    database = reopened;
     assert.equal(
       await database
         .getConnection()
