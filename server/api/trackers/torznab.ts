@@ -14,7 +14,9 @@ const TORZNAB_NAMESPACE = 'http://torznab.com/schemas/2015/feed';
 const MAX_INTEGER = 2147483647;
 export const MAX_XML_BYTES = 8 * 1024 * 1024;
 const secretMarker =
-  /(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)\s*[=:/_-]/i;
+  /(?:^|[^a-z0-9])(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)\s*[=:/]/i;
+const credentialPath =
+  /\/(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)[_-][^/]*\//i;
 
 interface XmlNode {
   $ns: { local: string; uri: string };
@@ -91,14 +93,19 @@ function safeText(
   )
     return null;
   const decoded = decode(value);
-  if (decoded === null || secretMarker.test(decoded)) return null;
+  if (
+    decoded === null ||
+    secretMarker.test(decoded) ||
+    credentialPath.test(decoded)
+  )
+    return null;
   if (secrets.some((secret) => secret && decoded.includes(secret))) return null;
   if (/https?:\/\/[^\s/]*@/i.test(decoded)) return null;
   return value;
 }
 
-/** Unknown query/path semantics are rejected; only credential components may
- * be discarded. Numeric torrent IDs must survive removal of authentication. */
+/** Retain the full verified TR4KER slug or an unambiguous supported numeric
+ * identity. Unknown query semantics are rejected rather than discarded. */
 export function canonicalizeTorznabGuid(
   input: string | null,
   secrets: readonly string[] = []
@@ -125,7 +132,7 @@ export function canonicalizeTorznabGuid(
         url.pathname.includes('%')
       )
         return null;
-      const kept = new URLSearchParams();
+      let queryId: string | null = null;
       for (const [key, value] of url.searchParams) {
         if (
           /^(?:api[_-]?key|passkey|token|access[_-]?token|auth|authorization|password|secret)$/i.test(
@@ -138,12 +145,19 @@ export function canonicalizeTorznabGuid(
           !/^\d+$/.test(value)
         )
           return null;
-        if (kept.has(key) && kept.get(key) !== value) return null;
-        kept.set(key, value);
+        const id = value.replace(/^0+(?=\d)/, '');
+        if (queryId !== null && queryId !== id) return null;
+        queryId = id;
       }
-      if (![...kept].length && !/\/\d+\/?$/.test(url.pathname)) return null;
-      kept.sort();
-      url.search = kept.toString();
+      const pathId =
+        /\/(\d+)\/?$/.exec(url.pathname)?.[1].replace(/^0+(?=\d)/, '') ?? null;
+      if (pathId !== null && queryId !== null && pathId !== queryId)
+        return null;
+      const verifiedSlug =
+        url.origin === 'https://tr4ker.net' &&
+        /^\/torrent\/[a-z0-9]+(?:-[a-z0-9]+)+$/i.test(url.pathname);
+      if (queryId === null && pathId === null && !verifiedSlug) return null;
+      url.search = queryId === null ? '' : `id=${queryId}`;
       guid = url.toString();
     } catch {
       return null;

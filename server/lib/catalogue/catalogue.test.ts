@@ -850,6 +850,13 @@ it('GUID boundary rejects credentials without echoing them', () => {
     'tracker:12345',
     'https://tracker.invalid/torrents/12345',
     'https://tracker.invalid/details?id=12345',
+    'https://tr4ker.net/torrent/Marvel-Secret-Wars-2026-1080p-Ab12Cd34',
+    'https://tr4ker.net/torrent/Secret-Story-S01E01-2024',
+    'https://tr4ker.net/torrent/The-Secret-War-2010',
+    'https://tr4ker.net/torrent/Token-Ring-S01E01-1080p',
+    'https://tr4ker.net/torrent/Password-Story-2026',
+    'https://tr4ker.net/torrent/Passkey-Story-S01',
+    'Secret_Story.S01E01.2024',
   ])
     assert.doesNotThrow(() => assertSafeCanonicalGuid(guid));
   for (const guid of [
@@ -862,6 +869,16 @@ it('GUID boundary rejects credentials without echoing them', () => {
     'https://tracker.invalid/1?%2561pikey=SECRET',
     'https://tracker.invalid/%25252561pikey/SECRET',
     'token:SECRET',
+    'apikey=SECRET',
+    'passkey=SECRET',
+    'secret=SECRET',
+    'password:SECRET',
+    'token%3ASECRET',
+    '%2574oken%253ASECRET',
+    'https://tracker.invalid/token_SECRET/1',
+    'raw%0Aid',
+    'raw\nid',
+    'raw%ZZid',
     ' raw-id ',
     '',
   ]) {

@@ -117,7 +117,7 @@ describe('TR4KER HTTP contract', () => {
         assert.equal(result.offset, 387280);
         assert.equal(result.limit, 60);
         assert.equal(result.category, category);
-        assert.equal(result.records.length, 4);
+        assert.equal(result.records.length, 5);
         assert.ok(
           result.observedAt.getTime() >= before &&
             result.observedAt.getTime() <= Date.now()
@@ -161,8 +161,8 @@ describe('TR4KER HTTP contract', () => {
       ...page,
       offset: 400000,
     });
-    assert.equal(result.records.length, 4);
-    assert.equal(result.receivedCount, 6);
+    assert.equal(result.records.length, 5);
+    assert.equal(result.receivedCount, 7);
     assert.equal(result.offset, 400000);
     assert.equal(calls, 1);
     assert.equal('total' in result, false);

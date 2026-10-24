@@ -29,6 +29,10 @@ unresolved tracker TMDB/TVDB IDs and explicit season/episode numbers. `provenanc
 identifies the source of each present field. P2 does not write these claims as
 media associations or infer coverage from titles.
 
+`CatalogueRepository.persistPage()` does not persist `trackerMetadata` or its
+field provenance. Durable retention belongs to the existing CAT-010 follow-up
+for P3/P5; this adapter correction does not change the P1 persistence contract.
+
 Page context echoes the requested category, limit and offset. `receivedCount`
 includes rejected items; `anomalies` contain only item indexes, fixed codes and
 field names, never raw XML or identifiers. Every record implicated in a known
@@ -36,13 +40,27 @@ GUID/infohash contradiction is excluded, including compatible or unknown-hash
 duplicates of that GUID. Other duplicates remain observations for P1's existing
 write boundary. Cross-page conflicts remain P1's responsibility.
 
-GUID canonicalization retains opaque P1-safe identifiers or URL paths with a
-numeric final torrent ID / allowlisted numeric ID query parameters. It removes
-credential query parameters, userinfo and fragments. Encoded paths, unknown query
-semantics, conflicting duplicate IDs and identities lost after credential removal
-are rejected rather than guessed. Unrecognized upstream GUID formats need a
-sanitized fixture and explicit normalization support. Download/enclosure URLs
-are never returned or fetched. Required text echoing credentials is rejected.
+GUID canonicalization supports the verified TR4KER structure
+`https://tr4ker.net/torrent/<hyphenated-release-slug>`. The entire slug retains its
+case and suffix; the validated infohash remains separate. An eight-character
+suffix matching the start of the infohash was observed in two examples, but this
+relationship is not guaranteed or required. Identity is never derived from a
+title, hash or presumed suffix format.
+
+Previously supported opaque P1-safe identifiers, numeric URL paths and numeric
+query identifiers remain supported. Query aliases `id`, `torrentid` and
+`torrent_id` are case-insensitive and normalize to one `id` parameter. Repeated
+aliases must agree, including with a numeric final path ID. Opaque slugs are not
+equated to numeric IDs; a supplied numeric query is retained alongside the slug.
+Credential parameters, userinfo and fragments are removed. Unknown query
+semantics, encoded paths, contradictory identifiers and identities lost after
+credential removal are rejected rather than guessed.
+
+Ordinary release words such as `Secret-Wars`, `Secret_Story` and `Token-Ring`
+are accepted without modifying titles. Credential assignments, credential-bearing
+paths and configured secret values (including supported encoded forms) remain
+rejected. Download/enclosure URLs are never returned or fetched. Unrecognized
+upstream GUID formats need a sanitized fixture and explicit normalization support.
 
 `TrackerAdapterError` provides a fixed message, code, retryability, HTTP status,
 optional numeric Torznab API code and sanitized `retryAfter` (`{ seconds }` or

@@ -42,7 +42,7 @@ export function assertSafeCanonicalGuid(guid: string): void {
       (character) =>
         character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127
     ) ||
-    /(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)[=:/_-]/i.test(
+    /(?:^|[^a-z0-9])(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)[=:/]/i.test(
       decoded
     )
   ) {
@@ -59,6 +59,9 @@ export function assertSafeCanonicalGuid(guid: string): void {
       url.username ||
       url.password ||
       url.hash ||
+      /\/(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)[_-][^/]*\//i.test(
+        url.pathname
+      ) ||
       [...url.searchParams].some(
         ([key, value]) =>
           !['id', 'torrentid', 'torrent_id'].includes(key.toLowerCase()) ||
