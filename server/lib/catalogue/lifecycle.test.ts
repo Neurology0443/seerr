@@ -36,6 +36,7 @@ function controlledConnection(
     },
     async query() {
       await schemaGate;
+      return [{ exists: true }];
     },
     async destroy() {
       calls.destroy++;

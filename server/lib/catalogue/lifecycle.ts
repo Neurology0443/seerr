@@ -102,8 +102,18 @@ export class CatalogueDatabase {
       if (this.stopping) return false;
       phase = 'migration';
       if (this.connection.options.type === 'postgres') {
-        // TypeORM creates its migration journal in this schema too.
-        await this.connection.query('CREATE SCHEMA IF NOT EXISTS "catalogue"');
+        // Even IF NOT EXISTS requires database CREATE privileges. A pre-created
+        // schema only needs its own permissions for the migration journal/DDL.
+        const schemas: { exists: boolean }[] = await this.connection.query(
+          'SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1) AS "exists"',
+          ['catalogue']
+        );
+        if (this.stopping) return false;
+        if (!schemas[0].exists) {
+          await this.connection.query(
+            'CREATE SCHEMA IF NOT EXISTS "catalogue"'
+          );
+        }
       }
       if (this.stopping) return false;
       await this.connection.runMigrations({ transaction: 'all' });

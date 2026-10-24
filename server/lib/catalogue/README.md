@@ -41,11 +41,18 @@ retrying; never enable synchronization or delete the journal to repair a failure
 SQL/error payload logging is disabled for this connection to avoid disclosing
 identifiers or credentials.
 
-PostgreSQL needs `CONNECT` on the database, and `CREATE` on the database for initial
-schema creation. If an administrator pre-creates the schema, the runtime/migration
-role needs `USAGE, CREATE` on `catalogue` and ownership of its objects (or equivalent
-DDL privileges), plus normal table/sequence privileges. Native schema privileges
-remain independently required by Seerr. No extension or extra service is needed.
+PostgreSQL needs `CONNECT` on the database. Initialization checks the PostgreSQL
+catalogue for the schema without requiring elevated privileges. Automatic creation
+of an absent `catalogue` schema requires database-level `CREATE`.
+
+If an administrator pre-creates `catalogue`, database-level `CREATE` is not needed.
+The runtime/migration role needs `USAGE, CREATE` within that schema to create the
+migration journal, tables and sequences. DDL migrations on existing objects require
+ownership of those objects (or membership in their owning role), alongside normal
+table/sequence privileges for data access. Schema ownership itself is not required
+when its owner grants the necessary schema privileges. Insufficient permissions
+remain initialization failures; the application never grants privileges itself.
+Native schema privileges remain independently required by Seerr.
 
 ## Persistence contract
 

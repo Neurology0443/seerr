@@ -1021,7 +1021,11 @@ it(
       poolSize: 1,
     });
     const database = 'seerr_catalogue_' + randomUUID().replaceAll('-', '');
+    const applicationRole =
+      'seerr_catalogue_app_' + randomUUID().replaceAll('-', '');
+    const applicationPassword = randomUUID();
     let created = false;
+    let roleCreated = false;
     let native: DataSource | undefined;
     try {
       await control.initialize();
@@ -1048,6 +1052,208 @@ it(
       });
       await native.initialize();
       await native.runMigrations();
+      const nativeHistory = await native.query(
+        'SELECT * FROM "migrations" ORDER BY "id"'
+      );
+      const publicColumns = () =>
+        native!.query(
+          `SELECT table_name, column_name, data_type, ordinal_position FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position`
+        );
+      const nativeColumns = await publicColumns();
+      await control.query(
+        `CREATE ROLE "${applicationRole}" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD '${applicationPassword}'`
+      );
+      roleCreated = true;
+      await control.query(
+        `REVOKE CREATE ON DATABASE "${database}" FROM PUBLIC`
+      );
+      await control.query(
+        `REVOKE CREATE ON DATABASE "${database}" FROM "${applicationRole}"`
+      );
+      await control.query(
+        `GRANT CONNECT ON DATABASE "${database}" TO "${applicationRole}"`
+      );
+      const restrictedFactory = () =>
+        createCatalogueDataSource({
+          type: 'postgres',
+          database,
+          env: {
+            ...env,
+            DB_USER: applicationRole,
+            DB_PASS: applicationPassword,
+          },
+        });
+      const probe = restrictedFactory();
+      try {
+        await probe.initialize();
+        assert.deepEqual(
+          await probe.query(
+            `SELECT has_database_privilege(current_user, current_database(), 'CREATE') AS allowed`
+          ),
+          [{ allowed: false }]
+        );
+        assert.deepEqual(
+          await probe.query(
+            `SELECT rolsuper, rolcreatedb, rolcreaterole, rolinherit, (SELECT pg_get_userbyid(datdba) = current_user FROM pg_database WHERE datname = current_database()) AS is_owner FROM pg_roles WHERE rolname = current_user`
+          ),
+          [
+            {
+              rolsuper: false,
+              rolcreatedb: false,
+              rolcreaterole: false,
+              rolinherit: false,
+              is_owner: false,
+            },
+          ]
+        );
+        assert.deepEqual(
+          await probe.query(
+            `SELECT EXISTS (SELECT 1 FROM pg_database d CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl, acldefault('d', d.datdba))) a WHERE d.datname = current_database() AND a.grantee = 0 AND a.privilege_type = 'CREATE') AS allowed`
+          ),
+          [{ allowed: false }]
+        );
+      } finally {
+        if (probe.isInitialized) await probe.destroy();
+      }
+
+      await t.test(
+        'missing schema without database CREATE fails safely with SQLSTATE 42501',
+        async () => {
+          const catalogue = new CatalogueDatabase(restrictedFactory);
+          try {
+            assert.equal(await catalogue.initialize(), false);
+            assert.deepEqual(catalogue.getState(), {
+              status: 'unavailable',
+              error: 'migration',
+              code: '42501',
+              diagnostic: 'Insufficient database privileges',
+            });
+            assert.throws(
+              () => catalogue.getConnection(),
+              CatalogueUnavailableError
+            );
+            assert.deepEqual(
+              await native!.query(
+                `SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'catalogue'`
+              ),
+              []
+            );
+            assert.deepEqual(
+              await native!.query('SELECT * FROM "migrations" ORDER BY "id"'),
+              nativeHistory
+            );
+          } finally {
+            await catalogue.shutdown();
+          }
+        }
+      );
+
+      await native.query('CREATE SCHEMA "catalogue"');
+      await native.query(
+        `GRANT USAGE ON SCHEMA "catalogue" TO "${applicationRole}"`
+      );
+      await t.test(
+        'pre-provisioned schema still rejects unauthorized migration DDL',
+        async () => {
+          const catalogue = new CatalogueDatabase(restrictedFactory);
+          try {
+            assert.equal(await catalogue.initialize(), false);
+            assert.deepEqual(catalogue.getState(), {
+              status: 'unavailable',
+              error: 'migration',
+              code: '42501',
+              diagnostic: 'Insufficient database privileges',
+            });
+            assert.throws(
+              () => catalogue.getConnection(),
+              CatalogueUnavailableError
+            );
+          } finally {
+            await catalogue.shutdown();
+          }
+        }
+      );
+
+      await native.query(
+        `GRANT CREATE ON SCHEMA "catalogue" TO "${applicationRole}"`
+      );
+      await t.test(
+        'pre-provisioned schema migrates and reopens without database CREATE',
+        async () => {
+          let catalogue = new CatalogueDatabase(restrictedFactory);
+          try {
+            assert.equal(await catalogue.initialize(), true);
+            assert.equal(catalogue.getState().status, 'ready');
+            const db = catalogue.getConnection();
+            assert.deepEqual(
+              await db.query(
+                `SELECT has_database_privilege(current_user, current_database(), 'CREATE') AS database_create, has_schema_privilege(current_user, 'catalogue', 'USAGE') AS schema_usage, has_schema_privilege(current_user, 'catalogue', 'CREATE') AS schema_create`
+              ),
+              [
+                {
+                  database_create: false,
+                  schema_usage: true,
+                  schema_create: true,
+                },
+              ]
+            );
+            const history = await db.query(
+              'SELECT * FROM "catalogue"."catalogue_migrations" ORDER BY "id"'
+            );
+            assert.equal(history.length, 1);
+            const repository = new CatalogueRepository(db);
+            await repository.saveTracker({
+              id: 'restricted-role',
+              name: 'fixture',
+              connectorType: 'fixture',
+              enabled: true,
+            });
+            assert.equal(await catalogue.initialize(), true);
+            await catalogue.shutdown();
+            catalogue = new CatalogueDatabase(restrictedFactory);
+            assert.equal(await catalogue.initialize(), true);
+            assert.equal(catalogue.getState().status, 'ready');
+            const reopened = catalogue.getConnection();
+            assert.deepEqual(
+              await reopened.query(
+                'SELECT * FROM "catalogue"."catalogue_migrations" ORDER BY "id"'
+              ),
+              history
+            );
+            assert.deepEqual(await reopened.runMigrations(), []);
+            assert.equal(
+              (
+                await reopened
+                  .getRepository(names.tracker)
+                  .findOneByOrFail({ id: 'restricted-role' })
+              ).name,
+              'fixture'
+            );
+            assert.deepEqual(
+              await reopened.query(
+                `SELECT has_database_privilege(current_user, current_database(), 'CREATE') AS allowed`
+              ),
+              [{ allowed: false }]
+            );
+          } finally {
+            await catalogue.shutdown();
+          }
+        }
+      );
+      assert.deepEqual(
+        await native.query('SELECT * FROM "migrations" ORDER BY "id"'),
+        nativeHistory
+      );
+      assert.deepEqual(await publicColumns(), nativeColumns);
+      // Reset only this test's catalogue so the existing storage suite also
+      // exercises automatic schema creation from an absent namespace.
+      await native.query('DROP SCHEMA "catalogue" CASCADE');
+      assert.deepEqual(
+        await native.query(
+          `SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'catalogue'`
+        ),
+        []
+      );
       assert.deepEqual(
         await native.query(
           `SELECT has_database_privilege(current_user, current_database(), 'CREATE') AS allowed`
@@ -1064,7 +1270,12 @@ it(
       try {
         if (created) await control.query(`DROP DATABASE "${database}"`);
       } finally {
-        if (control.isInitialized) await control.destroy();
+        try {
+          if (roleCreated)
+            await control.query(`DROP ROLE "${applicationRole}"`);
+        } finally {
+          if (control.isInitialized) await control.destroy();
+        }
       }
     }
   }
