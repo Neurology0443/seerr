@@ -6,9 +6,11 @@ on:
   pull_request:
     branches:
       - feature/seerr-multi
+      - feature/seerr-multi-catalogue
   push:
     branches:
       - feature/seerr-multi
+      - feature/seerr-multi-catalogue
   workflow_dispatch:
 
 permissions:
