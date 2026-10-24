@@ -317,6 +317,12 @@ describe('Torznab identity and security', () => {
     ['Token-Ring.S01E01.1080p', 'Token-Ring-S01E01-1080p'],
     ['Password-Story.2026', 'Password-Story-2026'],
     ['Passkey_Story.S01', 'Passkey-Story-S01'],
+    ['APIKey-Story.2026', 'APIKey-Story-2026'],
+    ['War.S01E04.MULTI.2160p.AMEN', 'war-s01e04-multi-2160p-amen-8bb905c7'],
+    [
+      'Secret.Token.Password.Passkey.APIKey',
+      'Secret-Token-Password-Passkey-APIKey',
+    ],
   ]) {
     it(`preserves the legitimate release title and full slug: ${title}`, async () => {
       const guid = `https://tr4ker.net/torrent/${slug}`;
@@ -337,17 +343,10 @@ describe('Torznab identity and security', () => {
     });
   }
 
-  it('keeps complete distinct slugs when hashes match and removes credential URL components', async () => {
+  it('keeps complete distinct slugs when hashes match', async () => {
     const first = 'https://tr4ker.net/torrent/Example-Release-AbCdEf12';
     const second = 'https://tr4ker.net/torrent/Example-Release-AbCdEf13';
     const hash = 'a'.repeat(40);
-    assert.equal(
-      canonicalizeTorznabGuid(
-        `https://user:${key}@tr4ker.net/torrent/Example-Release-AbCdEf12?token=${key}#${key}`,
-        [key]
-      ),
-      first
-    );
     const page = await normalize(
       rss(
         item(first, attr('infohash', hash)) +
@@ -374,18 +373,18 @@ describe('Torznab identity and security', () => {
       'TORRENT_ID=42&torrentid=42&ID=42',
     ]) {
       const canonical = canonicalizeTorznabGuid(
-        `https://tr4ker.net/details.php?${query}`
+        `https://tracker.invalid/details.php?${query}`
       );
-      assert.equal(canonical, 'https://tr4ker.net/details.php?id=42');
+      assert.equal(canonical, 'https://tracker.invalid/details.php?id=42');
       assertSafeCanonicalGuid(canonical!);
     }
     const numericPath = canonicalizeTorznabGuid(
-      'https://tr4ker.net/torrents/42?ID=42&Torrent_Id=42'
+      'https://tracker.invalid/torrents/42?ID=42&Torrent_Id=42'
     );
-    assert.equal(numericPath, 'https://tr4ker.net/torrents/42?id=42');
+    assert.equal(numericPath, 'https://tracker.invalid/torrents/42?id=42');
     assertSafeCanonicalGuid(numericPath!);
-    // An opaque slug is retained even when a numeric query is also supplied.
-    const slug = 'https://tr4ker.net/torrent/Example-Release-42';
+    // Legacy generic numeric queries do not establish equivalence to slugs.
+    const slug = 'https://tracker.invalid/torrent/Example-Release-42';
     assert.equal(canonicalizeTorznabGuid(`${slug}?ID=43`), `${slug}?id=43`);
     assert.notEqual(
       canonicalizeTorznabGuid(`${slug}?id=43`),
@@ -393,29 +392,40 @@ describe('Torznab identity and security', () => {
     );
     assert.equal(
       canonicalizeTorznabGuid(
-        'https://tr4ker.net/details.php?ID=9007199254740993'
+        'https://tracker.invalid/details.php?ID=9007199254740993'
       ),
-      'https://tr4ker.net/details.php?id=9007199254740993'
+      'https://tracker.invalid/details.php?id=9007199254740993'
     );
   });
 
   for (const guid of [
-    'https://tr4ker.net/details.php?id=42&ID=43',
-    'https://tr4ker.net/details.php?id=42&torrentid=43',
-    'https://tr4ker.net/details.php?TORRENT_ID=42&TorrentId=43',
-    'https://tr4ker.net/torrents/42?id=43',
-    'https://tr4ker.net/torrents/42?TORRENT_ID=43',
-    'https://tr4ker.net/torrents/42/?TorrentId=43',
+    'https://tracker.invalid/details.php?id=42&ID=43',
+    'https://tracker.invalid/details.php?id=42&torrentid=43',
+    'https://tracker.invalid/details.php?TORRENT_ID=42&TorrentId=43',
+    'https://tracker.invalid/torrents/42?id=43',
+    'https://tracker.invalid/torrents/42?TORRENT_ID=43',
+    'https://tracker.invalid/torrents/42/?TorrentId=43',
   ]) {
     it(`rejects contradictory logical torrent identifiers: ${guid}`, () => {
       assert.equal(canonicalizeTorznabGuid(guid), null);
     });
   }
 
-  it('does not broaden the verified slug structure or accept malformed slugs', () => {
+  it('rejects unexpected TR4KER URL components with safe identity anomalies', async () => {
     for (const guid of [
       'https://other.invalid/torrent/Example-Release',
       'http://tr4ker.net/torrent/Example-Release',
+      'https://www.tr4ker.net/torrent/Example-Release',
+      'https://tr4ker.net.other.invalid/torrent/Example-Release',
+      'https://tr4ker.net:444/torrent/Example-Release',
+      `https://user:${key}@tr4ker.net/torrent/Example-Release`,
+      `https://tr4ker.net/torrent/Example-Release?apikey=${key}`,
+      `https://tr4ker.net/torrent/Example-Release?token=${key}`,
+      'https://tr4ker.net/torrent/Example-Release?id=42',
+      'https://tr4ker.net/torrent/Example-Release?',
+      `https://tr4ker.net/torrent/Example-Release#${key}`,
+      'https://tr4ker.net/torrent/Example-Release#',
+      'https://tr4ker.net/torrent/',
       'https://tr4ker.net/torrents/Example-Release',
       'https://tr4ker.net/torrent/Example-Release/extra',
       'https://tr4ker.net/torrent/Example-Release/',
@@ -424,8 +434,30 @@ describe('Torznab identity and security', () => {
       'https://tr4ker.net/torrent/-Example-Release',
       'https://tr4ker.net/torrent/Example--Release',
       'https://tr4ker.net/torrent/Example-Release-',
-    ])
-      assert.equal(canonicalizeTorznabGuid(guid), null);
+      'https://tr4ker.net/torrent/Example-%52elease',
+      'https://tr4ker.net/torrent/Example-%ZZRelease',
+      'https://tr4ker.net/torrent/Example-Release\n',
+      'https://tr4ker.net/torrent/Example-\tRelease',
+      'https://tr4ker.net\\torrent\\Example-Release',
+      'https://tr4ker.net/other/../torrent/Example-Release',
+      `https://tr4ker.net/torrent/Example-${key.replaceAll('_', '-')}-Release`,
+    ]) {
+      assert.equal(
+        canonicalizeTorznabGuid(guid, [key, key.replaceAll('_', '-')]),
+        null
+      );
+      const page = await normalizeTorznabPage(
+        rss(item(guid.replaceAll('&', '&amp;'))),
+        context,
+        [key, key.replaceAll('_', '-')]
+      );
+      assert.deepEqual(page.records, []);
+      assert.deepEqual(page.anomalies, [
+        { itemIndex: 0, code: 'invalid_identity', field: 'canonicalGuid' },
+      ]);
+      assert.ok(!JSON.stringify(page).includes(key));
+      assert.ok(!JSON.stringify(page).includes(guid));
+    }
   });
 
   it('rejects credential assignments and encoded secrets without returning sensitive diagnostics', async () => {
@@ -465,19 +497,38 @@ describe('Torznab identity and security', () => {
     }
   });
 
-  it('removes only credential URL components while retaining stable identity components', () => {
-    const canonical = 'https://tr4ker.net/details.php?id=42';
-    const guid = `https://user:${key}@tr4ker.net/details.php?torrentid=42&apikey=${key}&id=42&passkey=OTHER_SECRET&token=TOKEN#FRAGMENT`;
-    assert.equal(canonicalizeTorznabGuid(guid, [key]), canonical);
+  it('retains safe generic identities and rejects their unsafe URL components', () => {
+    const canonical = 'https://tracker.invalid/details.php?id=42';
     assert.equal(canonicalizeTorznabGuid(canonical), canonical);
     assert.notEqual(
-      canonicalizeTorznabGuid('https://tr4ker.net/torrents/42'),
-      canonicalizeTorznabGuid('https://tr4ker.net/torrents/43')
+      canonicalizeTorznabGuid('https://tracker.invalid/torrents/42'),
+      canonicalizeTorznabGuid('https://tracker.invalid/torrents/43')
     );
     assert.equal(
       canonicalizeTorznabGuid('urn:uuid:1234-5678'),
       'urn:uuid:1234-5678'
     );
+    for (const guid of [
+      'https://tracker.invalid/torrents/42?apikey=UNKNOWN',
+      'https://user:UNKNOWN@tracker.invalid/torrents/42',
+      'https://tracker.invalid/torrents/42#UNKNOWN',
+      'https://tracker.invalid/torrents/42?unknown=1',
+    ])
+      assert.equal(canonicalizeTorznabGuid(guid), null);
+  });
+
+  it('does not replace a missing or invalid GUID with other tracker fields', async () => {
+    const fields = `<comments>https://tr4ker.net/torrent/Example-Release</comments><link>https://tr4ker.net/download?apikey=${key}</link><enclosure url="https://tr4ker.net/download?apikey=${key}"/>${attr('infohash', 'a'.repeat(40))}`;
+    for (const guid of ['', '<guid>invalid/guid</guid>']) {
+      const page = await normalize(
+        rss(`<item>${guid}<title>Example.Release</title>${fields}</item>`)
+      );
+      assert.deepEqual(page.records, []);
+      assert.deepEqual(page.anomalies, [
+        { itemIndex: 0, code: 'invalid_identity', field: 'canonicalGuid' },
+      ]);
+      assert.ok(!JSON.stringify(page).includes(key));
+    }
   });
 
   for (const guid of [

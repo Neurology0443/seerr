@@ -13,10 +13,8 @@ import type {
 const TORZNAB_NAMESPACE = 'http://torznab.com/schemas/2015/feed';
 const MAX_INTEGER = 2147483647;
 export const MAX_XML_BYTES = 8 * 1024 * 1024;
-const secretMarker =
-  /(?:^|[^a-z0-9])(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)\s*[=:/]/i;
-const credentialPath =
-  /\/(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)[_-][^/]*\//i;
+const credentialAssignment =
+  /(?:^|[^a-z0-9])(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)\s*[=:]/i;
 
 interface XmlNode {
   $ns: { local: string; uri: string };
@@ -48,7 +46,7 @@ function attribute(node: XmlNode, name: string): string | null {
 
 function text(node: XmlNode): string | null {
   if (Object.values(node).some(Array.isArray)) return null;
-  return typeof node._ === 'string' ? node._.trim() : null;
+  return typeof node._ === 'string' ? node._ : null;
 }
 
 function integer(
@@ -93,53 +91,58 @@ function safeText(
   )
     return null;
   const decoded = decode(value);
-  if (
-    decoded === null ||
-    secretMarker.test(decoded) ||
-    credentialPath.test(decoded)
-  )
-    return null;
+  if (decoded === null || credentialAssignment.test(decoded)) return null;
   if (secrets.some((secret) => secret && decoded.includes(secret))) return null;
   if (/https?:\/\/[^\s/]*@/i.test(decoded)) return null;
   return value;
 }
 
-/** Retain the full verified TR4KER slug or an unambiguous supported numeric
- * identity. Unknown query semantics are rejected rather than discarded. */
+/** Validate the documented TR4KER URL without removing identity components.
+ * Other Torznab sources retain their existing opaque and numeric forms. */
 export function canonicalizeTorznabGuid(
   input: string | null,
   secrets: readonly string[] = []
 ): string | null {
   if (!input || input.length > 2048) return null;
-  let guid = input.trim();
+  let guid = input;
   if (
+    guid.includes('\\') ||
     [...guid].some(
       (character) =>
         character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127
     )
   )
     return null;
+  const decoded = decode(guid);
+  if (
+    decoded === null ||
+    secrets.some((secret) => secret && decoded.includes(secret))
+  )
+    return null;
   if (/^https?:\/\//i.test(guid)) {
     try {
       const url = new URL(guid);
-      url.username = '';
-      url.password = '';
-      url.hash = '';
-      // Reject encoded paths and embedded credentials rather than guessing which
-      // path components identify the torrent and which are authentication.
       if (
-        !safeText(url.origin + url.pathname, secrets) ||
+        url.username ||
+        url.password ||
+        guid.includes('#') ||
         url.pathname.includes('%')
       )
         return null;
+      if (url.hostname === 'tr4ker.net') {
+        if (
+          url.protocol !== 'https:' ||
+          url.port ||
+          guid.includes('?') ||
+          !/^\/torrent\/[a-z0-9]+(?:-[a-z0-9]+)+$/i.test(url.pathname) ||
+          url.href !== guid
+        )
+          return null;
+        assertSafeCanonicalGuid(guid);
+        return guid;
+      }
       let queryId: string | null = null;
       for (const [key, value] of url.searchParams) {
-        if (
-          /^(?:api[_-]?key|passkey|token|access[_-]?token|auth|authorization|password|secret)$/i.test(
-            key
-          )
-        )
-          continue;
         if (
           !['id', 'torrentid', 'torrent_id'].includes(key.toLowerCase()) ||
           !/^\d+$/.test(value)
@@ -153,17 +156,14 @@ export function canonicalizeTorznabGuid(
         /\/(\d+)\/?$/.exec(url.pathname)?.[1].replace(/^0+(?=\d)/, '') ?? null;
       if (pathId !== null && queryId !== null && pathId !== queryId)
         return null;
-      const verifiedSlug =
-        url.origin === 'https://tr4ker.net' &&
-        /^\/torrent\/[a-z0-9]+(?:-[a-z0-9]+)+$/i.test(url.pathname);
-      if (queryId === null && pathId === null && !verifiedSlug) return null;
+      if (queryId === null && pathId === null) return null;
       url.search = queryId === null ? '' : `id=${queryId}`;
       guid = url.toString();
     } catch {
       return null;
     }
   }
-  if (!safeText(guid, secrets)) return null;
+  if (secrets.some((secret) => secret && guid.includes(secret))) return null;
   try {
     assertSafeCanonicalGuid(guid);
     return guid;
@@ -395,7 +395,7 @@ export async function normalizeTorznabPage(
     if (invalidHash) report('infohash');
     const infohash =
       !invalidHash && new Set(validHashes).size === 1 ? validHashes[0] : null;
-    const releaseName = safeText(scalar('title'), secrets);
+    const releaseName = safeText(scalar('title')?.trim() ?? null, secrets);
     if (releaseName === null) {
       report('releaseName');
       continue;
@@ -449,7 +449,7 @@ export async function normalizeTorznabPage(
       if (size === null) report('size');
       else provenance.size = { source: 'tracker', field: 'size' };
     }
-    const publishedAt = publicationDate(scalar('pubDate'));
+    const publishedAt = publicationDate(scalar('pubDate')?.trim() ?? null);
     if (children(item, 'pubDate').length) {
       if (publishedAt === null) report('publishedAt');
       else provenance.publishedAt = { source: 'tracker', field: 'pubDate' };

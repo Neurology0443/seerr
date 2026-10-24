@@ -40,27 +40,31 @@ GUID/infohash contradiction is excluded, including compatible or unknown-hash
 duplicates of that GUID. Other duplicates remain observations for P1's existing
 write boundary. Cross-page conflicts remain P1's responsibility.
 
-GUID canonicalization supports the verified TR4KER structure
+GUID canonicalization structurally validates the verified TR4KER structure
 `https://tr4ker.net/torrent/<hyphenated-release-slug>`. The entire slug retains its
 case and suffix; the validated infohash remains separate. An eight-character
 suffix matching the start of the infohash was observed in two examples, but this
 relationship is not guaranteed or required. Identity is never derived from a
-title, hash or presumed suffix format.
+title, hash or presumed suffix format. The GUID must already be in this canonical
+HTTPS form, with the exact hostname, one nonempty hyphenated slug and no port,
+userinfo, query string, fragment or encoded path component. Unexpected components
+are rejected, never removed to manufacture a valid identity.
 
-Previously supported opaque P1-safe identifiers, numeric URL paths and numeric
-query identifiers remain supported. Query aliases `id`, `torrentid` and
+Previously supported opaque P1-safe identifiers and generic Torznab numeric URL
+identities remain supported separately from the strict TR4KER convention.
+Generic query aliases `id`, `torrentid` and
 `torrent_id` are case-insensitive and normalize to one `id` parameter. Repeated
-aliases must agree, including with a numeric final path ID. Opaque slugs are not
-equated to numeric IDs; a supplied numeric query is retained alongside the slug.
-Credential parameters, userinfo and fragments are removed. Unknown query
-semantics, encoded paths, contradictory identifiers and identities lost after
-credential removal are rejected rather than guessed.
+aliases must agree, including with a numeric final path ID. Unknown parameters,
+encoded paths, userinfo, fragments and contradictory identities are rejected.
 
 Ordinary release words such as `Secret-Wars`, `Secret_Story` and `Token-Ring`
-are accepted without modifying titles. Credential assignments, credential-bearing
-paths and configured secret values (including supported encoded forms) remain
-rejected. Download/enclosure URLs are never returned or fetched. Unrecognized
-upstream GUID formats need a sanitized fixture and explicit normalization support.
+are accepted without modifying titles. GUID validation does not scan slug or
+path words for hypothetical credentials. The configured API-key value is still
+rejected wherever it appears, including supported encoded forms. Separate checks
+for non-GUID tracker text retain explicit credential-assignment and control/
+encoding safeguards. P1 applies generic URL component validation and rejects
+explicit credential assignments in opaque identifiers. Download/enclosure URLs
+are never returned or fetched, and `comments` is not used as a GUID fallback.
 
 `TrackerAdapterError` provides a fixed message, code, retryability, HTTP status,
 optional numeric Torznab API code and sanitized `retryAfter` (`{ seconds }` or
