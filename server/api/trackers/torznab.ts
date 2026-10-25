@@ -1,9 +1,12 @@
+import ExternalAPI from '@server/api/externalapi';
 import { assertSafeCanonicalGuid } from '@server/lib/catalogue/repository';
+import axios from 'axios';
 import xml2js from 'xml2js';
-import { TrackerAdapterError } from './errors';
+import { httpError, TrackerAdapterError } from './errors';
 import type {
   NormalizedTrackerPage,
   NormalizedTrackerTorrent,
+  PageRequest,
   TorrentField,
   TrackerAnomaly,
   TrackerCapabilities,
@@ -13,8 +16,13 @@ import type {
 const TORZNAB_NAMESPACE = 'http://torznab.com/schemas/2015/feed';
 const MAX_INTEGER = 2147483647;
 export const MAX_XML_BYTES = 8 * 1024 * 1024;
-const credentialAssignment =
-  /(?:^|[^a-z0-9])(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)\s*[=:]/i;
+
+export interface TorznabContract {
+  // Projection only: guid/title are required; other scalar fields are optional.
+  fields: readonly string[];
+  attributes: readonly string[];
+  canonicalizeGuid: (value: string) => string | null;
+}
 
 interface XmlNode {
   $ns: { local: string; uri: string };
@@ -91,85 +99,76 @@ function safeText(
   )
     return null;
   const decoded = decode(value);
-  if (decoded === null || credentialAssignment.test(decoded)) return null;
+  if (decoded === null) return null;
   if (secrets.some((secret) => secret && decoded.includes(secret))) return null;
-  if (/https?:\/\/[^\s/]*@/i.test(decoded)) return null;
   return value;
 }
 
-/** Validate the documented TR4KER URL without removing identity components.
- * Other Torznab sources retain their existing opaque and numeric forms. */
+/** The source contract owns accepted identity forms; P1 remains the final
+ * generic storage safety boundary. There is no implicit identity fallback. */
 export function canonicalizeTorznabGuid(
   input: string | null,
+  contract: TorznabContract,
   secrets: readonly string[] = []
 ): string | null {
   if (!input || input.length > 2048) return null;
-  let guid = input;
   if (
-    guid.includes('\\') ||
-    [...guid].some(
+    input.includes('\\') ||
+    [...input].some(
       (character) =>
         character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127
     )
   )
     return null;
-  const decoded = decode(guid);
+  const decoded = decode(input);
   if (
     decoded === null ||
     secrets.some((secret) => secret && decoded.includes(secret))
   )
     return null;
-  if (/^https?:\/\//i.test(guid)) {
-    try {
-      const url = new URL(guid);
-      if (
-        url.username ||
-        url.password ||
-        guid.includes('#') ||
-        url.pathname.includes('%')
-      )
-        return null;
-      if (url.hostname === 'tr4ker.net') {
-        if (
-          url.protocol !== 'https:' ||
-          url.port ||
-          guid.includes('?') ||
-          !/^\/torrent\/[a-z0-9]+(?:-[a-z0-9]+)+$/i.test(url.pathname) ||
-          url.href !== guid
-        )
-          return null;
-        assertSafeCanonicalGuid(guid);
-        return guid;
-      }
-      let queryId: string | null = null;
-      for (const [key, value] of url.searchParams) {
-        if (
-          !['id', 'torrentid', 'torrent_id'].includes(key.toLowerCase()) ||
-          !/^\d+$/.test(value)
-        )
-          return null;
-        const id = value.replace(/^0+(?=\d)/, '');
-        if (queryId !== null && queryId !== id) return null;
-        queryId = id;
-      }
-      const pathId =
-        /\/(\d+)\/?$/.exec(url.pathname)?.[1].replace(/^0+(?=\d)/, '') ?? null;
-      if (pathId !== null && queryId !== null && pathId !== queryId)
-        return null;
-      if (queryId === null && pathId === null) return null;
-      url.search = queryId === null ? '' : `id=${queryId}`;
-      guid = url.toString();
-    } catch {
-      return null;
-    }
-  }
-  if (secrets.some((secret) => secret && guid.includes(secret))) return null;
   try {
+    const guid = contract.canonicalizeGuid(input);
+    if (guid === null) return null;
+    const normalized = decode(guid);
+    if (
+      normalized === null ||
+      secrets.some((secret) => secret && normalized.includes(secret))
+    )
+      return null;
     assertSafeCanonicalGuid(guid);
     return guid;
   } catch {
     return null;
   }
+}
+
+// A protocol helper only. The caller's contract must first validate its source
+// hostname and routes; this helper does not decide which URLs are identities.
+export function canonicalizeNumericTorznabGuid(url: URL): string | null {
+  if (
+    url.username ||
+    url.password ||
+    url.href.includes('#') ||
+    url.pathname.includes('%')
+  )
+    return null;
+  let queryId: string | null = null;
+  for (const [key, value] of url.searchParams) {
+    if (
+      !['id', 'torrentid', 'torrent_id'].includes(key.toLowerCase()) ||
+      !/^\d+$/.test(value)
+    )
+      return null;
+    const id = value.replace(/^0+(?=\d)/, '');
+    if (queryId !== null && queryId !== id) return null;
+    queryId = id;
+  }
+  const pathId =
+    /\/(\d+)\/?$/.exec(url.pathname)?.[1].replace(/^0+(?=\d)/, '') ?? null;
+  if (pathId !== null && queryId !== null && pathId !== queryId) return null;
+  if (queryId === null && pathId === null) return null;
+  url.search = queryId === null ? '' : `id=${queryId}`;
+  return url.toString();
 }
 
 function publicationDate(value: string | null): Date | null {
@@ -287,6 +286,7 @@ async function parseXml(xml: string): Promise<XmlNode> {
 export async function normalizeTorznabPage(
   xml: string,
   context: TrackerPageContext,
+  contract: TorznabContract,
   secrets: readonly string[] = []
 ): Promise<NormalizedTrackerPage> {
   if (
@@ -361,15 +361,22 @@ export async function normalizeTorznabPage(
       anomalies.push({ itemIndex, code, field });
     };
     const scalar = (name: string): string | null => {
+      if (!contract.fields.includes(name)) return null;
       const nodes = children(item, name);
       return nodes.length === 1 ? text(nodes[0]) : null;
     };
-    const canonicalGuid = canonicalizeTorznabGuid(scalar('guid'), secrets);
+    const canonicalGuid = canonicalizeTorznabGuid(
+      scalar('guid'),
+      contract,
+      secrets
+    );
     if (canonicalGuid === null) {
-      report('canonicalGuid', 'invalid_identity');
+      report('canonicalGuid', 'contract_incompatible');
       continue;
     }
-    const attrs = children(item, 'attr', TORZNAB_NAMESPACE);
+    const attrs = children(item, 'attr', TORZNAB_NAMESPACE).filter((attr) =>
+      contract.attributes.includes(attribute(attr, 'name') ?? '')
+    );
     const attributeValues = (name: string) =>
       attrs
         .filter((attr) => attribute(attr, 'name') === name)
@@ -397,7 +404,7 @@ export async function normalizeTorznabPage(
       !invalidHash && new Set(validHashes).size === 1 ? validHashes[0] : null;
     const releaseName = safeText(scalar('title')?.trim() ?? null, secrets);
     if (releaseName === null) {
-      report('releaseName');
+      report('releaseName', 'contract_incompatible');
       continue;
     }
     const provenance: NormalizedTrackerTorrent['provenance'] = {
@@ -444,13 +451,20 @@ export async function normalizeTorznabPage(
       };
     let size = numeric('size', 'size', 0, Number.MAX_SAFE_INTEGER);
     // A validated RSS size is an equivalent only when the primary attr is absent.
-    if (!attributeValues('size').length && children(item, 'size').length) {
+    if (
+      contract.fields.includes('size') &&
+      !attributeValues('size').length &&
+      children(item, 'size').length
+    ) {
       size = integer(scalar('size'), 0, Number.MAX_SAFE_INTEGER);
       if (size === null) report('size');
       else provenance.size = { source: 'tracker', field: 'size' };
     }
     const publishedAt = publicationDate(scalar('pubDate')?.trim() ?? null);
-    if (children(item, 'pubDate').length) {
+    if (
+      contract.fields.includes('pubDate') &&
+      children(item, 'pubDate').length
+    ) {
       if (publishedAt === null) report('publishedAt');
       else provenance.publishedAt = { source: 'tracker', field: 'pubDate' };
     }
@@ -491,6 +505,11 @@ export async function normalizeTorznabPage(
       a.itemIndex - b.itemIndex ||
       (a.field < b.field ? -1 : a.field > b.field ? 1 : 0)
   );
+  const criticalRejections = new Set(
+    anomalies
+      .filter((anomaly) => anomaly.code === 'contract_incompatible')
+      .map((anomaly) => anomaly.itemIndex)
+  ).size;
   return {
     trackerId: context.trackerId,
     category: context.category,
@@ -500,6 +519,12 @@ export async function normalizeTorznabPage(
     records,
     anomalies,
     receivedCount: items.length,
+    contractStatus:
+      criticalRejections === 0
+        ? 'compatible'
+        : criticalRejections === items.length
+          ? 'incompatible'
+          : 'partial',
   };
 }
 
@@ -578,4 +603,94 @@ export async function parseTorznabCapabilities(
       operations,
     },
   };
+}
+
+export class TorznabAPI extends ExternalAPI {
+  constructor(
+    private readonly config: {
+      endpoint: string;
+      trackerId: string;
+      parameters: Record<string, string>;
+      timeout: number;
+      contract: TorznabContract;
+      secrets: readonly string[];
+    }
+  ) {
+    super(config.endpoint, config.parameters, {
+      timeout: config.timeout,
+      headers: { Accept: 'application/xml', 'Content-Type': 'application/xml' },
+    });
+  }
+
+  getCapabilities() {
+    return this.request({ t: 'caps' }, (xml) =>
+      parseTorznabCapabilities(xml, this.config.trackerId, this.config.secrets)
+    );
+  }
+
+  protected fetchSearchPage(page: Required<PageRequest>, categoryId: number) {
+    return this.request(
+      { t: 'search', cat: categoryId, limit: page.limit, offset: page.offset },
+      (xml, observedAt) =>
+        normalizeTorznabPage(
+          xml,
+          {
+            ...page,
+            trackerId: this.config.trackerId,
+            observedAt,
+          },
+          this.config.contract,
+          this.config.secrets
+        )
+    );
+  }
+
+  private async request<T>(
+    params: Record<string, string | number>,
+    parse: (xml: string, observedAt: Date) => Promise<T>
+  ): Promise<T> {
+    let status: number | null = null;
+    try {
+      // No application cache, retries or redirect forwarding of credentials.
+      const response = await this.axios.get<string>('', {
+        params,
+        responseType: 'text',
+        transformResponse: [(data) => data],
+        maxRedirects: 0,
+        maxContentLength: MAX_XML_BYTES,
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      status = response.status;
+      if (status < 200 || status >= 300)
+        throw httpError(status, response.headers['retry-after']);
+      const observedAt = new Date();
+      return await parse(response.data, observedAt);
+    } catch (error: unknown) {
+      if (error instanceof TrackerAdapterError) {
+        throw new TrackerAdapterError(error.code, error.retryable, {
+          httpStatus: error.httpStatus ?? status,
+          retryAfter: error.retryAfter,
+          apiCode: error.apiCode,
+        });
+      }
+      // Never retain the Axios exception, its cause, config, URL or response body.
+      if (axios.isAxiosError(error) && error.response) {
+        throw httpError(
+          error.response.status,
+          error.response.headers['retry-after']
+        );
+      }
+      const code =
+        error && typeof error === 'object' && 'code' in error
+          ? error.code
+          : null;
+      throw new TrackerAdapterError(
+        code === 'ECONNABORTED' || code === 'ETIMEDOUT'
+          ? 'timeout'
+          : 'transport',
+        true,
+        { httpStatus: status }
+      );
+    }
+  }
 }

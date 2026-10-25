@@ -12,14 +12,41 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { TrackerAdapterError } from './errors';
+import type { TorznabContract } from './torznab';
 import {
-  canonicalizeTorznabGuid,
+  canonicalizeTorznabGuid as canonicalizeGuid,
+  canonicalizeNumericTorznabGuid,
   normalizeTorznabPage,
   parseTorznabCapabilities,
 } from './torznab';
+import { TR4KER_CONTRACT } from './tr4ker';
 import type { TrackerPageContext } from './types';
 
 const key = 'P2_API_KEY_SENTINEL';
+// Explicit fixture-only identities for protocol tests. Production TR4KER never
+// receives this contract and cannot fall back to its opaque/numeric forms.
+const fixtureContract: TorznabContract = {
+  fields: TR4KER_CONTRACT.fields,
+  attributes: TR4KER_CONTRACT.attributes,
+  canonicalizeGuid(value) {
+    if (/^[a-z0-9._:-]+$/i.test(value)) return value;
+    const tr4kerGuid = TR4KER_CONTRACT.canonicalizeGuid(value);
+    if (tr4kerGuid !== null) return tr4kerGuid;
+    const url = new URL(value);
+    if (
+      url.origin !== 'https://tracker.invalid' ||
+      !/^(?:\/details\.php|\/torrents\/\d+\/?|\/torrent\/Example-Release-42)$/.test(
+        url.pathname
+      )
+    )
+      return null;
+    return canonicalizeNumericTorznabGuid(url);
+  },
+};
+const canonicalizeTorznabGuid = (
+  value: string | null,
+  secrets: readonly string[] = []
+) => canonicalizeGuid(value, fixtureContract, secrets);
 const fixture = (name: string) =>
   readFileSync(path.join(__dirname, '__fixtures__', name + '.xml'), 'utf8');
 const context: TrackerPageContext = {
@@ -35,7 +62,10 @@ const item = (guid: string, fields = '') =>
   `<item><guid>${guid}</guid><title>Example.Release</title>${fields}</item>`;
 const rss = (items: string) =>
   `<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>${items}</channel></rss>`;
-const normalize = (xml: string) => normalizeTorznabPage(xml, context, [key]);
+const normalize = (xml: string) =>
+  normalizeTorznabPage(xml, context, fixtureContract, [key]);
+const normalizeTr4ker = (xml: string) =>
+  normalizeTorznabPage(xml, context, TR4KER_CONTRACT, [key]);
 
 describe('Torznab normalization', () => {
   it('preserves nullable P1 fields, categories, raw metadata and provenance deterministically', async () => {
@@ -122,7 +152,7 @@ describe('Torznab normalization', () => {
     );
     assert.deepEqual(
       page.anomalies
-        .filter((value) => value.code === 'invalid_identity')
+        .filter((value) => value.code === 'contract_incompatible')
         .map((value) => value.itemIndex),
       [5, 6]
     );
@@ -318,6 +348,9 @@ describe('Torznab identity and security', () => {
     ['Password-Story.2026', 'Password-Story-2026'],
     ['Passkey_Story.S01', 'Passkey-Story-S01'],
     ['APIKey-Story.2026', 'APIKey-Story-2026'],
+    ['Secret: Invasion S01E01', 'Secret-Invasion-S01E01'],
+    ['The Secret: Dare to Dream', 'The-Secret-Dare-to-Dream'],
+    ['Token: The Series', 'Token-The-Series'],
     ['War.S01E04.MULTI.2160p.AMEN', 'war-s01e04-multi-2160p-amen-8bb905c7'],
     [
       'Secret.Token.Password.Passkey.APIKey',
@@ -327,7 +360,7 @@ describe('Torznab identity and security', () => {
     it(`preserves the legitimate release title and full slug: ${title}`, async () => {
       const guid = `https://tr4ker.net/torrent/${slug}`;
       const hash = 'b'.repeat(40);
-      const page = await normalize(
+      const page = await normalizeTr4ker(
         rss(item(guid, attr('infohash', hash))).replace(
           '<title>Example.Release</title>',
           `<title>${title}</title>`
@@ -418,6 +451,11 @@ describe('Torznab identity and security', () => {
       'https://www.tr4ker.net/torrent/Example-Release',
       'https://tr4ker.net.other.invalid/torrent/Example-Release',
       'https://tr4ker.net:444/torrent/Example-Release',
+      'https://other.invalid/torrents/42',
+      'https://tracker.invalid/torrents/42',
+      'https://tr4ker.net/torrents/42',
+      'https://tr4ker.net/details.php?id=42',
+      'torrent-1',
       `https://user:${key}@tr4ker.net/torrent/Example-Release`,
       `https://tr4ker.net/torrent/Example-Release?apikey=${key}`,
       `https://tr4ker.net/torrent/Example-Release?token=${key}`,
@@ -443,21 +481,123 @@ describe('Torznab identity and security', () => {
       `https://tr4ker.net/torrent/Example-${key.replaceAll('_', '-')}-Release`,
     ]) {
       assert.equal(
-        canonicalizeTorznabGuid(guid, [key, key.replaceAll('_', '-')]),
+        canonicalizeGuid(guid, TR4KER_CONTRACT, [
+          key,
+          key.replaceAll('_', '-'),
+        ]),
         null
       );
       const page = await normalizeTorznabPage(
         rss(item(guid.replaceAll('&', '&amp;'))),
         context,
+        TR4KER_CONTRACT,
         [key, key.replaceAll('_', '-')]
       );
       assert.deepEqual(page.records, []);
       assert.deepEqual(page.anomalies, [
-        { itemIndex: 0, code: 'invalid_identity', field: 'canonicalGuid' },
+        { itemIndex: 0, code: 'contract_incompatible', field: 'canonicalGuid' },
       ]);
       assert.ok(!JSON.stringify(page).includes(key));
       assert.ok(!JSON.stringify(page).includes(guid));
     }
+  });
+
+  it('applies the source-provided identity and projection contract in the shared engine', async () => {
+    const guid = 'https://fixture.invalid/release/42';
+    const contract: TorznabContract = {
+      fields: ['guid', 'title'],
+      attributes: ['seeders'],
+      canonicalizeGuid: (value) => (value === guid ? value : null),
+    };
+    const xml = rss(
+      item(
+        guid,
+        attr('seeders', '0') +
+          attr('tmdbid', '1234') +
+          '<pubDate>excluded-invalid-date</pubDate><size>excluded-invalid-size</size>' +
+          `<link>https://fixture.invalid/download?apikey=${key}</link>`
+      )
+    );
+    const page = await normalizeTorznabPage(xml, context, contract, [key]);
+    assert.equal(page.records[0].canonicalGuid, guid);
+    assertSafeCanonicalGuid(page.records[0].canonicalGuid);
+    assert.equal(page.records[0].seeders, 0);
+    assert.equal(page.records[0].trackerMetadata.tmdbId, null);
+    assert.equal(page.records[0].provenance.tmdbId, undefined);
+    assert.equal(page.contractStatus, 'compatible');
+    assert.deepEqual(page.anomalies, []);
+    assert.ok(!JSON.stringify(page).includes(key));
+    const tr4ker = await normalizeTr4ker(xml);
+    assert.deepEqual(tr4ker.records, []);
+    assert.equal(tr4ker.contractStatus, 'incompatible');
+    assert.deepEqual(tr4ker.anomalies, [
+      { itemIndex: 0, code: 'contract_incompatible', field: 'canonicalGuid' },
+    ]);
+  });
+
+  it('distinguishes partial, incompatible and genuinely empty pages without collection decisions', async () => {
+    const good = item(
+      'https://tr4ker.net/torrent/Good-Release',
+      attr('seeders', '0')
+    );
+    const badGuid = `https://tracker.invalid/passkey/${key}/42`;
+    const bad = item(badGuid).replace('Example.Release', 'REJECTED_TITLE');
+    for (const [xml, status, received, valid, rejected] of [
+      [rss(good + bad), 'partial', 2, 1, [1]],
+      [rss(good + bad + bad), 'partial', 3, 1, [1, 2]],
+      [rss(bad + bad), 'incompatible', 2, 0, [0, 1]],
+      [fixture('empty'), 'compatible', 0, 0, []],
+    ] as const) {
+      const page = await normalizeTr4ker(xml);
+      assert.equal(page.contractStatus, status);
+      assert.equal(page.receivedCount, received);
+      assert.equal(page.records.length, valid);
+      assert.deepEqual(
+        page.anomalies,
+        rejected.map((itemIndex) => ({
+          itemIndex,
+          code: 'contract_incompatible',
+          field: 'canonicalGuid',
+        }))
+      );
+      assert.equal(page.trackerId, context.trackerId);
+      assert.equal(page.category, context.category);
+      assert.equal(page.offset, context.offset);
+      assert.deepEqual(page.observedAt, context.observedAt);
+      const diagnostics = JSON.stringify({
+        anomalies: page.anomalies,
+        contractStatus: page.contractStatus,
+      });
+      assert.doesNotMatch(diagnostics, /SENTINEL|REJECTED_TITLE|https|<rss/);
+      for (const field of ['checkpoint', 'complete', 'suspended', 'coverage'])
+        assert.equal(field in page, false);
+    }
+  });
+
+  it('treats unusable required titles as critical but missing optional fields as unknown', async () => {
+    const guid = 'https://tr4ker.net/torrent/Valid-Release';
+    const invalid = `<item><guid>${guid}</guid><title>Release.${key}</title></item>`;
+    const page = await normalizeTr4ker(
+      rss(
+        item(guid, attr('seeders', '-1')) +
+          invalid +
+          `<item><guid>${guid}</guid></item>`
+      )
+    );
+    assert.equal(page.records.length, 1);
+    assert.equal(page.records[0].seeders, null);
+    assert.equal(page.records[0].leechers, null);
+    assert.equal(page.contractStatus, 'partial');
+    assert.deepEqual(page.anomalies, [
+      { itemIndex: 0, code: 'invalid_field', field: 'seeders' },
+      { itemIndex: 1, code: 'contract_incompatible', field: 'releaseName' },
+      { itemIndex: 2, code: 'contract_incompatible', field: 'releaseName' },
+    ]);
+    const optionalOnly = await normalizeTr4ker(
+      rss(item(guid, attr('seeders', '-1')))
+    );
+    assert.equal(optionalOnly.contractStatus, 'compatible');
+    assert.ok(!JSON.stringify(page).includes(key));
   });
 
   it('rejects credential assignments and encoded secrets without returning sensitive diagnostics', async () => {
@@ -473,7 +613,7 @@ describe('Torznab identity and security', () => {
         );
         assert.deepEqual(page.records, []);
         assert.deepEqual(page.anomalies, [
-          { itemIndex: 0, code: 'invalid_field', field: 'releaseName' },
+          { itemIndex: 0, code: 'contract_incompatible', field: 'releaseName' },
         ]);
         assert.ok(!JSON.stringify(page).includes(key));
         assert.equal(canonicalizeTorznabGuid(text, [key]), null);
@@ -491,7 +631,7 @@ describe('Torznab identity and security', () => {
       const page = await normalize(rss(item(guid)));
       assert.deepEqual(page.records, []);
       assert.deepEqual(page.anomalies, [
-        { itemIndex: 0, code: 'invalid_identity', field: 'canonicalGuid' },
+        { itemIndex: 0, code: 'contract_incompatible', field: 'canonicalGuid' },
       ]);
       assert.ok(!JSON.stringify(page).includes(key));
     }
@@ -525,7 +665,7 @@ describe('Torznab identity and security', () => {
       );
       assert.deepEqual(page.records, []);
       assert.deepEqual(page.anomalies, [
-        { itemIndex: 0, code: 'invalid_identity', field: 'canonicalGuid' },
+        { itemIndex: 0, code: 'contract_incompatible', field: 'canonicalGuid' },
       ]);
       assert.ok(!JSON.stringify(page).includes(key));
     }
@@ -609,6 +749,7 @@ describe('Torznab identity and security', () => {
     const page = await normalizeTorznabPage(
       rss(item('torrent-1', attr('infohash', secret.toUpperCase()))),
       context,
+      fixtureContract,
       [secret]
     );
     assert.equal(page.records[0].infohash, null);
@@ -621,7 +762,7 @@ describe('Torznab identity and security', () => {
   it('does not persist credentials echoed in arbitrary release text', async () => {
     const page = await normalize(
       rss(
-        `<item><guid>a</guid><title>Release.${key}</title></item><item><guid>b</guid><title>Release?passkey=OTHER_SECRET</title></item>`
+        `<item><guid>a</guid><title>Release.${key}</title></item><item><guid>b</guid><title>Release?passkey=${key}</title></item>`
       )
     );
     assert.deepEqual(page.records, []);
@@ -652,15 +793,19 @@ describe('Torznab identity and security', () => {
     const result = await normalizeTorznabPage(
       fixture('empty'),
       suppliedContext,
+      fixtureContract,
       [key]
     );
     assert.ok(!JSON.stringify(result).includes(key));
     assert.equal('apiKey' in result, false);
     assert.equal('authenticatedUrl' in result, false);
     await assert.rejects(
-      normalizeTorznabPage(fixture('empty'), { ...context, trackerId: key }, [
-        key,
-      ]),
+      normalizeTorznabPage(
+        fixture('empty'),
+        { ...context, trackerId: key },
+        fixtureContract,
+        [key]
+      ),
       TrackerAdapterError
     );
     await assert.rejects(

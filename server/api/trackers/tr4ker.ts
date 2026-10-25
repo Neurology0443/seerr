@@ -1,12 +1,6 @@
-import ExternalAPI from '@server/api/externalapi';
 import { getSettings } from '@server/lib/settings';
-import axios from 'axios';
-import { httpError, TrackerAdapterError } from './errors';
-import {
-  MAX_XML_BYTES,
-  normalizeTorznabPage,
-  parseTorznabCapabilities,
-} from './torznab';
+import { TrackerAdapterError } from './errors';
+import { TorznabAPI } from './torznab';
 import type { PageRequest, TrackerAdapter } from './types';
 
 export interface Tr4kerConfig {
@@ -16,12 +10,49 @@ export interface Tr4kerConfig {
   timeout?: number;
 }
 
-const DEFAULT_ENDPOINT = 'https://tr4ker.net/api/torznab/all';
-const CATEGORIES = { movie: 2000, tv: 5000 };
+export const TR4KER_CONTRACT = {
+  endpoint: 'https://tr4ker.net/api/torznab/all',
+  categories: { movie: 2000, tv: 5000 },
+  authenticationQueryParameter: 'apikey',
+  // GUID and title are required. The engine projects only these scalar fields
+  // and attributes. Comments, download links and enclosures are never read.
+  fields: ['guid', 'title', 'pubDate', 'size'],
+  attributes: [
+    'category',
+    'infohash',
+    'size',
+    'seeders',
+    'leechers',
+    'tmdbid',
+    'tvdbid',
+    'season',
+    'episode',
+  ],
+  canonicalizeGuid(value: string): string | null {
+    try {
+      const url = new URL(value);
+      if (
+        url.protocol !== 'https:' ||
+        url.hostname !== 'tr4ker.net' ||
+        url.port ||
+        url.username ||
+        url.password ||
+        value.includes('?') ||
+        value.includes('#') ||
+        !/^\/torrent\/[a-z0-9]+(?:-[a-z0-9]+)+$/i.test(url.pathname) ||
+        url.href !== value
+      )
+        return null;
+      return value;
+    } catch {
+      return null;
+    }
+  },
+};
 
 function validateConfiguration(config: Tr4kerConfig): string {
   try {
-    const endpoint = new URL(config.endpoint ?? DEFAULT_ENDPOINT);
+    const endpoint = new URL(config.endpoint ?? TR4KER_CONTRACT.endpoint);
     if (
       endpoint.protocol !== 'https:' ||
       endpoint.username ||
@@ -58,110 +89,34 @@ export function validateTr4kerPage(params: PageRequest): Required<PageRequest> {
 }
 
 export default class Tr4kerAdapter
-  extends ExternalAPI
+  extends TorznabAPI
   implements TrackerAdapter
 {
-  private readonly trackerId: string;
-  private readonly secrets: readonly string[];
-
   constructor(config: Tr4kerConfig) {
-    super(
-      validateConfiguration(config),
-      { apikey: config.apiKey },
-      {
-        timeout: config.timeout ?? getSettings().network.apiRequestTimeout,
-        headers: {
-          Accept: 'application/xml',
-          'Content-Type': 'application/xml',
-        },
-      }
-    );
-    this.trackerId = config.trackerId;
-    this.secrets = [config.apiKey];
-  }
-
-  getCapabilities() {
-    return this.request({ t: 'caps' }, (xml) =>
-      parseTorznabCapabilities(xml, this.trackerId, this.secrets)
-    );
+    super({
+      endpoint: validateConfiguration(config),
+      trackerId: config.trackerId,
+      parameters: {
+        [TR4KER_CONTRACT.authenticationQueryParameter]: config.apiKey,
+      },
+      timeout: config.timeout ?? getSettings().network.apiRequestTimeout,
+      contract: TR4KER_CONTRACT,
+      secrets: [config.apiKey],
+    });
   }
 
   fetchRecentPage(params: PageRequest) {
-    return this.fetchSearchPage(params);
+    return this.fetchPage(params);
   }
-
   fetchHistoricalPage(params: PageRequest) {
-    return this.fetchSearchPage(params);
+    return this.fetchPage(params);
   }
 
-  private async fetchSearchPage(params: PageRequest) {
+  private async fetchPage(params: PageRequest) {
     const page = validateTr4kerPage(params);
-    return this.request(
-      {
-        t: 'search',
-        cat: CATEGORIES[page.category],
-        limit: page.limit,
-        offset: page.offset,
-      },
-      (xml, observedAt) =>
-        normalizeTorznabPage(
-          xml,
-          {
-            ...page,
-            trackerId: this.trackerId,
-            observedAt,
-          },
-          this.secrets
-        )
+    return this.fetchSearchPage(
+      page,
+      TR4KER_CONTRACT.categories[page.category]
     );
-  }
-
-  private async request<T>(
-    params: Record<string, string | number>,
-    parse: (xml: string, observedAt: Date) => Promise<T>
-  ): Promise<T> {
-    let status: number | null = null;
-    try {
-      // No application cache, retries or redirect forwarding of the API key.
-      const response = await this.axios.get<string>('', {
-        params,
-        responseType: 'text',
-        transformResponse: [(data) => data],
-        maxRedirects: 0,
-        maxContentLength: MAX_XML_BYTES,
-        headers: { 'Cache-Control': 'no-cache' },
-      });
-      status = response.status;
-      if (status < 200 || status >= 300)
-        throw httpError(status, response.headers['retry-after']);
-      const observedAt = new Date();
-      return await parse(response.data, observedAt);
-    } catch (error: unknown) {
-      if (error instanceof TrackerAdapterError) {
-        throw new TrackerAdapterError(error.code, error.retryable, {
-          httpStatus: error.httpStatus ?? status,
-          retryAfter: error.retryAfter,
-          apiCode: error.apiCode,
-        });
-      }
-      // Never retain the Axios exception, its cause, config, URL or response body.
-      if (axios.isAxiosError(error) && error.response) {
-        throw httpError(
-          error.response.status,
-          error.response.headers['retry-after']
-        );
-      }
-      const code =
-        error && typeof error === 'object' && 'code' in error
-          ? error.code
-          : null;
-      throw new TrackerAdapterError(
-        code === 'ECONNABORTED' || code === 'ETIMEDOUT'
-          ? 'timeout'
-          : 'transport',
-        true,
-        { httpStatus: status }
-      );
-    }
   }
 }

@@ -48,6 +48,7 @@ export interface TrackerAnomaly {
   itemIndex: number;
   code:
     | 'invalid_identity'
+    | 'contract_incompatible'
     | 'invalid_field'
     | 'conflicting_field'
     | 'identity_conflict';
@@ -58,6 +59,8 @@ export interface NormalizedTrackerPage extends TrackerPageContext {
   records: NormalizedTrackerTorrent[];
   anomalies: TrackerAnomaly[];
   receivedCount: number;
+  // Describes only this response's critical field structure, not scan coverage.
+  contractStatus: 'compatible' | 'partial' | 'incompatible';
 }
 
 export interface TrackerCapabilities {

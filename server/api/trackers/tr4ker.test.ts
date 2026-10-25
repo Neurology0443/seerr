@@ -151,6 +151,51 @@ describe('TR4KER HTTP contract', () => {
     assert.equal(calls, 2);
   });
 
+  it('returns safe contract drift diagnostics from the adapter without retries or persistence', async () => {
+    const good =
+      '<item><guid>https://tr4ker.net/torrent/Secret-Invasion-S01E01</guid><title>Secret: Invasion S01E01</title></item>';
+    const bad = `<item><guid>https://other.invalid/passkey/${key}/42</guid><title>REJECTED_TITLE</title><link>https://tr4ker.net/download?apikey=${key}</link></item>`;
+    let calls = 0;
+    const client = adapter(async (config) => {
+      calls++;
+      return response(
+        config,
+        `<rss><channel>${calls === 1 ? good + bad : bad}</channel></rss>`
+      );
+    });
+    const partial = await client.fetchRecentPage(page);
+    assert.equal(calls, 1);
+    assert.equal(partial.contractStatus, 'partial');
+    assert.equal(partial.records.length, 1);
+    assert.equal(partial.records[0].releaseName, 'Secret: Invasion S01E01');
+    assert.equal(partial.receivedCount, 2);
+    assert.deepEqual(partial.anomalies, [
+      { itemIndex: 1, code: 'contract_incompatible', field: 'canonicalGuid' },
+    ]);
+    const incompatible = await client.fetchHistoricalPage({
+      category: 'tv',
+      offset: 80,
+    });
+    assert.equal(calls, 2);
+    assert.equal(incompatible.contractStatus, 'incompatible');
+    assert.deepEqual(incompatible.records, []);
+    assert.equal(incompatible.receivedCount, 1);
+    assert.equal(incompatible.category, 'tv');
+    assert.equal(incompatible.offset, 80);
+    assert.ok(Number.isFinite(incompatible.observedAt.getTime()));
+    assert.deepEqual(incompatible.anomalies, [
+      { itemIndex: 0, code: 'contract_incompatible', field: 'canonicalGuid' },
+    ]);
+    for (const result of [partial, incompatible]) {
+      assert.doesNotMatch(
+        JSON.stringify(result),
+        /SENTINEL|REJECTED_TITLE|download|Axios/
+      );
+      assert.equal('checkpoint' in result, false);
+      assert.equal('suspended' in result, false);
+    }
+  });
+
   it('returns all records even beyond the declared total and does not paginate itself', async () => {
     let calls = 0;
     const client = adapter(async (config) => {
