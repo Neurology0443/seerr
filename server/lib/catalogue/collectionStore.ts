@@ -1,5 +1,8 @@
 import type { DataSource, EntityManager } from 'typeorm';
-import type { Tr4kerCollectionSettings } from './collectionConfig';
+import type {
+  Tr4kerCollectionSettings,
+  TrackerCollectionDescription,
+} from './collectionConfig';
 import {
   emptyCollectionState,
   readCollectionCheckpoint,
@@ -42,9 +45,10 @@ export class CollectionStore {
       .update({ trackerId }, { trackerId });
   }
   async initialize(
-    trackerId: string,
+    tracker: TrackerCollectionDescription,
     settings: Tr4kerCollectionSettings
   ): Promise<void> {
+    const { trackerId } = tracker;
     await this.write(async (manager) => {
       await manager
         .getRepository(names.tracker)
@@ -52,8 +56,8 @@ export class CollectionStore {
         .insert()
         .values({
           id: trackerId,
-          name: 'TR4KER',
-          connectorType: 'torznab',
+          name: tracker.name,
+          connectorType: tracker.connectorType,
           enabled: true,
         })
         .orIgnore()
@@ -67,7 +71,7 @@ export class CollectionStore {
         .execute();
       await this.lockTracker(manager, trackerId);
       const now = await this.clock(manager);
-      for (const categoryId of [2000, 5000])
+      for (const category of tracker.categories)
         for (const mode of ['recent', 'historical'] as const) {
           await manager
             .getRepository(names.sync)
@@ -75,7 +79,7 @@ export class CollectionStore {
             .insert()
             .values({
               trackerId,
-              categoryId,
+              categoryId: category.id,
               mode,
               checkpoint: null,
               phase: mode === 'recent' ? 'recent' : 'initial',
@@ -89,7 +93,7 @@ export class CollectionStore {
               errorCode: null,
               lastHttpStatus: null,
               nextRunAt: new Date(
-                now + (mode === 'recent' && categoryId === 5000 ? 10000 : 0)
+                now + (mode === 'recent' ? category.recentStaggerMs : 0)
               ),
               collectionState: JSON.stringify(emptyCollectionState()),
             })
@@ -133,11 +137,12 @@ export class CollectionStore {
         await repository.update(scope.id, { nextRunAt: new Date(now) });
     });
   }
-  async reserveNext(
-    trackerId: string,
+  async claimNext(
+    tracker: TrackerCollectionDescription,
     owner: string,
     settings: Tr4kerCollectionSettings
   ): Promise<{ scope: CatalogueSyncState; now: number } | null> {
+    const { trackerId } = tracker;
     return this.write(async (manager) => {
       await this.lockTracker(manager, trackerId);
       const now = await this.clock(manager);
@@ -156,6 +161,9 @@ export class CollectionStore {
         .findBy({ trackerId });
       const eligible = scopes.filter(
         (scope) =>
+          tracker.categories.some(
+            (category) => category.id === scope.categoryId
+          ) &&
           scope.status !== 'suspended' &&
           scope.nextRunAt != null &&
           scope.nextRunAt.getTime() <= now &&
@@ -184,16 +192,14 @@ export class CollectionStore {
         )
           continue;
         if (!(await this.acquire(manager, scope, owner, now))) continue;
-        await manager.getRepository(names.dispatch).update(
-          { trackerId },
-          {
-            lastStart: now,
-            ...(maintenance ? { maintenanceStart: now } : {}),
-          }
-        );
+
         return {
           scope: {
             ...scope,
+            collectionState: JSON.stringify({
+              ...readCollectionState(scope.collectionState),
+              pendingDispatch: true,
+            }),
             leaseOwner: owner,
             leaseExpiresAt: new Date(now + COLLECTION_LEASE_MS),
           },
@@ -203,9 +209,84 @@ export class CollectionStore {
       return null;
     });
   }
+  // Final permit: call only after durable cycle/checkpoint preparation. The
+  // caller invokes its adapter immediately after this transaction commits.
+  async reserveRequest(
+    tracker: TrackerCollectionDescription,
+    scope: CollectionScope,
+    owner: string,
+    settings: Tr4kerCollectionSettings
+  ): Promise<number | null> {
+    return this.write(async (manager) => {
+      await this.lockTracker(manager, tracker.trackerId);
+      const dispatch = await manager
+        .getRepository<CatalogueDispatchState>(names.dispatch)
+        .findOneByOrFail({ trackerId: tracker.trackerId });
+      const scopes = await manager
+        .getRepository<CatalogueSyncState>(names.sync)
+        .findBy({ trackerId: tracker.trackerId });
+      const current = scopes.find(
+        (row) => row.categoryId === scope.categoryId && row.mode === scope.mode
+      );
+      const now = await this.clock(manager);
+      if (
+        !current ||
+        current.leaseOwner !== owner ||
+        !current.leaseExpiresAt ||
+        current.leaseExpiresAt.getTime() <= now
+      )
+        throw new CatalogueLeaseLostError();
+      if (!readCollectionState(current.collectionState).pendingDispatch)
+        return null;
+      const eligible = (row: CatalogueSyncState) =>
+        tracker.categories.some((category) => category.id === row.categoryId) &&
+        row.status !== 'suspended' &&
+        row.nextRunAt != null &&
+        row.nextRunAt.getTime() <= now &&
+        (!row.retryAfterAt || row.retryAfterAt.getTime() <= now);
+      const maintenance =
+        current.mode === 'historical' &&
+        ['maintenance', 'complete'].includes(current.phase);
+      if (
+        !eligible(current) ||
+        dispatch.suspended ||
+        (dispatch.cooldownUntil != null && dispatch.cooldownUntil > now) ||
+        (dispatch.lastStart != null &&
+          now < dispatch.lastStart + settings.globalSpacingSeconds * 1000) ||
+        (maintenance &&
+          (settings.maintenanceIntervalMinutes === null ||
+            (dispatch.maintenanceStart != null &&
+              now <
+                dispatch.maintenanceStart +
+                  settings.maintenanceSpacingSeconds * 1000))) ||
+        (current.mode === 'historical' &&
+          scopes.some(
+            (row) =>
+              row.mode === 'recent' &&
+              eligible(row) &&
+              (!row.leaseExpiresAt ||
+                row.leaseExpiresAt.getTime() <= now ||
+                readCollectionState(row.collectionState).pendingDispatch)
+          ))
+      )
+        return null;
+      const state = readCollectionState(current.collectionState);
+      state.pendingDispatch = false;
+      await manager
+        .getRepository(names.sync)
+        .update(current.id, { collectionState: JSON.stringify(state) });
+      await manager
+        .getRepository(names.dispatch)
+        .update(
+          { trackerId: tracker.trackerId },
+          { lastStart: now, ...(maintenance ? { maintenanceStart: now } : {}) }
+        );
+      return now;
+    });
+  }
   private async acquire(
     manager: EntityManager,
-    scope: CollectionScope,
+    scope: CatalogueSyncState,
     owner: string,
     now: number
   ): Promise<boolean> {
@@ -216,6 +297,10 @@ export class CollectionStore {
       .set({
         leaseOwner: owner,
         leaseExpiresAt: new Date(now + COLLECTION_LEASE_MS),
+        collectionState: JSON.stringify({
+          ...readCollectionState(scope.collectionState),
+          pendingDispatch: true,
+        }),
       })
       .where(
         'tracker_id = :trackerId AND category_id = :categoryId AND mode = :mode AND (lease_expires_at IS NULL OR lease_expires_at <= :now)',

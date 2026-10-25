@@ -8,13 +8,18 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { it, type TestContext } from 'node:test';
 import { DataSource, type QueryRunner } from 'typeorm';
-import { defaultTr4kerCollectionSettings as defaults } from './collectionConfig';
+import {
+  defaultTr4kerCollectionSettings as defaults,
+  tr4kerCollectionDescription,
+  type Tr4kerCollectionSettings,
+  type TrackerCollectionDescription,
+} from './collectionConfig';
 import {
   readCollectionCheckpoint,
   readCollectionState,
 } from './collectionState';
 import { CollectionStore } from './collectionStore';
-import { CatalogueCollector } from './collector';
+import { CatalogueCollector, type CollectionTracker } from './collector';
 import {
   createCatalogueDataSource,
   type CatalogueConnectionOptions,
@@ -102,6 +107,34 @@ async function worker(
     );
   });
 }
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+async function reserveNext(
+  store: CollectionStore,
+  trackerId: string,
+  owner: string,
+  settings: Tr4kerCollectionSettings
+) {
+  const tracker = { ...tr4kerCollectionDescription, trackerId };
+  const claimed = await store.claimNext(tracker, owner, settings);
+  if (!claimed) return null;
+  const now = await store.reserveRequest(
+    tracker,
+    claimed.scope,
+    owner,
+    settings
+  );
+  if (now === null) {
+    await store.release(claimed.scope, owner);
+    return null;
+  }
+  return { scope: claimed.scope, now };
+}
 async function verify(
   connection: CatalogueConnectionOptions,
   t: TestContext
@@ -126,13 +159,18 @@ async function verify(
     db
       .getRepository<CatalogueSyncState>(names.sync)
       .findOneByOrFail({ trackerId: id, categoryId, mode });
-  async function setup(fetch?: Fetch, settings = {}) {
+  async function setup(
+    fetch?: Fetch,
+    settings = {},
+    description: Partial<TrackerCollectionDescription> = {}
+  ) {
     now = instant;
     const id = `fixture-${randomUUID()}`;
     const calls: {
       mode: string;
       offset: number;
       category: string;
+      limit?: number;
       at: number;
     }[] = [];
     const adapter: TrackerAdapter = {
@@ -141,14 +179,16 @@ async function verify(
       },
       fetchRecentPage: async (req) => {
         calls.push({ mode: 'recent', ...req, at: now });
-        return fetch ? fetch(req) : page(id, req.offset);
+        return fetch ? fetch(req) : page(id, req.offset, req.limit);
       },
       fetchHistoricalPage: async (req) => {
         calls.push({ mode: 'historical', ...req, at: now });
-        return fetch ? fetch(req) : page(id, req.offset);
+        return fetch ? fetch(req) : page(id, req.offset, req.limit);
       },
     };
-    const tracker = {
+    const tracker: CollectionTracker = {
+      ...structuredClone(tr4kerCollectionDescription),
+      ...description,
       trackerId: id,
       adapter,
       settings: { ...defaults, ...settings, enabled: true },
@@ -178,6 +218,655 @@ async function verify(
     return { id, calls, adapter, tracker, collector, enable, tick };
   }
   try {
+    await t.test(
+      'ordered moving pages tolerate 21/19 overlaps and multiple ordinary front shifts',
+      async () => {
+        for (const shifts of [
+          [0, -1],
+          [0, 1],
+          [0, -1, 2, -3, 3],
+        ]) {
+          let id = '';
+          let index = 0;
+          const h = await setup(async (req) =>
+            index < shifts.length
+              ? page(id, req.offset + shifts[index++])
+              : page(id, req.offset, 0)
+          );
+          id = h.id;
+          await h.enable();
+          for (let i = 0; i < shifts.length; i++) await h.tick();
+          const progress = readCollectionCheckpoint(
+            (await scope(id)).checkpoint
+          )!;
+          assert.equal(progress.dirty, false);
+          assert.equal(progress.nextOffset, shifts.length * 80);
+          assert.deepEqual(
+            h.calls.map((call) => call.offset),
+            shifts.map((_, index) => index * 80)
+          );
+          assert.equal(
+            readCollectionState(
+              (await scope(id)).collectionState
+            ).diagnostics.some((d) => d.code === 'abnormal_overlap'),
+            false
+          );
+          if (shifts.length === 2) {
+            const ids = new Set(
+              page(id, 0).records.map((record) => record.canonicalGuid)
+            );
+            assert.equal(
+              page(id, 80 + shifts[1]).records.filter((record) =>
+                ids.has(record.canonicalGuid)
+              ).length,
+              shifts[1] === -1 ? 21 : 19
+            );
+          }
+          for (let i = 0; i < 3; i++) await h.tick();
+          assert.equal(
+            readCollectionState((await scope(id)).collectionState).coverage,
+            'observed'
+          );
+        }
+      }
+    );
+    await t.test(
+      'broken or reordered continuity remains partial across restart; a clean later pass repairs coverage',
+      async () => {
+        for (const reordered of [false, true]) {
+          let id = '';
+          let count = 0;
+          let clean = false;
+          const h = await setup(
+            async (req) => {
+              if (count++ >= 2) return page(id, req.offset, 0);
+              const result = page(
+                id,
+                req.offset + (!clean && req.offset > 0 && !reordered ? 1000 : 0)
+              );
+              if (!clean && reordered && req.offset > 0)
+                result.records.splice(
+                  0,
+                  20,
+                  ...result.records.slice(0, 20).reverse()
+                );
+              return result;
+            },
+            { maintenanceIntervalMinutes: 1 }
+          );
+          id = h.id;
+          await h.enable();
+          await h.tick();
+          await h.tick();
+          assert.equal(
+            readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
+            true
+          );
+          await db.destroy();
+          db = createCatalogueDataSource(connection);
+          await db.initialize();
+          const resumed = new CatalogueCollector(db, [h.tracker], clock);
+          await resumed.initialize();
+          for (let i = 0; i < 3; i++) {
+            await resumed.tick();
+            now += 3000;
+          }
+          assert.equal(
+            readCollectionState((await scope(id)).collectionState).coverage,
+            'partial'
+          );
+          assert.equal(
+            readCollectionCheckpoint((await scope(id)).checkpoint)?.done,
+            true
+          );
+          clean = true;
+          count = 0;
+          now += 60000;
+          for (let i = 0; i < 5; i++) {
+            await resumed.tick();
+            now += 6000;
+          }
+          const state = readCollectionState((await scope(id)).collectionState);
+          assert.equal(state.coverage, 'observed');
+          assert.ok(
+            state.diagnostics.some((d) => d.code === 'abnormal_overlap')
+          );
+        }
+      }
+    );
+    await t.test(
+      'absent and malformed optional metadata retain reliable observation coverage and safe diagnostics',
+      async () => {
+        for (const malformed of [false, true]) {
+          let id = '';
+          let first = true;
+          const h = await setup(async (req) => {
+            if (!first) return page(id, req.offset, 0);
+            first = false;
+            return {
+              ...page(id, req.offset, 2),
+              records: page(id, req.offset, 2).records.map((record) => ({
+                ...record,
+                trackerMetadata: {
+                  tmdbId: null,
+                  tvdbId: null,
+                  season: null,
+                  episode: null,
+                },
+                provenance: {},
+              })),
+              anomalies: malformed
+                ? [
+                    {
+                      itemIndex: 0,
+                      code: 'invalid_field',
+                      field: 'tmdbId',
+                      rejectedValue: 'SECRET',
+                      rawXml: '<xml>SECRET</xml>',
+                      url: 'https://secret.invalid/',
+                    } as const,
+                  ]
+                : [],
+            };
+          });
+          id = h.id;
+          await h.enable();
+          for (let i = 0; i < 4; i++) await h.tick();
+          const stored = await scope(id);
+          const state = readCollectionState(stored.collectionState);
+          assert.equal(state.coverage, 'observed');
+          assert.equal(stored.status, 'idle');
+          assert.equal(state.diagnostics.length, malformed ? 1 : 0);
+          if (malformed)
+            assert.deepEqual(state.diagnostics[0], {
+              code: 'invalid_field',
+              field: 'tmdbId',
+              at: instant,
+              count: 1,
+            });
+          assert.ok(!JSON.stringify(state).match(/SECRET|<xml>|https:/));
+          assert.equal(
+            await db.getRepository(names.torrent).countBy({ trackerId: id }),
+            2
+          );
+        }
+      }
+    );
+    await t.test(
+      'critical rejection cannot be cleared by terminal emptiness; corrected reprocessing restores coverage',
+      async () => {
+        let id = '';
+        let first = true;
+        let corrected = false;
+        const h = await setup(
+          async (req) => {
+            if (!first) return page(id, req.offset, 0);
+            first = false;
+            return {
+              ...page(id, req.offset, 2),
+              receivedCount: corrected ? 2 : 3,
+              anomalies: corrected
+                ? []
+                : [
+                    {
+                      itemIndex: 2,
+                      code: 'invalid_identity',
+                      field: 'canonicalGuid',
+                    } as const,
+                  ],
+            };
+          },
+          { maintenanceIntervalMinutes: 1 }
+        );
+        id = h.id;
+        await h.enable();
+        for (let i = 0; i < 4; i++) await h.tick();
+        assert.equal(
+          readCollectionState((await scope(id)).collectionState).coverage,
+          'partial'
+        );
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.done,
+          true
+        );
+        first = true;
+        corrected = true;
+        now += 60000;
+        for (let i = 0; i < 4; i++) await h.tick(6000);
+        assert.equal(
+          readCollectionState((await scope(id)).collectionState).coverage,
+          'observed'
+        );
+        assert.ok(
+          readCollectionState(
+            (await scope(id)).collectionState
+          ).diagnostics.some((d) => d.code === 'invalid_identity')
+        );
+      }
+    );
+    await t.test(
+      'tracker descriptions isolate identities, category mappings, page limits and derived progression',
+      async () => {
+        const a = await setup(
+          undefined,
+          {},
+          {
+            name: 'Synthetic A',
+            connectorType: 'mock-a',
+            categories: [
+              { id: 7100, requestCategory: 'tv', recentStaggerMs: 25 },
+            ],
+            pagination: { limit: 10, overlap: 2 },
+          }
+        );
+        const b = await setup(
+          undefined,
+          {},
+          {
+            name: 'Synthetic B',
+            connectorType: 'mock-b',
+            categories: [
+              { id: 9200, requestCategory: 'movie', recentStaggerMs: 500 },
+            ],
+            pagination: { limit: 12, overlap: 3 },
+          }
+        );
+        for (const h of [a, b]) {
+          const rows = await db
+            .getRepository<CatalogueSyncState>(names.sync)
+            .findBy({ trackerId: h.id });
+          assert.deepEqual(
+            rows.map((row) => row.categoryId),
+            [h.tracker.categories[0].id, h.tracker.categories[0].id]
+          );
+          assert.equal(
+            (
+              await db
+                .getRepository(names.tracker)
+                .findOneByOrFail({ id: h.id })
+            ).name,
+            h.tracker.name
+          );
+          assert.equal(
+            (
+              await db
+                .getRepository(names.tracker)
+                .findOneByOrFail({ id: h.id })
+            ).connectorType,
+            h.tracker.connectorType
+          );
+          await h.enable('historical', h.tracker.categories[0].id);
+        }
+        const collector = new CatalogueCollector(
+          db,
+          [a.tracker, b.tracker],
+          clock
+        );
+        await collector.tick();
+        now += 3000;
+        await collector.tick();
+        assert.deepEqual(
+          a.calls.map((call) => [call.category, call.offset, call.limit]),
+          [
+            ['tv', 0, 10],
+            ['tv', 8, 10],
+          ]
+        );
+        assert.deepEqual(
+          b.calls.map((call) => [call.category, call.offset, call.limit]),
+          [
+            ['movie', 0, 12],
+            ['movie', 9, 12],
+          ]
+        );
+        a.tracker.pagination = { limit: 6, overlap: 1 };
+        const changed = new CatalogueCollector(
+          db,
+          [a.tracker, b.tracker],
+          clock
+        );
+        await changed.initialize();
+        now += 3000;
+        await changed.tick();
+        assert.equal(a.calls.at(-1)?.offset, 0);
+        assert.equal(a.calls.at(-1)?.limit, 6);
+        assert.equal(b.calls.at(-1)?.offset, 18);
+        assert.equal(b.calls.at(-1)?.limit, 12);
+        const cp = readCollectionCheckpoint(
+          (await scope(a.id, 'historical', 7100)).checkpoint
+        )!;
+        assert.deepEqual(cp.pagination, { limit: 6, overlap: 1 });
+        assert.equal(cp.nextOffset, 5);
+        assert.equal(
+          readCollectionState(
+            (await scope(a.id, 'historical', 7100)).collectionState
+          ).coverage,
+          'partial'
+        );
+        assert.ok(
+          readCollectionState(
+            (await scope(a.id, 'historical', 7100)).collectionState
+          ).diagnostics.some((d) => d.code === 'pagination_changed')
+        );
+        now += 3000;
+        await changed.tick();
+        assert.equal(a.calls.at(-1)?.offset, 5);
+        assert.equal(
+          await db.getRepository(names.torrent).countBy({ trackerId: a.id }),
+          18
+        );
+        for (const pagination of [
+          { limit: 1, overlap: 1 },
+          { limit: 10, overlap: 0 },
+          { limit: 10, overlap: 10 },
+          { limit: 10.5, overlap: 2 },
+        ])
+          assert.throws(
+            () =>
+              new CatalogueCollector(db, [{ ...a.tracker, pagination }], clock),
+            /Invalid catalogue collection description/
+          );
+      }
+    );
+    await t.test(
+      'v1 checkpoint continuity upgrades without restarting a compatible deep scan',
+      async () => {
+        const h = await setup();
+        await h.enable();
+        await h.tick();
+        await h.tick();
+        const stored = await scope(h.id);
+        const legacy = JSON.parse(stored.checkpoint!);
+        legacy.version = 1;
+        delete legacy.pagination;
+        await db
+          .getRepository(names.sync)
+          .update(stored.id, { checkpoint: JSON.stringify(legacy) });
+        const resumed = new CatalogueCollector(db, [h.tracker], clock);
+        await resumed.initialize();
+        await resumed.tick();
+        assert.equal(h.calls.at(-1)?.offset, 160);
+        assert.equal(
+          readCollectionCheckpoint((await scope(h.id)).checkpoint)?.version,
+          2
+        );
+        assert.equal(
+          readCollectionCheckpoint((await scope(h.id)).checkpoint)?.dirty,
+          false
+        );
+      }
+    );
+    await t.test(
+      'delayed SQL preparation cannot compress actual global or maintenance adapter starts',
+      async () => {
+        for (const maintenance of [false, true]) {
+          const h = await setup(undefined, { maintenanceIntervalMinutes: 1 });
+          await h.enable('historical', 2000, {
+            phase: maintenance ? 'maintenance' : 'initial',
+          });
+          await h.enable('historical', 5000, {
+            phase: maintenance ? 'maintenance' : 'initial',
+          });
+          const preparation = deferred();
+          const release = deferred();
+          let delayed = false;
+          const original = CatalogueRepository.prototype.persistPage;
+          const mock = t.mock.method(
+            CatalogueRepository.prototype,
+            'persistPage',
+            async function (
+              this: CatalogueRepository,
+              ...args: Parameters<typeof original>
+            ) {
+              if (
+                !delayed &&
+                args[0].length === 0 &&
+                args[1].trackerId === h.id &&
+                args[1].categoryId === 2000
+              ) {
+                delayed = true;
+                preparation.resolve();
+                await release.promise;
+              }
+              return original.apply(this, args);
+            }
+          );
+          try {
+            const first = h.collector.tick();
+            await preparation.promise;
+            assert.equal(
+              (
+                await db
+                  .getRepository(names.dispatch)
+                  .findOneByOrFail({ trackerId: h.id })
+              ).lastStart,
+              null
+            );
+            const spacing = maintenance ? 6000 : 3000;
+            now += spacing;
+            const other = new CatalogueCollector(db, [h.tracker], clock);
+            await other.tick();
+            assert.equal(h.calls.length, 1);
+            now += 1000;
+            release.resolve();
+            await first;
+            assert.equal(
+              h.calls.length,
+              1,
+              'Delayed preparation must obtain a fresh permit before calling the adapter'
+            );
+            now = h.calls[0].at + spacing;
+            await h.collector.tick();
+            assert.equal(h.calls.length, 2);
+            assert.ok(h.calls[1].at - h.calls[0].at >= spacing);
+          } finally {
+            release.resolve();
+            mock.mock.restore();
+          }
+        }
+      }
+    );
+    await t.test(
+      'preparation failure consumes no quota and a permit cannot be reused',
+      async () => {
+        const h = await setup();
+        await h.enable();
+        await h.enable('historical', 5000);
+        const original = CatalogueRepository.prototype.persistPage;
+        let failed = false;
+        const mock = t.mock.method(
+          CatalogueRepository.prototype,
+          'persistPage',
+          async function (
+            this: CatalogueRepository,
+            ...args: Parameters<typeof original>
+          ) {
+            if (!failed && args[0].length === 0 && args[1].trackerId === h.id) {
+              failed = true;
+              throw new Error('Synthetic preparation failure SECRET');
+            }
+            return original.apply(this, args);
+          }
+        );
+        try {
+          await h.collector.tick();
+          assert.equal(h.calls.length, 0);
+          assert.equal(
+            (
+              await db
+                .getRepository(names.dispatch)
+                .findOneByOrFail({ trackerId: h.id })
+            ).lastStart,
+            null
+          );
+          await h.collector.tick();
+          assert.equal(h.calls.length, 1);
+          assert.equal(h.calls[0].at, instant);
+        } finally {
+          mock.mock.restore();
+        }
+        const next = await setup();
+        await next.enable('recent');
+        await next.enable();
+        const recent = await next.collector.store.claimNext(
+          next.tracker,
+          'recent',
+          next.tracker.settings
+        );
+        assert.ok(recent);
+        const historical = await next.collector.store.claimNext(
+          next.tracker,
+          'historical',
+          next.tracker.settings
+        );
+        assert.ok(historical);
+        assert.equal(
+          await next.collector.store.reserveRequest(
+            next.tracker,
+            historical.scope,
+            'historical',
+            next.tracker.settings
+          ),
+          null
+        );
+        assert.equal(
+          await next.collector.store.reserveRequest(
+            next.tracker,
+            recent.scope,
+            'recent',
+            next.tracker.settings
+          ),
+          instant
+        );
+        now += 3000;
+        assert.equal(
+          await next.collector.store.reserveRequest(
+            next.tracker,
+            recent.scope,
+            'recent',
+            next.tracker.settings
+          ),
+          null,
+          'A dispatched request cannot get a second permit'
+        );
+        assert.equal(
+          await next.collector.store.reserveRequest(
+            next.tracker,
+            historical.scope,
+            'historical',
+            next.tracker.settings
+          ),
+          now
+        );
+      }
+    );
+    await t.test(
+      'slow and suspended trackers cannot block another tracker; stop/drain covers every in-flight operation',
+      async () => {
+        const slow = deferred();
+        const aStarted = deferred();
+        const bFinished = deferred();
+        const a = await setup(async () => {
+          aStarted.resolve();
+          await slow.promise;
+          throw httpError(401);
+        });
+        const b = await setup();
+        await a.enable();
+        await b.enable();
+        const collector = new CatalogueCollector(
+          db,
+          [a.tracker, b.tracker],
+          clock
+        );
+        const release = collector.store.release.bind(collector.store);
+        t.mock.method(
+          collector.store,
+          'release',
+          async (...args: Parameters<typeof release>) => {
+            await release(...args);
+            if (args[0].trackerId === b.id) bFinished.resolve();
+          }
+        );
+        const first = collector.tick();
+        await aStarted.promise;
+        await bFinished.promise;
+        await new Promise(setImmediate);
+        assert.equal(a.calls.length, 1);
+        assert.equal(b.calls.length, 1);
+        now += 3000;
+        await collector.tick();
+        assert.equal(a.calls.length, 1);
+        assert.equal(b.calls.length, 2);
+        slow.resolve();
+        await first;
+        assert.equal(
+          (
+            await db
+              .getRepository(names.dispatch)
+              .findOneByOrFail({ trackerId: a.id })
+          ).suspended,
+          true
+        );
+        assert.equal(
+          (
+            await db
+              .getRepository(names.dispatch)
+              .findOneByOrFail({ trackerId: b.id })
+          ).suspended,
+          false
+        );
+        now += 3000;
+        await collector.tick();
+        assert.equal(b.calls.length, 3);
+        await collector.store.recover(a.id);
+        // Tracker-wide auth recovery also re-enables the other declared scopes.
+        // Keep this fixture focused on the two Historical requests below.
+        await db
+          .getRepository(names.sync)
+          .update({ trackerId: a.id }, { nextRunAt: null });
+        await a.enable();
+        const finishA = deferred();
+        const finishB = deferred();
+        const startA = deferred();
+        const startB = deferred();
+        a.adapter.fetchHistoricalPage = async (req) => {
+          startA.resolve();
+          await finishA.promise;
+          return page(a.id, req.offset);
+        };
+        b.adapter.fetchHistoricalPage = async (req) => {
+          startB.resolve();
+          await finishB.promise;
+          return page(b.id, req.offset);
+        };
+        now += 3000;
+        const active = collector.tick();
+        await Promise.all([startA.promise, startB.promise]);
+        assert.equal(
+          await collector.tick(),
+          false,
+          'Repeated ticks cannot duplicate either in-flight operation'
+        );
+        collector.stop();
+        let drained = false;
+        const drain = collector.drain().then(() => {
+          drained = true;
+        });
+        await new Promise(setImmediate);
+        assert.equal(drained, false);
+        finishA.resolve();
+        await new Promise(setImmediate);
+        assert.equal(drained, false);
+        finishB.resolve();
+        await Promise.all([active, drain]);
+        assert.equal(drained, true);
+        assert.equal(await collector.tick(), false);
+        assert.equal(collector.scopeRunning(2000), false);
+        assert.equal((await scope(a.id)).leaseOwner, null);
+        assert.equal((await scope(b.id)).leaseOwner, null);
+      }
+    );
     await t.test(
       'P1 to P3 migration preserves existing identities and category foreign keys',
       async () => {
@@ -291,7 +980,8 @@ async function verify(
       async () => {
         const h = await setup();
         await h.enable();
-        const lease = await h.collector.store.reserveNext(
+        const lease = await reserveNext(
+          h.collector.store,
           h.id,
           'owner',
           h.tracker.settings
@@ -612,7 +1302,8 @@ async function verify(
         await h.enable('historical', 2000, { nextRunAt: new Date(0) });
         const store = new CollectionStore(db);
         const before = Date.now();
-        const lease = await store.reserveNext(
+        const lease = await reserveNext(
+          store,
           h.id,
           'sql-clock',
           h.tracker.settings
@@ -620,7 +1311,8 @@ async function verify(
         assert.ok(lease);
         assert.ok(lease.now >= before - 100 && lease.now <= Date.now() + 100);
         assert.equal(
-          await new CollectionStore(db).reserveNext(
+          await reserveNext(
+            new CollectionStore(db),
             h.id,
             'sql-clock-2',
             h.tracker.settings
@@ -788,7 +1480,7 @@ async function verify(
         now += 60000;
         h.adapter.fetchHistoricalPage = async (req) => {
           h.calls.push({ mode: 'historical', ...req, at: now });
-          return page(id, req.offset);
+          return page(id, req.offset, req.limit);
         };
         await h.tick();
         assert.equal(h.calls.at(-1)?.offset, 0);
@@ -812,14 +1504,16 @@ async function verify(
         const h = await setup();
         await h.enable();
         await h.enable('recent');
-        const first = await h.collector.store.reserveNext(
+        const first = await reserveNext(
+          h.collector.store,
           h.id,
           'recent-owner',
           h.tracker.settings
         );
         assert.equal(first?.scope.mode, 'recent');
         now += 3000;
-        const second = await new CollectionStore(db, clock).reserveNext(
+        const second = await reserveNext(
+          new CollectionStore(db, clock),
           h.id,
           'historical-owner',
           h.tracker.settings
@@ -827,7 +1521,8 @@ async function verify(
         assert.equal(second?.scope.mode, 'historical');
         assert.equal((await scope(h.id, 'recent')).leaseOwner, 'recent-owner');
         assert.equal(
-          await new CollectionStore(db, clock).reserveNext(
+          await reserveNext(
+            new CollectionStore(db, clock),
             h.id,
             'too-early',
             h.tracker.settings
@@ -913,7 +1608,12 @@ async function verify(
         );
         await h.collector.store.release(checkpoint, 'new-owner');
         assert.equal(
-          await h.collector.store.reserveNext(h.id, 'next', h.tracker.settings),
+          await reserveNext(
+            h.collector.store,
+            h.id,
+            'next',
+            h.tracker.settings
+          ),
           null,
           'Restart must retain global request spacing'
         );
@@ -948,7 +1648,7 @@ async function verify(
           await db.initialize();
           const restarted = new CollectionStore(db, clock);
           assert.equal(
-            await restarted.reserveNext(h.id, 'restart', h.tracker.settings),
+            await reserveNext(restarted, h.id, 'restart', h.tracker.settings),
             null
           );
         }

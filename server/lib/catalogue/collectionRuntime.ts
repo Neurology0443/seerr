@@ -2,7 +2,10 @@ import Tr4kerAdapter from '@server/api/trackers/tr4ker';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { DataSource } from 'typeorm';
-import { validateCollectionSettings } from './collectionConfig';
+import {
+  tr4kerCollectionDescription,
+  validateCollectionSettings,
+} from './collectionConfig';
 import { CatalogueCollector } from './collector';
 
 let collector: CatalogueCollector | undefined;
@@ -27,7 +30,7 @@ export function startCatalogueCollection(
       validateCollectionSettings(settings);
       const candidate = new CatalogueCollector(connection, [
         {
-          trackerId: 'tr4ker',
+          ...tr4kerCollectionDescription,
           settings,
           adapter: new Tr4kerAdapter({
             trackerId: 'tr4ker',

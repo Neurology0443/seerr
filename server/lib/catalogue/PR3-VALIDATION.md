@@ -95,3 +95,73 @@ live tracker crawl were not run. Native startup behavior was checked through the
 focused lifecycle/runtime/scheduling regressions; final broad validation remains
 with the human operator. No branches, staging, commits, pushes or sibling worktree
 files were changed.
+
+## Corrective pass — collection reliability and tracker isolation
+
+Modified only `collectionConfig.ts`, `collectionState.ts`, `collectionStore.ts`,
+`collector.ts`, `collectionRuntime.ts`, `collector.test.ts`,
+`fixtures/collectionWorker.ts`, `README.md` and this validation record, all under
+`server/lib/catalogue/`. The catalogue SQL schema, P2 adapters, settings format and
+native scheduler are unchanged. No backlog entries were created or updated.
+
+Corrections:
+
+- Ordered GUID intersections tolerate ordinary front insertions/removals while
+  broken continuity, reordered overlaps and repeated pages remain conservative.
+- Scope acquisition/preparation precedes the final SQL permit. Adapter invocation
+  immediately follows that permit; preparation failure consumes no request slot.
+  A durable pending-dispatch flag retains Recent priority during preparation and
+  prevents reuse of an already dispatched permit. Global/maintenance spacing,
+  database time, cross-process leases and transactional page fencing remain shared.
+- The runtime supplies identity, category mappings, page size and overlap. Progress
+  derives from those parameters. Version 2 checkpoints record them; compatible v1
+  checkpoints upgrade without rescanning, and incompatible pagination restarts only
+  the affected pass without deleting observations or claiming immediate coverage.
+- At most one local operation per tracker runs concurrently. Repeated ticks can
+  advance another tracker while one request is blocked. Stop/drain tracks all work.
+- Recording bounded safe diagnostics is independent of coverage. Optional metadata
+  anomalies remain visible without false coverage degradation. Critical failures
+  remain partial through completion/restart; a later clean pass can repair them.
+
+Targeted P3/configuration/runtime/scheduling command:
+
+```sh
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56484 SEERR_MIGRATION_PG_PASSWORD=corrective-disposable pnpm test server/lib/catalogue/collector.test.ts server/lib/catalogue/collectionRuntime.test.ts server/job/schedule.test.ts server/lib/settings/catalogue.test.ts
+```
+
+**65 passed, 0 failed, 0 cancelled, 0 skipped.** Both SQLite and real isolated
+PostgreSQL exercised the changes. Adapter-invocation timestamps, deliberately
+blocked preparation, separate collector instances, existing child-process quota
+and stale-owner tests, blocked/suspended trackers, multitracker drain, moving pages,
+coverage repair, optional anomalies, settings isolation and v1 recovery are covered.
+
+Directly affected P1/P2 command (run separately against the same empty disposable
+instance, after P3 removed its own test databases):
+
+```sh
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56484 SEERR_MIGRATION_PG_PASSWORD=corrective-disposable pnpm test server/lib/catalogue/catalogue.test.ts server/lib/catalogue/lifecycle.test.ts server/api/trackers/torznab.test.ts server/api/trackers/tr4ker.test.ts
+```
+
+**183 passed, 0 failed, 0 skipped.** This includes persistence/checkpoint atomicity,
+native isolation, migrations, lifecycle and existing offline P2 normalization.
+
+Focused lint and formatting commands:
+
+```sh
+devenv shell -- pnpm exec eslint server/lib/catalogue/collectionConfig.ts server/lib/catalogue/collectionState.ts server/lib/catalogue/collectionStore.ts server/lib/catalogue/collector.ts server/lib/catalogue/collectionRuntime.ts server/lib/catalogue/collector.test.ts server/lib/catalogue/fixtures/collectionWorker.ts
+devenv shell -- pnpm exec prettier --check server/lib/catalogue/collectionConfig.ts server/lib/catalogue/collectionState.ts server/lib/catalogue/collectionStore.ts server/lib/catalogue/collector.ts server/lib/catalogue/collectionRuntime.ts server/lib/catalogue/collector.test.ts server/lib/catalogue/fixtures/collectionWorker.ts server/lib/catalogue/README.md server/lib/catalogue/PR3-VALIDATION.md
+git diff --check
+```
+
+All passed. Only modified files were formatted. No global lint, formatting,
+typecheck, i18n check, full repository test suite or production build was run.
+No live tracker calls or benchmarks were performed. The existing observed-boundary
+limitation remains; no implementation blocker remains.
+
+The initial corrective test run cancelled the controlled shutdown fixture: tracker
+recovery re-enabled Recent scopes while the fixture awaited a Historical response.
+The fixture now explicitly selects its intended scopes after recovery. The complete
+passing run above supersedes that cancelled run; no assertion or production
+recovery rule was weakened. PostgreSQL 17.9 was provisioned in the disposable
+`/tmp/seerr-p3-corrective-pg` directory on loopback port 56484 and stopped after the
+checks. No project environment configuration or real data was changed.

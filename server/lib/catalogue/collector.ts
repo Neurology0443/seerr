@@ -7,11 +7,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { DataSource } from 'typeorm';
 import { In } from 'typeorm';
 import {
+  validateCollectionDescription,
   validateCollectionSettings,
   type Tr4kerCollectionSettings,
+  type TrackerCollectionDescription,
 } from './collectionConfig';
 import {
   diagnose,
+  pageContinuity,
   readCollectionCheckpoint,
   readCollectionState,
   type CollectionCheckpoint,
@@ -27,8 +30,7 @@ import type {
   SyncCheckpoint,
 } from './types';
 
-export interface CollectionTracker {
-  trackerId: string;
+export interface CollectionTracker extends TrackerCollectionDescription {
   adapter: TrackerAdapter;
   settings: Tr4kerCollectionSettings;
 }
@@ -80,10 +82,12 @@ export class CatalogueCollector {
   readonly store: CollectionStore;
   private readonly repository: CatalogueRepository;
   private stopped = false;
-  private active?: Promise<boolean>;
-  private scopeCategory?: number;
-  scopeRunning(categoryId: number): boolean {
-    return this.scopeCategory === categoryId;
+  private readonly active = new Map<string, Promise<boolean>>();
+  private readonly scopeCategories = new Map<string, number>();
+  scopeRunning(categoryId: number, trackerId?: string): boolean {
+    return trackerId === undefined
+      ? [...this.scopeCategories.values()].includes(categoryId)
+      : this.scopeCategories.get(trackerId) === categoryId;
   }
   constructor(
     connection: DataSource,
@@ -92,86 +96,113 @@ export class CatalogueCollector {
   ) {
     this.store = new CollectionStore(connection, clock);
     this.repository = new CatalogueRepository(connection);
-    for (const tracker of trackers)
+    if (
+      new Set(trackers.map((tracker) => tracker.trackerId)).size !==
+      trackers.length
+    )
+      throw new Error('Duplicate catalogue tracker');
+    for (const tracker of trackers) {
       validateCollectionSettings(tracker.settings);
+      validateCollectionDescription(tracker);
+    }
   }
   async initialize(): Promise<void> {
     for (const tracker of this.trackers)
-      await this.store.initialize(tracker.trackerId, tracker.settings);
+      await this.store.initialize(tracker, tracker.settings);
   }
   enqueueRecent(categoryId: number): Promise<void> {
     return Promise.all(
-      this.trackers.map((tracker) =>
-        this.store.enqueueRecent(tracker.trackerId, categoryId)
-      )
+      this.trackers
+        .filter((tracker) =>
+          tracker.categories.some((category) => category.id === categoryId)
+        )
+        .map((tracker) =>
+          this.store.enqueueRecent(tracker.trackerId, categoryId)
+        )
     ).then(() => undefined);
   }
   tick(): Promise<boolean> {
     if (this.stopped) return Promise.resolve(false);
-    if (this.active) return this.active;
-    this.active = this.dispatch().finally(() => {
-      this.active = undefined;
+    const launched: Promise<boolean>[] = [];
+    for (const tracker of this.trackers) {
+      if (this.active.has(tracker.trackerId)) continue;
+      const work = this.dispatch(tracker).finally(() => {
+        this.active.delete(tracker.trackerId);
+      });
+      this.active.set(tracker.trackerId, work);
+      launched.push(work);
+    }
+    // Each tracker has at most one local operation. Subsequent ticks can serve
+    // responsive trackers while another request remains in flight.
+    return Promise.allSettled(launched).then((results) => {
+      const failed = results.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
+      return results.some(
+        (result) => result.status === 'fulfilled' && result.value
+      );
     });
-    return this.active;
   }
   stop(): void {
     this.stopped = true;
   }
   async drain(): Promise<void> {
-    await this.active;
+    await Promise.allSettled([...this.active.values()]);
   }
-  private async dispatch(): Promise<boolean> {
-    let worked = false;
-    for (const tracker of this.trackers) {
-      if (this.stopped) break;
-      const owner = randomUUID();
-      const reserved = await this.store.reserveNext(
-        tracker.trackerId,
-        owner,
-        tracker.settings
-      );
-      if (!reserved) continue;
-      worked = true;
-      const { scope, now } = reserved;
-      this.scopeCategory = scope.categoryId;
-      let renewal: NodeJS.Timeout | undefined;
-      try {
-        const deadline = now + 120000;
-        renewal = setInterval(() => {
-          if (!this.stopped)
-            void this.store.renew(scope, owner, deadline).catch(() => false);
-        }, 20000);
-        renewal.unref();
-        await this.collect(tracker, scope, owner, now);
-      } catch (error) {
-        if (!(error instanceof CatalogueLeaseLostError))
-          await this.failure(tracker, scope, owner, error).catch(
-            () => undefined
-          );
-      } finally {
-        this.scopeCategory = undefined;
-        if (renewal) clearInterval(renewal);
-        await this.store.release(scope, owner).catch(() => undefined);
-      }
+  private async dispatch(tracker: CollectionTracker): Promise<boolean> {
+    if (this.stopped) return false;
+    const owner = randomUUID();
+    const claimed = await this.store.claimNext(
+      tracker,
+      owner,
+      tracker.settings
+    );
+    if (!claimed) return false;
+    const { scope, now } = claimed;
+    this.scopeCategories.set(tracker.trackerId, scope.categoryId);
+    let renewal: NodeJS.Timeout | undefined;
+    try {
+      const deadline = now + 120000;
+      renewal = setInterval(() => {
+        if (!this.stopped)
+          void this.store.renew(scope, owner, deadline).catch(() => false);
+      }, 20000);
+      renewal.unref();
+      return await this.collect(tracker, scope, owner, now);
+    } catch (error) {
+      if (!(error instanceof CatalogueLeaseLostError))
+        await this.failure(tracker, scope, owner, error).catch(() => undefined);
+      return false;
+    } finally {
+      this.scopeCategories.delete(tracker.trackerId);
+      if (renewal) clearInterval(renewal);
+      await this.store.release(scope, owner).catch(() => undefined);
     }
-    return worked;
   }
   private async collect(
     tracker: CollectionTracker,
     scope: CatalogueSyncState,
     owner: string,
     now: number
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const { limit, overlap } = tracker.pagination;
+    const step = limit - overlap;
     const state = readCollectionState(scope.collectionState);
     let cp = readCollectionCheckpoint(scope.checkpoint);
-    if (!cp || cp.done) {
+    const paginationChanged =
+      cp != null &&
+      (cp.pagination.limit !== limit || cp.pagination.overlap !== overlap);
+    if (!cp || cp.done || paginationChanged) {
       const invalid = !!scope.checkpoint && !cp;
       const repairThrough =
         scope.mode === 'recent' && cp && state.coverage === 'partial'
-          ? Math.max(cp.repairThrough, cp.nextOffset - 80)
+          ? Math.max(
+              cp.repairThrough,
+              cp.nextOffset - (cp.pagination.limit - cp.pagination.overlap)
+            )
           : 0;
       cp = {
-        version: 1,
+        version: 2,
+        pagination: { ...tracker.pagination },
         nextOffset: 0,
         pages: 0,
         startedAt: now,
@@ -180,13 +211,14 @@ export class CatalogueCollector {
         empty: null,
         terminalOffset: null,
         done: false,
-        dirty: invalid,
+        dirty: false,
         repairThrough,
         maintenance:
           scope.mode === 'historical' &&
           ['complete', 'maintenance'].includes(scope.phase),
       };
       if (invalid) diagnose(state, 'invalid_checkpoint', 'page', now);
+      if (paginationChanged) diagnose(state, 'pagination_changed', 'page', now);
       state.coverage = 'partial';
       scope.cycleId = randomUUID();
       scope.phase =
@@ -205,20 +237,34 @@ export class CatalogueCollector {
       onIdentityConflicts: () => beginning,
     });
     Object.assign(scope, beginning);
-    if (this.stopped) return;
+    if (this.stopped) return false;
+    const category = tracker.categories.find(
+      (category) => category.id === scope.categoryId
+    )!;
     const request = {
-      category:
-        scope.categoryId === 2000 ? ('movie' as const) : ('tv' as const),
+      category: category.requestCategory,
       offset: cp.nextOffset,
-      limit: 100,
+      limit,
     };
+    const fetch = (
+      scope.mode === 'recent'
+        ? tracker.adapter.fetchRecentPage
+        : tracker.adapter.fetchHistoricalPage
+    ).bind(tracker.adapter);
+    const dispatchedAt = await this.store.reserveRequest(
+      tracker,
+      scope,
+      owner,
+      tracker.settings
+    );
+    if (dispatchedAt === null || this.stopped) return false;
+    state.pendingDispatch = false;
+    now = dispatchedAt;
     let timeout: NodeJS.Timeout | undefined;
     let page: NormalizedTrackerPage;
     try {
       page = await Promise.race([
-        scope.mode === 'recent'
-          ? tracker.adapter.fetchRecentPage(request)
-          : tracker.adapter.fetchHistoricalPage(request),
+        fetch(request),
         new Promise<never>((_resolve, reject) => {
           timeout = setTimeout(
             () => reject(new TrackerAdapterError('timeout', true)),
@@ -230,7 +276,7 @@ export class CatalogueCollector {
     } finally {
       if (timeout) clearTimeout(timeout);
     }
-    if (this.stopped) return;
+    if (this.stopped) return true;
     // Adapter observation time is local to its process. The reserved database
     // timestamp orders collector observations consistently across instances.
     const records = page.records.map((record) => ({
@@ -239,11 +285,8 @@ export class CatalogueCollector {
     }));
     const hashes = records.map((record) => fingerprint(record.canonicalGuid));
     const unique = new Set(hashes);
-    const overlap = hashes.filter((hash) => cp!.previous.includes(hash)).length;
-    const repeated =
-      hashes.length > 0 &&
-      hashes.length === cp.previous.length &&
-      hashes.every((hash) => cp!.previous.includes(hash));
+    const continuity = pageContinuity(cp.previous, hashes, tracker.pagination);
+    const repeated = continuity === 'repeated';
     const critical =
       page.contractStatus !== 'compatible' ||
       page.anomalies.some(
@@ -254,12 +297,7 @@ export class CatalogueCollector {
       );
     for (const anomaly of page.anomalies)
       diagnose(state, anomaly.code, anomaly.field, now);
-    const unstable =
-      repeated ||
-      unique.size !== hashes.length ||
-      (cp.previous.length === 100 &&
-        hashes.length > 0 &&
-        overlap !== Math.min(20, hashes.length));
+    const unstable = continuity !== 'continuous';
     if (unstable)
       diagnose(
         state,
@@ -300,7 +338,7 @@ export class CatalogueCollector {
         if (!cp.empty) cp.empty = { offset: cp.nextOffset, confirmations: 1 };
         else if (cp.nextOffset === cp.empty.offset) {
           cp.empty.confirmations = 2;
-          cp.nextOffset += 80;
+          cp.nextOffset += step;
         } else {
           cp.terminalOffset = cp.empty.offset;
           if (scope.mode === 'historical') cp.done = true;
@@ -308,7 +346,7 @@ export class CatalogueCollector {
       } else {
         cp.empty = null;
         cp.terminalOffset = null;
-        cp.nextOffset += 80;
+        cp.nextOffset += step;
       }
       if (scope.mode === 'recent') {
         const existing = records.length
@@ -331,13 +369,15 @@ export class CatalogueCollector {
             .map((row) => row.canonicalGuid)
         );
         const boundary =
-          hashes.length === 100 &&
-          unique.size === 100 &&
+          hashes.length === limit &&
+          unique.size === limit &&
           !critical &&
           !unstable &&
           records.filter((record) => known.has(record.canonicalGuid)).length >=
-            80 &&
-          records.slice(-20).every((record) => known.has(record.canonicalGuid));
+            Math.max(2, step) &&
+          records
+            .slice(-overlap)
+            .every((record) => known.has(record.canonicalGuid));
         cp.knownStreak = boundary ? cp.knownStreak + 1 : 0;
         const corroborated =
           cp.knownStreak >= 2 &&
@@ -350,7 +390,7 @@ export class CatalogueCollector {
             cp.repairThrough = Math.max(cp.repairThrough, request.offset);
         }
       } else if (cp.done) state.coverage = cp.dirty ? 'partial' : 'observed';
-      cp.previous = hashes.slice(0, 100);
+      cp.previous = hashes.slice(0, limit);
       scope.pagesProcessed++;
       scope.lastSuccessfulAt = new Date(now);
       scope.nextRunAt = new Date(now + 1);
@@ -373,6 +413,7 @@ export class CatalogueCollector {
       clock: this.store.clock,
       onIdentityConflicts: (count) => {
         diagnose(state, 'identity_conflict', 'infohash', now, count);
+        state.coverage = 'partial';
         cp!.dirty = true;
         cp!.repairThrough = Math.max(cp!.repairThrough, request.offset);
         checkpoint = checkpointFor(scope, cp!, state, now);
@@ -386,6 +427,7 @@ export class CatalogueCollector {
               .update({ trackerId: tracker.trackerId }, { failures: 0 });
           },
     });
+    return true;
   }
   private async failure(
     tracker: CollectionTracker,

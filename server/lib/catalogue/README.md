@@ -172,6 +172,13 @@ minimum three seconds globally (at most 20 starts per half-open minute), and six
 seconds between maintenance starts (at most 10). Larger spacing values are allowed;
 smaller values are rejected. Recent has dispatch priority. Idle time adds no capacity.
 
+Lease acquisition and cycle preparation do not consume quota. The final SQL
+reservation follows durable preparation and is immediately followed by the adapter
+invocation, with no intervening asynchronous SQL. A pending Recent preparation
+retains priority; a request already dispatched cannot reuse its permit. Distinct
+trackers each have one bounded local operation and progress independently. Shutdown
+stops new dispatch and drains all tracked operations within the existing bound.
+
 Recent cycles start at zero, stop only at a corroborated known boundary across two
 successive overlapping pages, and have a configurable page bound (2–1000). Their
 first run is partial. Partial Recent ranges must be revisited before a later cycle
@@ -179,6 +186,20 @@ can report an observed window. Historical anomalies keep the pass partial throug
 its terminal boundary; a subsequent clean full pass can repair that evidence.
 Progress, coverage and bounded safe diagnostics are separate durable state. Neither
 restart nor explicit error recovery clears incomplete evidence or deletes torrents.
+
+Continuity uses the intersection and relative order of GUIDs near the old page's
+tail and the new page's head. Small overlap variations (including 19 or 21 for the
+20-record overlap) are accepted; missing continuity, reordering and repeated pages
+remain uncertain. Diagnostics alone do not set coverage: malformed optional native
+metadata is observable without invalidating reliable observation coverage. Critical
+rejections remain partial through terminal confirmation until clean reprocessing.
+
+The runtime supplies explicit tracker identity, category mappings and pagination;
+TR4KER retains 100/20 and step 80. Checkpoint version 2 records pagination parameters.
+Version 1's frozen 100/20 continuity is upgraded without losing its offset. Changing
+pagination on an incomplete pass restarts that pass at zero, retaining torrent rows
+and partial coverage while the affected range is reprocessed. No SQL schema or
+settings-format migration is required.
 
 Each scope has an opaque SQL lease, lasting 60 seconds, with renewal every 20 seconds
 bounded to a two-minute operation. Page commits check ownership inside the same
