@@ -1,4 +1,8 @@
 import { MediaServerType } from '@server/constants/server';
+import {
+  defaultTr4kerCollectionSettings,
+  type Tr4kerCollectionSettings,
+} from '@server/lib/catalogue/collectionConfig';
 import { Permission } from '@server/lib/permissions';
 import { runMigrations } from '@server/lib/settings/migrator';
 import type { AvailableLocale } from '@server/types/languages';
@@ -373,9 +377,14 @@ export type JobId =
   | 'jellyfin-full-scan'
   | 'image-cache-cleanup'
   | 'availability-sync'
-  | 'process-blocklisted-tags';
+  | 'process-blocklisted-tags'
+  | 'catalogue-recent-movies'
+  | 'catalogue-recent-tv';
 
 export interface AllSettings {
+  catalogue: {
+    tr4ker: Tr4kerCollectionSettings;
+  };
   clientId: string;
   sessionSecret?: string;
   vapidPublic: string;
@@ -583,7 +592,12 @@ class Settings {
           },
         },
       },
+      catalogue: {
+        tr4ker: { ...defaultTr4kerCollectionSettings },
+      },
       jobs: {
+        'catalogue-recent-movies': { schedule: '0 */15 * * * *' },
+        'catalogue-recent-tv': { schedule: '10 */15 * * * *' },
         'plex-recently-added-scan': {
           schedule: '0 */5 * * * *',
         },
@@ -775,6 +789,10 @@ class Settings {
 
   get jobs(): Record<JobId, JobSettings> {
     return this.data.jobs;
+  }
+
+  get catalogue(): AllSettings['catalogue'] {
+    return this.data.catalogue;
   }
 
   set jobs(data: Record<JobId, JobSettings>) {

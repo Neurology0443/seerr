@@ -35,7 +35,7 @@ export interface FieldOrigin {
 // Structurally compatible with P1 writes. These IDs are tracker claims, not
 // resolved media associations. P1 owns first/last-seen and seeder freshness.
 export type NormalizedTrackerTorrent = Required<
-  Omit<ObservedTorrent, 'categories'>
+  Omit<ObservedTorrent, 'categories' | 'trackerMetadata' | 'provenance'>
 > &
   Pick<ObservedTorrent, 'categories'> & {
     trackerMetadata: {

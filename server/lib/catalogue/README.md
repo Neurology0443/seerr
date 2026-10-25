@@ -61,7 +61,7 @@ checkpoint together. The lower-level `upsertObservedTorrents(manager, records)`
 and `saveSyncCheckpoint(manager, checkpoint)` require an active shared transaction.
 Use the repository's writes for SQLite; they serialize transactions on its single
 connection. Callers using explicit manager transactions must serialize those
-themselves. Cross-process collection ownership belongs to PR3.
+themselves. P3 collection ownership uses the SQL leases described below.
 
 Identity is tracker plus canonical GUID. A contradictory known infohash rejects
 the transaction. Incoming missing hashes do not erase a known identity hash.
@@ -91,7 +91,7 @@ stopped, then run its migrations. Test the restored backup before production use
 
 An explicit rebuild may discard only the catalogue file/schema **and its own
 journal**, then initialize and recollect it. Retain settings/credentials and native
-Seerr storage. PR1 provides no destructive rebuild command or collector. Absence
+Seerr storage. No destructive rebuild command is provided. Absence
 of recollected data must not be treated as authoritative negative availability.
 
 The native SQLite-to-PostgreSQL converter rejects targets with custom schemas and
@@ -118,3 +118,94 @@ against that dedicated instance. Never use application `DB_*` credentials for te
 Without this explicitly provisioned instance the PostgreSQL test is skipped with
 a blocker message (required in CI). **PR1 cannot be closed until the real
 PostgreSQL test passes.** Configuration checks are not PostgreSQL execution proof.
+
+## P3 collection configuration and recovery
+
+Collection is opt-in. Set the **process environment variable `TR4KER_KEY`** on each
+Seerr instance; this is the sole API-key source. The key is never written to
+catalogue SQL, settings or diagnostics. The endpoint remains the P2 TR4KER contract.
+Configure non-secret options in `settings.json`:
+
+```json
+{
+  "catalogue": {
+    "tr4ker": {
+      "enabled": true,
+      "recentPageLimit": 10,
+      "maintenanceIntervalMinutes": null,
+      "globalSpacingSeconds": 3,
+      "maintenanceSpacingSeconds": 6,
+      "initialBackoffSeconds": 30,
+      "maxBackoffSeconds": 900,
+      "failureLimit": 5
+    }
+  },
+  "jobs": {
+    "catalogue-recent-movies": { "schedule": "0 */15 * * * *" },
+    "catalogue-recent-tv": { "schedule": "10 */15 * * * *" }
+  }
+}
+```
+
+Merge these keys into existing settings. Existing installations receive disabled
+collection defaults and both jobs through settings migration `0010`. Recent cadence
+uses the existing native jobs settings (six-field cron), with movies and TV ten
+seconds apart by default. Keep their starts staggered when changing schedules.
+Collection options require restart; native job schedule edits retain their existing
+behavior. All instances sharing a catalogue must use the same tracker settings.
+Missing credentials or invalid configuration leave collection disabled while native
+Seerr continues. Catalogue initialization and migrations remain independent of HTTP
+startup. No capabilities probe or live validation crawl is performed.
+
+Historical starts automatically once storage and configuration are ready. Pages
+are 100 records with 20 overlap and an 80-position step. It resumes committed
+progress after restart. A terminal boundary needs an empty read, a second empty
+read at that offset, then an empty read at the subsequent offset. `total` is ignored.
+This records an observed boundary, without promising exhaustive tracker coverage.
+
+Maintenance has **no default recurrence**. Set `maintenanceIntervalMinutes` to a
+positive integer (at most 525600) to activate it; `null` disables new maintenance
+work. Each subsequent pass begins at zero after the preceding pass finishes and
+its configured interval elapses. An interrupted pass keeps its own offset. The
+tracker shares a SQL request-start budget across all categories and instances:
+minimum three seconds globally (at most 20 starts per half-open minute), and six
+seconds between maintenance starts (at most 10). Larger spacing values are allowed;
+smaller values are rejected. Recent has dispatch priority. Idle time adds no capacity.
+
+Recent cycles start at zero, stop only at a corroborated known boundary across two
+successive overlapping pages, and have a configurable page bound (2–1000). Their
+first run is partial. Partial Recent ranges must be revisited before a later cycle
+can report an observed window. Historical anomalies keep the pass partial through
+its terminal boundary; a subsequent clean full pass can repair that evidence.
+Progress, coverage and bounded safe diagnostics are separate durable state. Neither
+restart nor explicit error recovery clears incomplete evidence or deletes torrents.
+
+Each scope has an opaque SQL lease, lasting 60 seconds, with renewal every 20 seconds
+bounded to a two-minute operation. Page commits check ownership inside the same
+transaction as observations, allowlisted native metadata and checkpoints. Late former
+owners cannot commit after expiration/takeover. A lost or interrupted request replays
+from the last commit. Shutdown stops new dispatch; abandoned ownership expires.
+
+Transient failures back off exponentially from 30 seconds to 15 minutes by default;
+valid future `Retry-After` seconds/dates take precedence even beyond that cap. Five
+consecutive transient tracker failures suspend that tracker; authentication errors
+suspend immediately. Systematic contract errors suspend only the affected scope.
+Compatible page success resets failure counters. Backoff expiry permits automatic
+retry; suspension requires correction and explicit recovery. PR3 adds no admin UI.
+
+The internal operational recovery hook is `CollectionStore.recover('tr4ker')`, or
+`recover('tr4ker', 2000, 'historical')` for a scoped contract suspension. Invoke it
+against the configured catalogue after correcting credentials/configuration, with
+writers stopped. It retains checkpoints, partial coverage and diagnostics, resets
+failure counters, and never reserves future request slots or starts a network call.
+Use `initializeCatalogue()` / `getCatalogueConnection()` for that connection and
+close it with `shutdownCatalogue()`. Merely restarting or replacing the key does
+not acknowledge a suspension. P4 can later expose this hook through administration.
+
+Native TMDB/TVDB IDs remain separate nullable tracker claims on each torrent, with
+season/episode, allowlisted per-field Torznab provenance and `nativeObservedAt`.
+A newer observation can clear an absent claim to NULL; an older replay cannot
+replace newer claims. No media associations or inferred season coverage are made.
+The default P1 persistence path still rejects identity conflicts transactionally;
+collector writes quarantine conflicting records, keep valid records and retain a
+safe scoped diagnostic and partial coverage in that transaction.

@@ -5,6 +5,7 @@ import type {
   CatalogueCoverage,
   CatalogueDestinationIndexer,
   CatalogueDestinationTrackerLink,
+  CatalogueDispatchState,
   CatalogueEngine,
   CatalogueMediaAssociation,
   CatalogueSyncState,
@@ -21,6 +22,7 @@ export const catalogueEntityNames = {
   sync: 'CatalogueSyncState',
   indexer: 'CatalogueDestinationIndexer',
   link: 'CatalogueDestinationTrackerLink',
+  dispatch: 'CatalogueDispatchState',
 } as const;
 
 // Build metadata per connection, without native decorators or global DB_TYPE.
@@ -93,6 +95,16 @@ export function createCatalogueEntities(
         firstSeenAt: date('first_seen_at'),
         lastSeenAt: date('last_seen_at'),
         seedersObservedAt: date('seeders_observed_at', true),
+        nativeTmdbId: int('native_tmdb_id', true),
+        nativeTvdbId: int('native_tvdb_id', true),
+        nativeSeason: int('native_season', true),
+        nativeEpisode: int('native_episode', true),
+        nativeProvenance: {
+          name: 'native_provenance',
+          type: 'text',
+          nullable: true,
+        },
+        nativeObservedAt: date('native_observed_at', true),
       },
       uniques: [
         {
@@ -219,6 +231,14 @@ export function createCatalogueEntities(
         retryAfterAt: date('retry_after_at', true),
         errorCode: text('error_code', true),
         lastHttpStatus: int('last_http_status', true),
+        collectionState: {
+          name: 'collection_state',
+          type: 'text',
+          nullable: true,
+        },
+        nextRunAt: date('next_run_at', true),
+        leaseOwner: text('lease_owner', true),
+        leaseExpiresAt: date('lease_expires_at', true),
       },
       uniques: [
         {
@@ -229,6 +249,44 @@ export function createCatalogueEntities(
       foreignKeys: [
         fk(
           'FK_catalogue_sync_tracker',
+          catalogueEntityNames.tracker,
+          'trackerId'
+        ),
+      ],
+    }),
+    new EntitySchema<CatalogueDispatchState>({
+      name: catalogueEntityNames.dispatch,
+      tableName: 'tracker_dispatch',
+      schema,
+      columns: {
+        trackerId: { name: 'tracker_id', type: 'varchar', primary: true },
+        ...Object.fromEntries(
+          ['lastStart', 'maintenanceStart', 'cooldownUntil'].map((property) => [
+            property,
+            {
+              name: {
+                lastStart: 'last_start',
+                maintenanceStart: 'maintenance_start',
+                cooldownUntil: 'cooldown_until',
+              }[property],
+              type: 'bigint',
+              nullable: true,
+              transformer: {
+                to: (value: number | null) => value,
+                from: (value: string | number | null) =>
+                  value == null ? null : Number(value),
+              },
+            },
+          ])
+        ),
+        suspended: { type: 'boolean', default: false },
+        failures: { type: 'integer', default: 0 },
+        errorCode: text('error_code', true),
+        lastHttpStatus: int('last_http_status', true),
+      },
+      foreignKeys: [
+        fk(
+          'FK_catalogue_dispatch_tracker',
           catalogueEntityNames.tracker,
           'trackerId'
         ),

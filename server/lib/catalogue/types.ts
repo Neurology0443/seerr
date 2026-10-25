@@ -24,6 +24,12 @@ export interface CatalogueTorrent {
   firstSeenAt: Date;
   lastSeenAt: Date;
   seedersObservedAt: Date | null;
+  nativeTmdbId: number | null;
+  nativeTvdbId: number | null;
+  nativeSeason: number | null;
+  nativeEpisode: number | null;
+  nativeProvenance: string | null;
+  nativeObservedAt: Date | null;
 }
 export interface CatalogueCategory {
   id: number;
@@ -63,6 +69,26 @@ export interface CatalogueSyncState {
   retryAfterAt: Date | null;
   errorCode: string | null;
   lastHttpStatus: number | null;
+  collectionState?: string | null;
+  nextRunAt?: Date | null;
+  leaseOwner?: string | null;
+  leaseExpiresAt?: Date | null;
+}
+export interface CatalogueDispatchState {
+  trackerId: string;
+  lastStart: number | null;
+  maintenanceStart: number | null;
+  cooldownUntil: number | null;
+  suspended: boolean;
+  failures: number;
+  errorCode: string | null;
+  lastHttpStatus: number | null;
+}
+export interface NativeTrackerMetadata {
+  tmdbId: number | null;
+  tvdbId: number | null;
+  season: number | null;
+  episode: number | null;
 }
 export interface CatalogueDestinationIndexer {
   id: number;
@@ -92,5 +118,9 @@ export type ObservedTorrent = Pick<
   > & {
     observedAt: Date;
     categories?: number[];
+    trackerMetadata?: NativeTrackerMetadata;
+    provenance?: Partial<
+      Record<keyof NativeTrackerMetadata, { source: string; field: string }>
+    >;
   };
 export type SyncCheckpoint = Omit<CatalogueSyncState, 'id'>;

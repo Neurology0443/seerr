@@ -1,6 +1,10 @@
 import { MediaServerType } from '@server/constants/server';
 import blocklistedTagsProcessor from '@server/job/blocklistedTagsProcessor';
 import availabilitySync from '@server/lib/availabilitySync';
+import {
+  catalogueCollectionRunning,
+  enqueueCatalogueRecent,
+} from '@server/lib/catalogue/collectionRuntime';
 import downloadTracker from '@server/lib/downloadtracker';
 import ImageProxy from '@server/lib/imageproxy';
 import refreshToken from '@server/lib/refreshToken';
@@ -31,6 +35,7 @@ interface ScheduledJob {
 export const scheduledJobs: ScheduledJob[] = [];
 
 export const startJobs = (): void => {
+  if (scheduledJobs.length) return;
   const jobs = getSettings().jobs;
   const mediaServerType = getSettings().main.mediaServerType;
 
@@ -259,5 +264,21 @@ export const startJobs = (): void => {
     cancelFn: () => blocklistedTagsProcessor.cancel(),
   });
 
+  for (const [id, categoryId, name] of [
+    ['catalogue-recent-movies', 2000, 'Catalogue Recent Movies'],
+    ['catalogue-recent-tv', 5000, 'Catalogue Recent TV'],
+  ] as const) {
+    scheduledJobs.push({
+      id,
+      name,
+      type: 'process',
+      interval: 'minutes',
+      cronSchedule: jobs[id].schedule,
+      job: schedule.scheduleJob(jobs[id].schedule, () =>
+        enqueueCatalogueRecent(categoryId)
+      ),
+      running: () => catalogueCollectionRunning(categoryId),
+    });
+  }
   logger.info('Scheduled jobs loaded', { label: 'Jobs' });
 };
