@@ -37,13 +37,11 @@ export function assertSafeCanonicalGuid(guid: string): void {
     !guid ||
     guid.length > 2048 ||
     guid !== guid.trim() ||
+    decoded.includes('\\') ||
     decoded.includes('%') ||
     [...decoded].some(
       (character) =>
         character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127
-    ) ||
-    /(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)[=:/_-]/i.test(
-      decoded
     )
   ) {
     throw new Error('Unsafe catalogue GUID');
@@ -58,7 +56,7 @@ export function assertSafeCanonicalGuid(guid: string): void {
     if (
       url.username ||
       url.password ||
-      url.hash ||
+      decoded.includes('#') ||
       [...url.searchParams].some(
         ([key, value]) =>
           !['id', 'torrentid', 'torrent_id'].includes(key.toLowerCase()) ||
@@ -67,7 +65,12 @@ export function assertSafeCanonicalGuid(guid: string): void {
     ) {
       throw new Error('Unsafe catalogue GUID');
     }
-  } else if (!/^[a-z0-9._:-]+$/i.test(decoded)) {
+  } else if (
+    !/^[a-z0-9._:-]+$/i.test(decoded) ||
+    /(?:^|[^a-z0-9])(?:passkey|api[_-]?key|auth(?:orization)?|token|password|secret)[:=]/i.test(
+      decoded
+    )
+  ) {
     throw new Error('Unsafe catalogue GUID');
   }
 }

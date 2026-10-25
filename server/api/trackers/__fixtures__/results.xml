@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Sanitized TR4KER format</title>
+    <torznab:response offset="387200" total="1001"/>
+    <item>
+      <guid isPermaLink="true">https://tr4ker.net/torrent/Marvel-Secret-Wars-2026-1080p-1a2b3c4d</guid>
+      <title>Marvel.Secret-Wars.2026.1080p</title>
+      <pubDate>Sat, 24 Oct 2026 10:30:00 +0200</pubDate>
+      <link>https://tr4ker.net/download/101?apikey=P2_API_KEY_SENTINEL</link>
+      <enclosure url="https://tr4ker.net/download/101?passkey=P2_PASSKEY_SENTINEL" length="4294967296" type="application/x-bittorrent"/>
+      <torznab:attr name="category" value="2040"/>
+      <torznab:attr name="category" value="2000"/>
+      <torznab:attr name="category" value="2040"/>
+      <torznab:attr name="infohash" value="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"/>
+      <torznab:attr name="size" value="4294967296"/>
+      <torznab:attr name="seeders" value="0"/>
+      <torznab:attr name="leechers" value="2"/>
+      <torznab:attr name="tmdbid" value="12345"/>
+    </item>
+    <item>
+      <guid>https://tr4ker.net/torrent/Example-Show-S01E04-bbbbbbbb</guid>
+      <title>Example.Show.S01E04</title>
+      <pubDate>Sat, 24 Oct 2026 08:31:00 GMT</pubDate>
+      <torznab:attr name="category" value="5000"/>
+      <torznab:attr name="infohash" value="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"/>
+      <torznab:attr name="seeders" value="5"/>
+      <torznab:attr name="tvdbid" value="45678"/>
+      <torznab:attr name="season" value="1"/>
+      <torznab:attr name="episode" value="4"/>
+    </item>
+    <item>
+      <guid>https://tr4ker.net/torrent/Unknown-Show-S01-S03-c0ffee00</guid>
+      <title>Unknown.Show.S01-S03</title>
+    </item>
+    <item>
+      <guid>https://tr4ker.net/torrent/Optional-Invalid-Values-deadbeef</guid>
+      <title>Optional.Invalid.Values</title>
+      <pubDate>31 Feb 2026 08:31:00 +0000</pubDate>
+      <torznab:attr name="category" value="-1"/>
+      <torznab:attr name="seeders" value="-1"/>
+      <torznab:attr name="leechers" value="1e3"/>
+      <torznab:attr name="size" value="9007199254740992"/>
+      <torznab:attr name="tmdbid" value="not-an-id"/>
+      <torznab:attr name="tvdbid" value="0"/>
+      <torznab:attr name="season" value="2.5"/>
+      <torznab:attr name="episode" value="NaN"/>
+      <torznab:attr name="infohash" value="not-a-hash"/>
+    </item>
+    <item>
+      <guid>https://tr4ker.net/torrent/Example-Show-S01-01234567</guid>
+      <title>Example.Show.S01</title>
+      <torznab:attr name="category" value="5000"/>
+      <torznab:attr name="infohash" value="01234567cccccccccccccccccccccccccccccccc"/>
+      <torznab:attr name="size" value="107374182400"/>
+      <torznab:attr name="tmdbid" value="123456"/>
+      <torznab:attr name="tvdbid" value="456789"/>
+      <torznab:attr name="season" value="1"/>
+      <torznab:attr name="seeders" value="0"/>
+      <torznab:attr name="leechers" value="0"/>
+    </item>
+    <item><title>Missing.Guid</title><torznab:attr name="infohash" value="cccccccccccccccccccccccccccccccccccccccc"/></item>
+    <item><guid>https://tr4ker.net/download?token=P2_API_KEY_SENTINEL</guid><title>Unsafe.Identity</title></item>
+  </channel>
+</rss>
