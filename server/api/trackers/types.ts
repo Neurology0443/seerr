@@ -34,15 +34,18 @@ export interface FieldOrigin {
 
 // Structurally compatible with P1 writes. These IDs are tracker claims, not
 // resolved media associations. P1 owns first/last-seen and seeder freshness.
-export type NormalizedTrackerTorrent = Required<ObservedTorrent> & {
-  trackerMetadata: {
-    tmdbId: number | null;
-    tvdbId: number | null;
-    season: number | null;
-    episode: number | null;
+export type NormalizedTrackerTorrent = Required<
+  Omit<ObservedTorrent, 'categories'>
+> &
+  Pick<ObservedTorrent, 'categories'> & {
+    trackerMetadata: {
+      tmdbId: number | null;
+      tvdbId: number | null;
+      season: number | null;
+      episode: number | null;
+    };
+    provenance: Partial<Record<TorrentField, FieldOrigin>>;
   };
-  provenance: Partial<Record<TorrentField, FieldOrigin>>;
-};
 
 export interface TrackerAnomaly {
   itemIndex: number;

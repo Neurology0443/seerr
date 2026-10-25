@@ -52,13 +52,13 @@ export const TR4KER_CONTRACT = {
 
 function validateConfiguration(config: Tr4kerConfig): string {
   try {
-    const endpoint = new URL(config.endpoint ?? TR4KER_CONTRACT.endpoint);
+    const configuredEndpoint = config.endpoint ?? TR4KER_CONTRACT.endpoint;
+    const endpoint = new URL(configuredEndpoint);
+    // Compare every URL component through its canonical serialization, and
+    // reject overrides normalized by URL (default ports, dot segments, etc.).
     if (
-      endpoint.protocol !== 'https:' ||
-      endpoint.username ||
-      endpoint.password ||
-      endpoint.search ||
-      endpoint.hash ||
+      endpoint.href !== TR4KER_CONTRACT.endpoint ||
+      endpoint.href !== configuredEndpoint ||
       !config.apiKey?.trim() ||
       !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(config.trackerId) ||
       config.trackerId.includes(config.apiKey) ||
@@ -66,7 +66,7 @@ function validateConfiguration(config: Tr4kerConfig): string {
         (!Number.isSafeInteger(config.timeout) || config.timeout <= 0))
     )
       throw new Error();
-    return endpoint.toString();
+    return TR4KER_CONTRACT.endpoint;
   } catch {
     throw new TrackerAdapterError('invalid_configuration');
   }

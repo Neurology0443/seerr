@@ -6,14 +6,14 @@ import type {
   AxiosResponse,
   InternalAxiosRequestConfig,
 } from 'axios';
-import { AxiosError } from 'axios';
+import axios, { AxiosError } from 'axios';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, it, mock } from 'node:test';
 import { inspect } from 'node:util';
 import { TrackerAdapterError, parseRetryAfter } from './errors';
-import Tr4kerAdapter from './tr4ker';
+import Tr4kerAdapter, { TR4KER_CONTRACT } from './tr4ker';
 import type { PageRequest } from './types';
 
 const key = 'P2_API_KEY_SENTINEL';
@@ -72,15 +72,22 @@ describe('TR4KER HTTP contract', () => {
     assert.equal(capabilities.advertised.limits.max, 100);
   });
 
-  it('accepts injected endpoint, tracker identity and timeout without persisting configuration', async () => {
+  it('accepts the verified endpoint, tracker identity and timeout with an isolated test transport', async () => {
     const client = new TestAdapter({
       trackerId: 'test-tracker',
       apiKey: key,
-      endpoint: 'https://fixture.invalid/api/torznab/all',
+      endpoint: TR4KER_CONTRACT.endpoint,
       timeout: 1234,
     });
     client.installAdapter(async (config) => {
-      assert.equal(config.baseURL, 'https://fixture.invalid/api/torznab/all');
+      assert.equal(config.baseURL, TR4KER_CONTRACT.endpoint);
+      assert.deepEqual(config.params, {
+        apikey: key,
+        t: 'search',
+        cat: 2000,
+        offset: page.offset,
+        limit: 100,
+      });
       assert.equal(config.timeout, 1234);
       return response(config);
     });
@@ -88,6 +95,49 @@ describe('TR4KER HTTP contract', () => {
     assert.equal(result.trackerId, 'test-tracker');
     assert.doesNotMatch(JSON.stringify(result), /SENTINEL|fixture.invalid/);
   });
+
+  for (const endpoint of [
+    'http://tr4ker.net/api/torznab/all',
+    'https://fixture.invalid/api/torznab/all',
+    'https://tr4ker.net.fixture.invalid/api/torznab/all',
+    'https://fixture-tr4ker.net/api/torznab/all',
+    'https://www.tr4ker.net/api/torznab/all',
+    'https://tr4ker.net./api/torznab/all',
+    'https://tr4ker.net:8443/api/torznab/all',
+    'https://tr4ker.net:443/api/torznab/all',
+    'https://tr4ker.net/api/torznab',
+    'https://tr4ker.net/api/torznab/all/',
+    'https://tr4ker.net/api/torznab/other/../all',
+    'https://tr4ker.net/api/torznab/%61ll',
+    `https://user:${key}@tr4ker.net/api/torznab/all`,
+    'https://@tr4ker.net/api/torznab/all',
+    'https://tr4ker.net@fixture.invalid/api/torznab/all',
+    `https://tr4ker.net/api/torznab/all?apikey=${key}`,
+    'https://tr4ker.net/api/torznab/all?t=caps',
+    'https://tr4ker.net/api/torznab/all?',
+    `https://tr4ker.net/api/torznab/all#${key}`,
+    'https://tr4ker.net/api/torznab/all#',
+    'not-a-url',
+  ]) {
+    it(`rejects an unauthorized endpoint before creating an authenticated client: ${endpoint.replaceAll(key, '[redacted]')}`, () => {
+      const create = mock.method(axios, 'create');
+      assert.throws(
+        () => new Tr4kerAdapter({ trackerId: 'tr4ker', apiKey: key, endpoint }),
+        (error) => {
+          assert.ok(error instanceof TrackerAdapterError);
+          assert.equal(error.code, 'invalid_configuration');
+          const diagnostics = inspect(error) + JSON.stringify(error);
+          assert.ok(!diagnostics.includes(key));
+          assert.ok(!diagnostics.includes(endpoint));
+          assert.ok(!diagnostics.includes('https://'));
+          assert.equal('cause' in error, false);
+          assert.equal('config' in error, false);
+          return true;
+        }
+      );
+      assert.equal(create.mock.callCount(), 0);
+    });
+  }
 
   for (const method of ['fetchRecentPage', 'fetchHistoricalPage'] as const) {
     for (const [category, cat] of [
@@ -98,6 +148,8 @@ describe('TR4KER HTTP contract', () => {
         let calls = 0;
         const client = adapter(async (config) => {
           calls++;
+          assert.equal(config.baseURL, TR4KER_CONTRACT.endpoint);
+          assert.equal(config.maxRedirects, 0);
           assert.deepEqual(config.params, {
             apikey: key,
             t: 'search',
@@ -251,9 +303,6 @@ describe('TR4KER HTTP contract', () => {
 
   it('rejects unsafe configuration with a static credential-free error', () => {
     for (const config of [
-      { endpoint: `https://user:${key}@fixture.invalid/all` },
-      { endpoint: `https://fixture.invalid/all?apikey=${key}` },
-      { endpoint: 'http://fixture.invalid/all' },
       { apiKey: '' },
       { trackerId: key },
       { timeout: -1 },
@@ -274,6 +323,29 @@ describe('TR4KER HTTP contract', () => {
 
 describe('TR4KER safe errors', () => {
   afterEach(() => mock.restoreAll());
+
+  it('rejects redirects without forwarding credentials or exposing the redirect URL', async () => {
+    let calls = 0;
+    const client = adapter(async (config) => {
+      calls++;
+      assert.equal(config.baseURL, TR4KER_CONTRACT.endpoint);
+      assert.equal(config.maxRedirects, 0);
+      return response(config, key, 302, {
+        location: `https://fixture.invalid/?apikey=${key}`,
+      });
+    });
+    await assert.rejects(client.getCapabilities(), (error) => {
+      assert.ok(error instanceof TrackerAdapterError);
+      assert.equal(error.code, 'http_error');
+      assert.equal(error.httpStatus, 302);
+      assert.doesNotMatch(
+        inspect(error) + JSON.stringify(error),
+        /SENTINEL|fixture.invalid/
+      );
+      return true;
+    });
+    assert.equal(calls, 1);
+  });
 
   for (const test of [
     { status: 401, code: 'authentication', retryable: false },

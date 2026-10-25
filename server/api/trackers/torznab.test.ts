@@ -6,7 +6,11 @@ import {
   assertSafeCanonicalGuid,
   upsertObservedTorrents,
 } from '@server/lib/catalogue/repository';
-import type { CatalogueTorrent } from '@server/lib/catalogue/types';
+import type {
+  CatalogueCategory,
+  CatalogueTorrent,
+  ObservedTorrent,
+} from '@server/lib/catalogue/types';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -128,7 +132,7 @@ describe('Torznab normalization', () => {
         season: null,
         episode: null,
       });
-      assert.deepEqual(record.categories, []);
+      assert.equal(Object.hasOwn(record, 'categories'), false);
     }
     assert.equal(unknown.provenance.seeders, undefined);
     assert.equal(unknown.provenance.season, undefined);
@@ -204,6 +208,68 @@ describe('Torznab normalization', () => {
     const page = await normalize(rss(item('torrent-1', fields)));
     assert.equal(page.records[0].seeders, 0);
     assert.deepEqual(page.records[0].categories, [5000]);
+  });
+
+  for (const test of [
+    { name: 'absent', fields: '', invalid: false },
+    { name: 'empty', fields: attr('category', ''), invalid: true },
+    {
+      name: 'missing a value',
+      fields: '<torznab:attr name="category"/>',
+      invalid: true,
+    },
+    { name: 'malformed', fields: attr('category', key), invalid: true },
+    {
+      name: 'partially malformed',
+      fields: attr('category', '2040') + attr('category', '-1'),
+      invalid: true,
+    },
+    {
+      name: 'partially missing a value',
+      fields: '<torznab:attr name="category"/>' + attr('category', '2000'),
+      invalid: true,
+    },
+  ]) {
+    it(`omits ${test.name} category information without discarding useful torrent fields`, async () => {
+      const guid = 'https://tr4ker.net/torrent/Example-Release-42';
+      const page = await normalizeTr4ker(
+        rss(item(guid, test.fields + attr('seeders', '0')))
+      );
+      assert.equal(page.records.length, 1);
+      const [record] = page.records;
+      assert.equal(record.canonicalGuid, guid);
+      assert.equal(record.releaseName, 'Example.Release');
+      assert.equal(record.seeders, 0);
+      assert.equal(Object.hasOwn(record, 'categories'), false);
+      assert.equal(record.provenance.categories, undefined);
+      assert.equal(page.contractStatus, 'compatible');
+      assert.deepEqual(
+        page.anomalies,
+        test.invalid
+          ? [{ itemIndex: 0, code: 'invalid_field', field: 'categories' }]
+          : []
+      );
+      assert.ok(!JSON.stringify(page).includes(key));
+    });
+  }
+
+  it('normalizes complete category information into a sorted unique replacement', async () => {
+    const page = await normalizeTr4ker(
+      rss(
+        item(
+          'https://tr4ker.net/torrent/Example-Release-42',
+          attr('category', '2040') +
+            attr('category', '2000') +
+            attr('category', '2040')
+        )
+      )
+    );
+    assert.deepEqual(page.records[0].categories, [2000, 2040]);
+    assert.deepEqual(page.records[0].provenance.categories, {
+      source: 'tracker',
+      field: 'torznab:attr/category',
+    });
+    assert.deepEqual(page.anomalies, []);
   });
 
   it('reports conflicting repeated attributes and validates equivalent RSS size', async () => {
@@ -812,6 +878,89 @@ describe('Torznab identity and security', () => {
       parseTorznabCapabilities(fixture('caps'), key, [key]),
       TrackerAdapterError
     );
+  });
+
+  it('preserves P1 category associations for unknown or incomplete P2 observations', async () => {
+    const database = createCatalogueDataSource({
+      type: 'sqlite',
+      database: ':memory:',
+    });
+    try {
+      await database.initialize();
+      await database.runMigrations();
+      await new CatalogueRepository(database).saveTracker({
+        id: 'tr4ker',
+        name: 'TR4KER',
+        connectorType: 'torznab',
+        enabled: true,
+      });
+      const observe = (fields: string, minute: number) =>
+        normalizeTorznabPage(
+          rss(
+            item(
+              'https://tr4ker.net/torrent/Example-Release-42',
+              fields + attr('seeders', '0')
+            )
+          ),
+          {
+            ...context,
+            observedAt: new Date(context.observedAt.getTime() + minute * 60000),
+          },
+          TR4KER_CONTRACT,
+          [key]
+        );
+      const persist = (records: ObservedTorrent[]) =>
+        database.transaction((manager) =>
+          upsertObservedTorrents(manager, records)
+        );
+      const initial = await observe(
+        attr('category', '2000') + attr('category', '2040'),
+        0
+      );
+      const [stored] = await persist(initial.records);
+      const categories = async () =>
+        (
+          await database
+            .getRepository<CatalogueCategory>(catalogueEntityNames.category)
+            .find({
+              where: { torrentId: stored.id },
+              order: { categoryId: 'ASC' },
+            })
+        ).map((row) => row.categoryId);
+      assert.deepEqual(await categories(), [2000, 2040]);
+
+      for (const [index, fields] of [
+        '',
+        attr('category', key),
+        attr('category', '5000') + '<torznab:attr name="category"/>',
+      ].entries()) {
+        const page = await observe(fields, index + 1);
+        assert.equal(Object.hasOwn(page.records[0], 'categories'), false);
+        const [updated] = await persist(page.records);
+        assert.deepEqual(updated.lastSeenAt, page.observedAt);
+        assert.deepEqual(await categories(), [2000, 2040]);
+      }
+
+      const replacement = await observe(
+        attr('category', '5030') + attr('category', '5000'),
+        4
+      );
+      await persist(replacement.records);
+      assert.deepEqual(await categories(), [5000, 5030]);
+      await persist(initial.records);
+      await persist([{ ...initial.records[0], categories: [] }]);
+      assert.deepEqual(await categories(), [5000, 5030]);
+
+      const missing = await observe('', 5);
+      await persist(missing.records);
+      assert.deepEqual(await categories(), [5000, 5030]);
+      await persist([{ ...missing.records[0], categories: [] }]);
+      assert.deepEqual(await categories(), []);
+      await persist(replacement.records);
+      assert.deepEqual(await categories(), []);
+    } finally {
+      if (database.isInitialized) await database.destroy();
+    }
   });
 
   it('feeds the existing P1 repository and preserves its cross-page conflict boundary', async () => {

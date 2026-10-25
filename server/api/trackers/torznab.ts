@@ -433,13 +433,21 @@ export async function normalizeTorznabPage(
       provenance[field] = { source: 'tracker', field: `torznab:attr/${name}` };
       return numbers[0];
     };
-    const categories = new Set<number>();
+    const categoryIds = new Set<number>();
+    let categoriesComplete = true;
     for (const value of attributeValues('category')) {
       const category = integer(value, 1);
-      if (category === null) report('categories');
-      else categories.add(category);
+      if (category === null) {
+        categoriesComplete = false;
+        report('categories');
+      } else categoryIds.add(category);
     }
-    if (categories.size)
+    // A partial set is not an authoritative replacement for known associations.
+    const categories =
+      categoriesComplete && categoryIds.size
+        ? [...categoryIds].sort((a, b) => a - b)
+        : undefined;
+    if (categories !== undefined)
       provenance.categories = {
         source: 'tracker',
         field: 'torznab:attr/category',
@@ -473,7 +481,7 @@ export async function normalizeTorznabPage(
       canonicalGuid,
       releaseName,
       infohash,
-      categories: [...categories].sort((a, b) => a - b),
+      ...(categories === undefined ? {} : { categories }),
       size,
       publishedAt,
       seeders: numeric('seeders', 'seeders'),

@@ -2,9 +2,11 @@
 
 `TrackerAdapter` exposes capability discovery and one Recent or Historical page
 per call. `Tr4kerAdapter` accepts server-side `trackerId`, `apiKey`, optional
-`endpoint` and optional `timeout`. The defaults are TR4KER's HTTPS Torznab `/all`
-endpoint and Seerr's configured `network.apiRequestTimeout`. Constructing or
-importing the client performs no requests.
+`endpoint` and optional `timeout`. Authenticated requests use only
+`https://tr4ker.net/api/torznab/all`; an explicit endpoint must match this canonical
+URL exactly. Other destinations or URL components fail before client creation.
+The timeout defaults to Seerr's configured `network.apiRequestTimeout`.
+Constructing or importing the client performs no requests.
 
 ```ts
 const adapter = new Tr4kerAdapter({ trackerId, apiKey });
@@ -37,6 +39,15 @@ unresolved tracker TMDB/TVDB IDs and explicit season/episode numbers. `provenanc
 identifies the source of each present field. P2 does not write these claims as
 media associations or infer coverage from titles.
 
+Absent category metadata omits `categories`. If any category value is malformed
+or missing, the entire category set is omitted with safe `invalid_field`
+anomalies; a valid subset is not a complete replacement. Complete valid values
+remain deduplicated and sorted. P2 never infers categories from the requested
+search category. P1 retains associations when `categories` is omitted, replaces
+them for a nonempty set and clears them only for an explicitly known `[]`,
+subject to its existing observation-order rules. Torznab omissions or malformed
+values never produce that explicit empty observation.
+
 `CatalogueRepository.persistPage()` does not persist `trackerMetadata` or its
 field provenance. Durable retention belongs to the existing CAT-010 follow-up
 for P3/P5; this adapter correction does not change the P1 persistence contract.
@@ -56,7 +67,8 @@ field. A valid empty page has `receivedCount=0`, no anomalies and `compatible`;
 an incompatible response has received items, no accepted records and explicit
 critical anomalies. The existing tracker, category, offset and observation time
 remain on the page. Invalid optional fields still produce `invalid_field` or
-`conflicting_field` and `null`; GUID/hash contradictions retain `identity_conflict`.
+`conflicting_field` and `null` (or omission for categories); GUID/hash
+contradictions retain `identity_conflict`.
 
 These are observations, not collection coverage or availability decisions. P3
 must inspect critical diagnostics and identity conflicts before relying on a page;
@@ -95,7 +107,8 @@ are never returned or fetched, and `comments` is not used as a GUID fallback.
 optional numeric Torznab API code and sanitized `retryAfter` (`{ seconds }` or
 `{ date }`, with canonical ISO date). Raw upstream exceptions are discarded.
 Malformed XML (including trailing data), invalid envelopes and API errors fail
-the page; invalid optional item fields instead produce anomalies and `null`.
+the page; invalid optional item fields instead produce anomalies and `null`,
+or omission for categories.
 
 The adapter does not use `total`, infer scan completion, advance offsets, write
 checkpoints, persist pages, retry, throttle, schedule collection or make native
