@@ -264,9 +264,9 @@ export const startJobs = (): void => {
     cancelFn: () => blocklistedTagsProcessor.cancel(),
   });
 
-  for (const [id, categoryId, name] of [
-    ['catalogue-recent-movies', 2000, 'Catalogue Recent Movies'],
-    ['catalogue-recent-tv', 5000, 'Catalogue Recent TV'],
+  for (const [id, category, name] of [
+    ['catalogue-recent-movies', 'movie', 'Catalogue Recent Movies'],
+    ['catalogue-recent-tv', 'tv', 'Catalogue Recent TV'],
   ] as const) {
     scheduledJobs.push({
       id,
@@ -275,9 +275,9 @@ export const startJobs = (): void => {
       interval: 'minutes',
       cronSchedule: jobs[id].schedule,
       job: schedule.scheduleJob(jobs[id].schedule, () =>
-        enqueueCatalogueRecent(categoryId)
+        enqueueCatalogueRecent(category)
       ),
-      running: () => catalogueCollectionRunning(categoryId),
+      running: () => catalogueCollectionRunning(category),
     });
   }
   logger.info('Scheduled jobs loaded', { label: 'Jobs' });

@@ -1,6 +1,7 @@
 import { TrackerAdapterError } from '@server/api/trackers/errors';
 import type {
   NormalizedTrackerPage,
+  PageRequest,
   TrackerAdapter,
 } from '@server/api/trackers/types';
 import { createHash, randomUUID } from 'node:crypto';
@@ -110,16 +111,19 @@ export class CatalogueCollector {
     for (const tracker of this.trackers)
       await this.store.initialize(tracker, tracker.settings);
   }
-  enqueueRecent(categoryId: number): Promise<void> {
-    return Promise.all(
-      this.trackers
-        .filter((tracker) =>
-          tracker.categories.some((category) => category.id === categoryId)
-        )
-        .map((tracker) =>
-          this.store.enqueueRecent(tracker.trackerId, categoryId)
-        )
-    ).then(() => undefined);
+  enqueueRecent(mediaCategory: PageRequest['category']): Promise<void> {
+    return Promise.allSettled(
+      this.trackers.flatMap((tracker) =>
+        tracker.categories
+          .filter((category) => category.requestCategory === mediaCategory)
+          .map((category) =>
+            this.store.enqueueRecent(tracker.trackerId, category.id)
+          )
+      )
+    ).then((results) => {
+      const failed = results.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
+    });
   }
   tick(): Promise<boolean> {
     if (this.stopped) return Promise.resolve(false);
@@ -283,18 +287,31 @@ export class CatalogueCollector {
       ...record,
       observedAt: new Date(now),
     }));
+    const criticalAnomaly = page.anomalies.some(
+      (a) =>
+        ['canonicalGuid', 'infohash', 'releaseName', 'categories'].includes(
+          a.field
+        ) || a.code === 'identity_conflict'
+    );
+    const unusable =
+      records.length === 0 &&
+      (page.receivedCount > 0 ||
+        page.contractStatus !== 'compatible' ||
+        criticalAnomaly);
+    // A rejected nonempty response contradicts any pending terminal emptiness.
+    if (page.receivedCount > 0 || unusable) {
+      cp.empty = null;
+      cp.terminalOffset = null;
+    }
+    const pageStartCheckpoint = structuredClone(cp);
+    const pageStartScope = { ...scope };
+    const failuresBeforePage = state.failures;
     const hashes = records.map((record) => fingerprint(record.canonicalGuid));
     const unique = new Set(hashes);
     const continuity = pageContinuity(cp.previous, hashes, tracker.pagination);
     const repeated = continuity === 'repeated';
     const critical =
-      page.contractStatus !== 'compatible' ||
-      page.anomalies.some(
-        (a) =>
-          ['canonicalGuid', 'infohash', 'releaseName', 'categories'].includes(
-            a.field
-          ) || a.code === 'identity_conflict'
-      );
+      unusable || page.contractStatus !== 'compatible' || criticalAnomaly;
     for (const anomaly of page.anomalies)
       diagnose(state, anomaly.code, anomaly.field, now);
     const unstable = continuity !== 'continuous';
@@ -305,18 +322,22 @@ export class CatalogueCollector {
         'page',
         now
       );
-    if (critical || unstable) {
-      cp.dirty = true;
-      cp.repairThrough = Math.max(cp.repairThrough, cp.nextOffset);
-      state.coverage = 'partial';
-    }
-    const systematic =
+    let systematic =
+      unusable ||
       page.contractStatus === 'incompatible' ||
       repeated ||
       (page.contractStatus === 'partial' &&
         records.length < page.receivedCount / 2);
-    if (systematic) {
-      state.failures++;
+    if (critical || unstable) {
+      // An unadvanced Historical page is still pending, not a skipped range.
+      if (!systematic || scope.mode === 'recent') {
+        cp.dirty = true;
+        cp.repairThrough = Math.max(cp.repairThrough, cp.nextOffset);
+      }
+      state.coverage = 'partial';
+    }
+    const deferPage = () => {
+      state.failures = failuresBeforePage + 1;
       scope.status =
         state.failures >= tracker.settings.failureLimit
           ? 'suspended'
@@ -326,6 +347,10 @@ export class CatalogueCollector {
       scope.retryAfterAt = new Date(
         now + backoff(state.failures, tracker.settings)
       );
+      state.coverage = 'partial';
+    };
+    if (systematic) {
+      deferPage();
       // Keep the committed offset; valid observations can still be retained.
     } else {
       state.failures = 0;
@@ -414,18 +439,30 @@ export class CatalogueCollector {
       onIdentityConflicts: (count) => {
         diagnose(state, 'identity_conflict', 'infohash', now, count);
         state.coverage = 'partial';
-        cp!.dirty = true;
-        cp!.repairThrough = Math.max(cp!.repairThrough, request.offset);
+        if (count === records.length) {
+          // The repository can reject every record against stored identities.
+          // Restore tentative progress inside the same page transaction.
+          cp = pageStartCheckpoint;
+          Object.assign(scope, pageStartScope);
+          systematic = true;
+          if (scope.mode === 'recent') {
+            cp.dirty = true;
+            cp.repairThrough = Math.max(cp.repairThrough, request.offset);
+          }
+          deferPage();
+        } else {
+          cp!.dirty = true;
+          cp!.repairThrough = Math.max(cp!.repairThrough, request.offset);
+        }
         checkpoint = checkpointFor(scope, cp!, state, now);
         return checkpoint;
       },
-      afterPersist: systematic
-        ? undefined
-        : async (manager) => {
-            await manager
-              .getRepository(names.dispatch)
-              .update({ trackerId: tracker.trackerId }, { failures: 0 });
-          },
+      afterPersist: async (manager) => {
+        if (!systematic)
+          await manager
+            .getRepository(names.dispatch)
+            .update({ trackerId: tracker.trackerId }, { failures: 0 });
+      },
     });
     return true;
   }
@@ -447,7 +484,9 @@ export class CatalogueCollector {
     const cp = readCollectionCheckpoint(stored.checkpoint);
     state.coverage = 'partial';
     state.failures++;
-    if (cp) {
+    if (cp && scope.mode === 'recent') {
+      // Recent must revisit its moving front after an interruption. Historical
+      // retries this unadvanced offset; request health alone does not dirty it.
       cp.dirty = true;
       cp.repairThrough = Math.max(cp.repairThrough, cp.nextOffset);
     }

@@ -4,6 +4,7 @@ import { it } from 'node:test';
 import type { DataSource } from 'typeorm';
 import {
   catalogueCollectionRunning,
+  enqueueCatalogueRecent,
   startCatalogueCollection,
   stopCatalogueCollection,
 } from './collectionRuntime';
@@ -52,9 +53,37 @@ it('collection starts only with explicit configuration; startup is single-flight
     assert.equal(initialize.mock.callCount(), 2);
     assert.equal(tick.mock.callCount(), 1);
     assert.equal(catalogueCollectionRunning(), true);
+    t.mock.method(
+      CatalogueCollector.prototype,
+      'scopeRunning',
+      (id: number, trackerId?: string) => id === 2000 && trackerId === 'tr4ker'
+    );
+    assert.equal(catalogueCollectionRunning('movie'), true);
+    assert.equal(catalogueCollectionRunning('tv'), false);
+    const enqueued: ('movie' | 'tv')[] = [];
+    t.mock.method(
+      CatalogueCollector.prototype,
+      'enqueueRecent',
+      async (category: 'movie' | 'tv') => {
+        enqueued.push(category);
+        if (category === 'movie')
+          throw new Error('Synthetic unavailable tracker SECRET');
+      }
+    );
+    enqueueCatalogueRecent('movie');
+    enqueueCatalogueRecent('tv');
+    await new Promise(setImmediate);
+    assert.deepEqual(enqueued, ['movie', 'tv']);
+    assert.equal(
+      tick.mock.callCount(),
+      3,
+      'Ready work must be dispatched even when another enqueue fails'
+    );
     await stopCatalogueCollection();
     assert.equal(stop.mock.callCount(), 1);
     assert.equal(catalogueCollectionRunning(), false);
+    enqueueCatalogueRecent('movie');
+    assert.equal(enqueued.length, 2);
     await startCatalogueCollection({} as DataSource);
     assert.equal(initialize.mock.callCount(), 2);
   } finally {

@@ -151,6 +151,9 @@ Merge these keys into existing settings. Existing installations receive disabled
 collection defaults and both jobs through settings migration `0010`. Recent cadence
 uses the existing native jobs settings (six-field cron), with movies and TV ten
 seconds apart by default. Keep their starts staggered when changing schedules.
+The two jobs trigger logical `movie`/`tv` work; each tracker resolves these through
+its configured category IDs (TR4KER uses `2000`/`5000`). Unsupported mappings are
+not enqueued. An enqueue failure for one tracker does not discard another's work.
 Collection options require restart; native job schedule edits retain their existing
 behavior. All instances sharing a catalogue must use the same tracker settings.
 Missing credentials or invalid configuration leave collection disabled while native
@@ -182,8 +185,11 @@ stops new dispatch and drains all tracked operations within the existing bound.
 Recent cycles start at zero, stop only at a corroborated known boundary across two
 successive overlapping pages, and have a configurable page bound (2–1000). Their
 first run is partial. Partial Recent ranges must be revisited before a later cycle
-can report an observed window. Historical anomalies keep the pass partial through
-its terminal boundary; a subsequent clean full pass can repair that evidence.
+can report an observed window. Historical defects on advanced pages keep the pass
+partial through its terminal boundary; a subsequent clean full pass can repair
+that evidence. A failed request or wholly unusable page leaves its offset pending.
+Successful reprocessing at that offset can finish the current pass as observed,
+provided no other coverage defect remains, including after restart during backoff.
 Progress, coverage and bounded safe diagnostics are separate durable state. Neither
 restart nor explicit error recovery clears incomplete evidence or deletes torrents.
 
@@ -213,6 +219,11 @@ consecutive transient tracker failures suspend that tracker; authentication erro
 suspend immediately. Systematic contract errors suspend only the affected scope.
 Compatible page success resets failure counters. Backoff expiry permits automatic
 retry; suspension requires correction and explicit recovery. PR3 adds no admin UI.
+Nonempty pages with no usable records, including records all quarantined against
+stored identities, use bounded scope retries without advancing page progress or
+success timestamps. They cancel pending terminal-empty evidence and cannot confirm
+the end of history. Partially accepted pages retain valid records and partial
+coverage. Recent interruption safeguards remain conservative across cycles.
 
 The internal operational recovery hook is `CollectionStore.recover('tr4ker')`, or
 `recover('tr4ker', 2000, 'historical')` for a scoped contract suspension. Invoke it
@@ -224,7 +235,11 @@ close it with `shutdownCatalogue()`. Merely restarting or replacing the key does
 not acknowledge a suspension. P4 can later expose this hook through administration.
 
 Native TMDB/TVDB IDs remain separate nullable tracker claims on each torrent, with
-season/episode, allowlisted per-field Torznab provenance and `nativeObservedAt`.
+season/episode, bounded per-field tracker provenance and `nativeObservedAt`.
+Provenance accepts symbolic protocol-independent field paths; adapters interpret
+the exact names. Persistence requires source `tracker` for native claims and rejects
+malformed structures, credential fields, URLs and raw payloads. Existing TR4KER
+Torznab paths persist unchanged; absent optional claims need no provenance.
 A newer observation can clear an absent claim to NULL; an older replay cannot
 replace newer claims. No media associations or inferred season coverage are made.
 The default P1 persistence path still rejects identity conflicts transactionally;

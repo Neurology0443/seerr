@@ -165,3 +165,75 @@ passing run above supersedes that cancelled run; no assertion or production
 recovery rule was weakened. PostgreSQL 17.9 was provisioned in the disposable
 `/tmp/seerr-p3-corrective-pg` directory on loopback port 56484 and stopped after the
 checks. No project environment configuration or real data was changed.
+
+## Corrective pass — collection reliability and tracker independence
+
+Modified files:
+
+- `server/lib/catalogue/collector.ts`: unadvanced Historical retries, unusable-page handling and logical Recent enqueue mapping.
+- `server/lib/catalogue/repository.ts`: protocol-independent validation of bounded native tracker provenance.
+- `server/lib/catalogue/collectionRuntime.ts`, `server/job/schedule.ts`: logical movie/TV triggers and runtime wake-up after isolated enqueue errors.
+- `server/lib/catalogue/collector.test.ts`, `server/lib/catalogue/collectionRuntime.test.ts`, `server/job/schedule.test.ts`: focused regression coverage for these boundaries.
+- `server/lib/catalogue/README.md`, this validation record: recovery, scheduling and provenance contract documentation.
+
+Corrections:
+
+- Timeout, 429 and 503 failures retain an unadvanced Historical checkpoint without
+  inventing a permanent dirty range. Backoff and Retry-After survive reopening;
+  successful same-offset reprocessing can finish the pass as observed. Existing
+  critical gaps remain partial, and Recent interruption safeguards are retained.
+- Nonempty pages with no usable records use bounded scope retries regardless of
+  normalized contract status. Repository quarantine of every record restores
+  tentative page progress and success state inside the same transaction. Rejected
+  pages invalidate pending terminal emptiness. Partial acceptance retains valid
+  records and conservative coverage.
+- Native provenance retains the existing tracker-source and numeric value
+  requirements while accepting bounded symbolic field paths from other protocols.
+  Malformed structures, unsafe sources, credential paths, URLs and raw payloads
+  are rejected transactionally. Existing TR4KER provenance is unchanged.
+- The two existing jobs trigger logical `movie`/`tv` work, mapped to each tracker's
+  configured IDs. Unsupported mappings are ignored; one enqueue error or suspended
+  tracker does not prevent another's scheduled work. Job IDs, crons, fairness,
+  leases, Recent priority and per-tracker request budgets retain their behavior.
+
+Focused collection/runtime/scheduling command:
+
+```sh
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56485 SEERR_MIGRATION_PG_PASSWORD=independence-disposable pnpm test server/lib/catalogue/collector.test.ts server/lib/catalogue/collectionRuntime.test.ts server/job/schedule.test.ts
+```
+
+**74 passed, 0 failed, 0 cancelled, 0 skipped.** Real isolated SQLite and PostgreSQL
+cover all four corrections plus existing Historical/Recent pagination, coverage,
+metadata, transactions, leases, fencing, quotas, restart and failure isolation.
+An initial new scheduling fixture expected consecutive movie pages; its expectation
+was corrected to preserve the existing movie/TV alternation. No production fairness
+rule or assertion was weakened. The passing run supersedes that fixture failure.
+
+Directly affected P1/P2 command, run separately after the preceding tests removed
+their own databases:
+
+```sh
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56485 SEERR_MIGRATION_PG_PASSWORD=independence-disposable pnpm test server/lib/catalogue/catalogue.test.ts server/lib/catalogue/lifecycle.test.ts server/api/trackers/torznab.test.ts server/api/trackers/tr4ker.test.ts
+```
+
+**183 passed, 0 failed, 0 cancelled, 0 skipped.** Includes storage/checkpoint
+atomicity, native isolation, lifecycle and offline P2/TR4KER normalization.
+
+Modified-file checks:
+
+```sh
+devenv shell -- pnpm exec eslint server/lib/catalogue/collector.ts server/lib/catalogue/repository.ts server/lib/catalogue/collectionRuntime.ts server/lib/catalogue/collectionRuntime.test.ts server/lib/catalogue/collector.test.ts server/job/schedule.ts server/job/schedule.test.ts
+devenv shell -- pnpm exec prettier --check server/lib/catalogue/collector.ts server/lib/catalogue/repository.ts server/lib/catalogue/collectionRuntime.ts server/lib/catalogue/collectionRuntime.test.ts server/lib/catalogue/collector.test.ts server/job/schedule.ts server/job/schedule.test.ts server/lib/catalogue/README.md server/lib/catalogue/PR3-VALIDATION.md
+git diff --check
+```
+
+All passed. Only modified files were formatted. PostgreSQL 17.9 used the disposable
+`/tmp/seerr-p3-independence-pg` directory on loopback port 56485 and was stopped
+and removed after testing. No real data or tracker credentials were used.
+
+No schema, migrations, adapters, settings format or project environment changes
+were needed. No backlog entries were created or updated. No global lint,
+formatting, typecheck, i18n, full repository suite, production build or live tracker
+calls were run. Observed boundaries retain their existing exhaustiveness limits;
+no implementation blocker remains. No staging, commit, push, branch changes or
+sibling-worktree modifications were performed.

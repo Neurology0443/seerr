@@ -1,4 +1,5 @@
 import Tr4kerAdapter from '@server/api/trackers/tr4ker';
+import type { PageRequest } from '@server/api/trackers/types';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { DataSource } from 'typeorm';
@@ -60,18 +61,30 @@ export function startCatalogueCollection(
   });
   return starting;
 }
-export function enqueueCatalogueRecent(categoryId: number): void {
+export function enqueueCatalogueRecent(
+  category: PageRequest['category']
+): void {
   if (stopping || !collector) return;
   void collector
-    .enqueueRecent(categoryId)
+    .enqueueRecent(category)
+    .catch(reportUnavailable)
     .then(() => collector?.tick())
     .catch(reportUnavailable);
 }
-export function catalogueCollectionRunning(categoryId?: number): boolean {
+export function catalogueCollectionRunning(
+  category?: PageRequest['category']
+): boolean {
   return (
     !!collector &&
     !stopping &&
-    (categoryId === undefined || collector.scopeRunning(categoryId))
+    (category === undefined ||
+      collector.trackers.some((tracker) =>
+        tracker.categories.some(
+          (configured) =>
+            configured.requestCategory === category &&
+            collector!.scopeRunning(configured.id, tracker.trackerId)
+        )
+      ))
   );
 }
 export async function stopCatalogueCollection(): Promise<void> {

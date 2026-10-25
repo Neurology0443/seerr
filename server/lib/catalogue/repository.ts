@@ -96,6 +96,37 @@ function requireTransaction(manager: EntityManager): void {
     throw new Error('Catalogue page writes require an active transaction');
 }
 
+function assertNativeProvenance(origin: unknown): void {
+  const value = origin as { source?: unknown; field?: unknown } | null;
+  // Native metadata remains a tracker claim. The adapter interprets the exact
+  // protocol field; persistence accepts only a bounded symbolic field path.
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).some((key) => key !== 'source' && key !== 'field') ||
+    value.source !== 'tracker' ||
+    typeof value.field !== 'string' ||
+    !/^[a-z_$/][a-z0-9_$.:/-]{0,127}$/i.test(value.field) ||
+    value.field.includes('//') ||
+    value.field
+      .split(/[.:/]/)
+      .some((part) =>
+        [
+          'apikey',
+          'passkey',
+          'authorization',
+          'auth',
+          'accesstoken',
+          'token',
+          'password',
+          'secret',
+        ].includes(part.toLowerCase().replace(/[_-]/g, ''))
+      )
+  )
+    throw new Error('Invalid catalogue native metadata provenance');
+}
+
 type NormalizedObservation = ObservedTorrent & { firstSeenAt: Date };
 
 function normalizeObservations(
@@ -118,24 +149,14 @@ function normalizeObservations(
       throw new Error('Invalid catalogue infohash');
     for (const category of input.categories ?? []) integer(category, 1);
     if (input.trackerMetadata) {
-      for (const [field, attribute] of Object.entries({
-        tmdbId: 'tmdbid',
-        tvdbId: 'tvdbid',
-        season: 'season',
-        episode: 'episode',
-      })) {
+      for (const field of ['tmdbId', 'tvdbId', 'season', 'episode'] as const) {
         const value =
           input.trackerMetadata[field as keyof typeof input.trackerMetadata];
         if (value != null) {
           integer(value, field.endsWith('Id') ? 1 : 0);
-          const origin =
-            input.provenance?.[field as keyof typeof input.trackerMetadata];
-          if (
-            origin?.source !== 'tracker' ||
-            origin.field !== `torznab:attr/${attribute}`
-          )
-            throw new Error('Invalid catalogue native metadata provenance');
-        }
+          assertNativeProvenance(input.provenance?.[field]);
+        } else if (input.provenance?.[field] != null)
+          assertNativeProvenance(input.provenance[field]);
       }
     }
     const record: NormalizedObservation = {

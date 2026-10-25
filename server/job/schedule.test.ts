@@ -15,10 +15,14 @@ it('Recent movie/TV native jobs are separate, staggered, configurable and regist
     callbacks.set(cron, callback);
     return job;
   }) as typeof schedule.scheduleJob);
-  const enqueued: number[] = [];
-  t.mock.method(runtime, 'enqueueCatalogueRecent', (category: number) => {
-    enqueued.push(category);
-  });
+  const enqueued: ('movie' | 'tv')[] = [];
+  t.mock.method(
+    runtime,
+    'enqueueCatalogueRecent',
+    (category: 'movie' | 'tv') => {
+      enqueued.push(category);
+    }
+  );
   const settings = getSettings();
   const previous = settings.jobs['catalogue-recent-movies'].schedule;
   settings.jobs['catalogue-recent-movies'].schedule = '0 */30 * * * *';
@@ -35,7 +39,7 @@ it('Recent movie/TV native jobs are separate, staggered, configurable and regist
     assert.equal(catalogue[1].cronSchedule, '10 */15 * * * *');
     callbacks.get(catalogue[0].cronSchedule)!();
     callbacks.get(catalogue[1].cronSchedule)!();
-    assert.deepEqual(enqueued, [2000, 5000]);
+    assert.deepEqual(enqueued, ['movie', 'tv']);
     assert.ok(scheduledJobs.some((j) => j.id === 'radarr-scan'));
     assert.ok(scheduledJobs.some((j) => j.id === 'download-sync'));
   } finally {

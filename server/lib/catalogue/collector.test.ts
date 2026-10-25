@@ -26,7 +26,7 @@ import {
 } from './datasource';
 import { catalogueEntityNames as names } from './entities';
 import { CatalogueRepository } from './repository';
-import type { CatalogueSyncState } from './types';
+import type { CatalogueSyncState, ObservedTorrent } from './types';
 
 type Fetch = TrackerAdapter['fetchHistoricalPage'];
 const instant = 1800000000000;
@@ -218,6 +218,502 @@ async function verify(
     return { id, calls, adapter, tracker, collector, enable, tick };
   }
   try {
+    await t.test(
+      'Historical request retries recover at the same checkpoint without inventing a coverage gap',
+      async () => {
+        for (const scenario of [
+          {
+            error: new TrackerAdapterError('timeout', true),
+            delay: 30000,
+            gap: false,
+          },
+          { error: httpError(429, '120'), delay: 120000, gap: false },
+          { error: httpError(503), delay: 30000, gap: false },
+          {
+            error: new TrackerAdapterError('timeout', true),
+            delay: 30000,
+            gap: true,
+          },
+        ]) {
+          let id = '';
+          let failed = false;
+          const h = await setup(async (req) => {
+            if (req.offset === 80 && !failed) {
+              failed = true;
+              throw scenario.error;
+            }
+            if (req.offset >= 160) return page(id, req.offset, 0);
+            return {
+              ...page(id, req.offset),
+              anomalies:
+                req.offset === 0 && scenario.gap
+                  ? [
+                      {
+                        itemIndex: 100,
+                        code: 'invalid_identity',
+                        field: 'canonicalGuid',
+                      } as const,
+                    ]
+                  : [],
+            };
+          });
+          id = h.id;
+          await h.enable();
+          await h.tick();
+          await h.tick();
+          const backoff = await scope(id);
+          const cp = readCollectionCheckpoint(backoff.checkpoint)!;
+          assert.equal(cp.nextOffset, 80);
+          assert.equal(cp.pages, 1);
+          assert.equal(cp.dirty, scenario.gap);
+          assert.equal(backoff.status, 'backoff');
+          assert.equal(
+            backoff.retryAfterAt?.getTime(),
+            instant + 3000 + scenario.delay
+          );
+          assert.equal(
+            readCollectionState(backoff.collectionState).coverage,
+            'partial'
+          );
+          await db.destroy();
+          db = createCatalogueDataSource(connection);
+          await db.initialize();
+          const resumed = new CatalogueCollector(db, [h.tracker], clock);
+          await resumed.initialize();
+          assert.equal(await resumed.tick(), false);
+          assert.equal(h.calls.length, 2);
+          now = backoff.retryAfterAt!.getTime();
+          await resumed.tick();
+          assert.equal(h.calls.at(-1)?.offset, 80);
+          assert.equal(
+            readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
+            scenario.gap
+          );
+          assert.equal(
+            readCollectionState((await scope(id)).collectionState).failures,
+            0
+          );
+          for (let i = 0; i < 3; i++) {
+            now += 3000;
+            await resumed.tick();
+          }
+          assert.equal(
+            readCollectionCheckpoint((await scope(id)).checkpoint)?.done,
+            true
+          );
+          assert.equal(
+            readCollectionState((await scope(id)).collectionState).coverage,
+            scenario.gap ? 'partial' : 'observed'
+          );
+          assert.deepEqual(
+            h.calls.map((call) => call.offset),
+            [0, 80, 80, 160, 160, 240]
+          );
+        }
+      }
+    );
+    await t.test(
+      'all critical normalized rejections keep progress pending and use bounded scope retries',
+      async () => {
+        for (const code of [
+          'identity_conflict',
+          'invalid_identity',
+          'contract_incompatible',
+        ] as const) {
+          let id = '';
+          let corrected = false;
+          const h = await setup(async (req) =>
+            corrected
+              ? page(id, req.offset, req.offset === 0 ? 2 : 0)
+              : {
+                  ...page(id, req.offset, 0),
+                  receivedCount: 2,
+                  anomalies: [
+                    { itemIndex: 0, code, field: 'infohash' } as const,
+                    { itemIndex: 1, code, field: 'canonicalGuid' } as const,
+                  ],
+                }
+          );
+          id = h.id;
+          await h.enable();
+          for (let attempt = 1; attempt <= 5; attempt++) {
+            await h.collector.tick();
+            const stored = await scope(id);
+            const cp = readCollectionCheckpoint(stored.checkpoint)!;
+            assert.equal(cp.nextOffset, 0);
+            assert.equal(cp.pages, 0);
+            assert.equal(stored.pagesProcessed, 0);
+            assert.equal(cp.empty, null);
+            assert.equal(cp.done, false);
+            assert.equal(stored.lastSuccessfulAt, null);
+            assert.equal(
+              readCollectionState(stored.collectionState).failures,
+              attempt
+            );
+            assert.equal(
+              stored.status,
+              attempt === 5 ? 'suspended' : 'backoff'
+            );
+            assert.equal(
+              readCollectionState(stored.collectionState).coverage,
+              'partial'
+            );
+            now = stored.retryAfterAt!.getTime();
+          }
+          assert.equal(
+            (
+              await db
+                .getRepository(names.dispatch)
+                .findOneByOrFail({ trackerId: id })
+            ).suspended,
+            false
+          );
+          assert.equal(
+            await db.getRepository(names.torrent).countBy({ trackerId: id }),
+            0
+          );
+          corrected = true;
+          await h.collector.store.recover(id, 2000, 'historical');
+          await h.tick();
+          assert.equal(h.calls.at(-1)?.offset, 0);
+          assert.equal(
+            readCollectionCheckpoint((await scope(id)).checkpoint)?.nextOffset,
+            80
+          );
+          for (let i = 0; i < 3; i++) await h.tick();
+          assert.equal(
+            readCollectionState((await scope(id)).collectionState).coverage,
+            'observed'
+          );
+          assert.equal(
+            await db.getRepository(names.torrent).countBy({ trackerId: id }),
+            2
+          );
+        }
+      }
+    );
+    await t.test(
+      'repository rejection of every conflicting identity rolls back tentative progress and success state',
+      async () => {
+        let id = '';
+        let corrected = false;
+        const h = await setup(async (req) => {
+          if (req.offset > 0) return page(id, req.offset, 0);
+          const result = page(id, 0, 2);
+          if (!corrected)
+            result.records = result.records.map((record) => ({
+              ...record,
+              infohash: 'f'.repeat(40),
+            }));
+          return result;
+        });
+        id = h.id;
+        const repository = new CatalogueRepository(db);
+        await repository.persistPage(page(id, 0, 2).records, await scope(id));
+        await h.enable();
+        now += 1000;
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          await h.collector.tick();
+          const stored = await scope(id);
+          const cp = readCollectionCheckpoint(stored.checkpoint)!;
+          assert.equal(cp.nextOffset, 0);
+          assert.equal(cp.pages, 0);
+          assert.equal(stored.pagesProcessed, 0);
+          assert.equal(stored.lastSuccessfulAt, null);
+          assert.equal(stored.lastObservedAt, null);
+          assert.equal(
+            readCollectionState(stored.collectionState).failures,
+            attempt
+          );
+          assert.equal(stored.status, attempt === 5 ? 'suspended' : 'backoff');
+          assert.equal(
+            (
+              await repository.findTorrentByGuid(id, guid(0))
+            )?.lastSeenAt.getTime(),
+            instant
+          );
+          assert.equal(
+            (await repository.findTorrentByGuid(id, guid(0)))?.infohash,
+            record(0, id).infohash
+          );
+          now = stored.retryAfterAt!.getTime();
+        }
+        corrected = true;
+        await h.collector.store.recover(id, 2000, 'historical');
+        await h.tick();
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.nextOffset,
+          80
+        );
+        for (let i = 0; i < 3; i++) await h.tick();
+        assert.equal(
+          readCollectionState((await scope(id)).collectionState).coverage,
+          'observed'
+        );
+        assert.equal(
+          await db.getRepository(names.torrent).countBy({ trackerId: id }),
+          2
+        );
+      }
+    );
+    await t.test(
+      'a rejected nonempty page cancels pending terminal confirmation without advancing',
+      async () => {
+        let id = '';
+        let reads = 0;
+        const h = await setup(async (req) =>
+          ++reads === 3
+            ? {
+                ...page(id, req.offset, 0),
+                receivedCount: 2,
+                anomalies: [
+                  {
+                    itemIndex: 0,
+                    code: 'identity_conflict',
+                    field: 'infohash',
+                  } as const,
+                ],
+              }
+            : page(id, req.offset, 0)
+        );
+        id = h.id;
+        await h.enable();
+        await h.tick();
+        await h.tick();
+        await h.tick();
+        const rejected = await scope(id);
+        const cp = readCollectionCheckpoint(rejected.checkpoint)!;
+        assert.equal(cp.nextOffset, 80);
+        assert.equal(cp.pages, 2);
+        assert.equal(cp.empty, null);
+        assert.equal(cp.done, false);
+        assert.equal(rejected.status, 'backoff');
+        now = rejected.retryAfterAt!.getTime();
+        await h.tick();
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.done,
+          false
+        );
+        await h.tick();
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.done,
+          false
+        );
+        await h.tick();
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.done,
+          true
+        );
+        assert.deepEqual(
+          h.calls.map((call) => call.offset),
+          [0, 0, 80, 80, 80, 160]
+        );
+        assert.equal(
+          readCollectionState((await scope(id)).collectionState).coverage,
+          'observed'
+        );
+      }
+    );
+    await t.test(
+      'native provenance accepts protocol-independent tracker fields while rejecting unsafe or malformed claims atomically',
+      async () => {
+        const h = await setup();
+        const repository = new CatalogueRepository(db);
+        const observation: ObservedTorrent = {
+          ...record(0, h.id),
+          provenance: {
+            tmdbId: { source: 'tracker', field: 'api.attributes.tmdbId' },
+            tvdbId: { source: 'tracker', field: '/metadata/tvdb_id' },
+            season: { source: 'tracker', field: 'json:season_number' },
+            episode: { source: 'tracker', field: '$.episode' },
+          },
+        };
+        const checkpoint = await scope(h.id);
+        const [saved] = await repository.persistPage([observation], checkpoint);
+        assert.deepEqual(
+          JSON.parse(saved.nativeProvenance!),
+          observation.provenance
+        );
+        assert.equal(saved.nativeTmdbId, 42);
+        assert.equal(saved.nativeTvdbId, 84);
+        assert.equal(saved.nativeEpisode, 0);
+        const invalidOrigins: unknown[] = [
+          undefined,
+          null,
+          {},
+          [],
+          { source: 'SECRET', field: 'api.tmdbId' },
+          { source: 'application', field: 'api.tmdbId' },
+          { source: 'tracker', field: '' },
+          { source: 'tracker', field: 42 },
+          { source: 'tracker', field: 'x'.repeat(129) },
+          {
+            source: 'tracker',
+            field: 'https://tracker.invalid/tmdb?apikey=SECRET',
+          },
+          { source: 'tracker', field: 'api:token/SECRET' },
+          { source: 'tracker', field: 'api:api_key/SECRET' },
+          { source: 'tracker', field: 'api:<tmdb>SECRET</tmdb>' },
+          { source: 'tracker', field: 'api:tmdb%0ASECRET' },
+          { source: 'tracker', field: 'api:tmdb\nSECRET' },
+          { source: 'tracker', field: 'api:tmdb', rawValue: 'SECRET' },
+        ];
+        for (const origin of invalidOrigins) {
+          const invalid = {
+            ...record(1, h.id),
+            trackerMetadata: {
+              tmdbId: 42,
+              tvdbId: null,
+              season: null,
+              episode: null,
+            },
+            provenance: { tmdbId: origin },
+          } as ObservedTorrent;
+          await assert.rejects(
+            repository.persistPage([record(2, h.id), invalid], {
+              ...checkpoint,
+              pagesProcessed: 999,
+            }),
+            /Invalid catalogue native metadata provenance/
+          );
+          assert.equal(
+            await db.getRepository(names.torrent).countBy({ trackerId: h.id }),
+            1
+          );
+          assert.equal(
+            (await scope(h.id)).pagesProcessed,
+            checkpoint.pagesProcessed
+          );
+        }
+        const [unknown] = await repository.persistPage(
+          [
+            {
+              ...record(1, h.id),
+              trackerMetadata: {
+                tmdbId: null,
+                tvdbId: null,
+                season: null,
+                episode: null,
+              },
+              provenance: undefined,
+            },
+          ],
+          checkpoint
+        );
+        assert.equal(unknown.nativeTmdbId, null);
+        assert.deepEqual(JSON.parse(unknown.nativeProvenance!), {});
+        await db.destroy();
+        db = createCatalogueDataSource(connection);
+        await db.initialize();
+        assert.deepEqual(
+          JSON.parse(
+            (await new CatalogueRepository(db).findTorrent(saved.id))!
+              .nativeProvenance!
+          ),
+          observation.provenance
+        );
+      }
+    );
+    await t.test(
+      'logical Recent schedules resolve each tracker category and isolate unsupported, suspended and unavailable work',
+      async () => {
+        const a = await setup(undefined, { recentPageLimit: 2 });
+        const b = await setup(
+          undefined,
+          { recentPageLimit: 2 },
+          {
+            categories: [
+              { id: 7100, requestCategory: 'movie', recentStaggerMs: 0 },
+              { id: 9300, requestCategory: 'tv', recentStaggerMs: 10000 },
+            ],
+          }
+        );
+        const collector = new CatalogueCollector(
+          db,
+          [a.tracker, b.tracker],
+          clock
+        );
+        await collector.enqueueRecent('movie');
+        assert.ok((await scope(a.id, 'recent', 2000)).nextRunAt);
+        assert.ok((await scope(b.id, 'recent', 7100)).nextRunAt);
+        assert.equal((await scope(a.id, 'recent', 5000)).nextRunAt, null);
+        assert.equal((await scope(b.id, 'recent', 9300)).nextRunAt, null);
+        assert.equal(
+          await db
+            .getRepository(names.sync)
+            .countBy({ trackerId: b.id, categoryId: 2000 }),
+          0
+        );
+        assert.equal(
+          await db
+            .getRepository(names.sync)
+            .countBy({ trackerId: b.id, categoryId: 5000 }),
+          0
+        );
+        await collector.enqueueRecent('tv');
+        for (let i = 0; i < 4; i++) {
+          await collector.tick();
+          now += 3000;
+        }
+        assert.deepEqual(
+          a.calls.map((call) => call.category),
+          ['movie', 'tv', 'movie', 'tv']
+        );
+        assert.deepEqual(
+          b.calls.map((call) => call.category),
+          ['movie', 'tv', 'movie', 'tv']
+        );
+        assert.equal((await scope(b.id, 'recent', 7100)).nextRunAt, null);
+        assert.equal((await scope(b.id, 'recent', 9300)).nextRunAt, null);
+        now += 900000;
+        const enqueue = collector.store.enqueueRecent.bind(collector.store);
+        const failure = t.mock.method(
+          collector.store,
+          'enqueueRecent',
+          async (id: string, categoryId: number) => {
+            if (id === a.id)
+              throw new Error('Synthetic unavailable tracker SECRET');
+            return enqueue(id, categoryId);
+          }
+        );
+        try {
+          await assert.rejects(
+            collector.enqueueRecent('movie'),
+            /Synthetic unavailable tracker/
+          );
+        } finally {
+          failure.mock.restore();
+        }
+        assert.ok((await scope(b.id, 'recent', 7100)).nextRunAt);
+        assert.equal((await scope(a.id, 'recent', 2000)).nextRunAt, null);
+        await db
+          .getRepository(names.dispatch)
+          .update({ trackerId: a.id }, { suspended: true });
+        await collector.enqueueRecent('movie');
+        await collector.tick();
+        assert.equal(a.calls.length, 4);
+        assert.equal(b.calls.length, 5);
+        now += 3000;
+        await collector.tick();
+        assert.equal(b.calls.length, 6);
+        b.tracker.categories = b.tracker.categories.filter(
+          (category) => category.requestCategory === 'tv'
+        );
+        now += 900000;
+        await collector.enqueueRecent('movie');
+        assert.equal(
+          (await scope(b.id, 'recent', 7100)).nextRunAt,
+          null,
+          'An unsupported movie mapping must not be substituted'
+        );
+        await collector.enqueueRecent('tv');
+        assert.ok((await scope(b.id, 'recent', 9300)).nextRunAt);
+        assert.equal(
+          await db.getRepository(names.sync).countBy({ trackerId: b.id }),
+          4
+        );
+      }
+    );
     await t.test(
       'ordered moving pages tolerate 21/19 overlaps and multiple ordinary front shifts',
       async () => {
@@ -923,7 +1419,7 @@ async function verify(
                 provenance: {
                   season: {
                     source: 'tracker',
-                    field: 'SECRET-unvalidated-attribute',
+                    field: 'native:season?apikey=SECRET',
                   },
                 },
               },
@@ -1209,7 +1705,7 @@ async function verify(
         );
         assert.equal(readCollectionCheckpoint(stored.checkpoint)?.done, true);
         now += 900000;
-        await h.collector.enqueueRecent(2000);
+        await h.collector.enqueueRecent('movie');
         await h.tick();
         await h.tick();
         assert.equal(
@@ -1283,7 +1779,7 @@ async function verify(
           true
         );
         now += 900000;
-        await resumed.enqueueRecent(2000);
+        await resumed.enqueueRecent('movie');
         for (let i = 0; i < 3; i++) {
           await resumed.tick();
           now += 3000;
