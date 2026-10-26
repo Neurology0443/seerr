@@ -1,7 +1,7 @@
 import { getSettings } from '@server/lib/settings';
 import { TrackerAdapterError } from './errors';
 import { TorznabAPI } from './torznab';
-import type { PageRequest, TrackerAdapter } from './types';
+import type { PageRequest, RejectionReason, TrackerAdapter } from './types';
 
 export interface Tr4kerConfig {
   trackerId: string;
@@ -28,6 +28,23 @@ export const TR4KER_CONTRACT = {
     'season',
     'episode',
   ],
+  guidRejectionReason(value: string): RejectionReason {
+    if (value.includes('%')) return 'guid_encoding';
+    if (/[\s\\]/.test(value)) return 'unsafe_guid';
+    try {
+      const url = new URL(value);
+      if (url.username || url.password) return 'guid_credentials';
+      if (value.includes('?')) return 'guid_query';
+      if (value.includes('#')) return 'guid_fragment';
+      if (url.protocol !== 'https:') return 'guid_scheme';
+      if (url.hostname !== 'tr4ker.net' || url.port) return 'guid_host';
+      if (!/^\/torrent\/[a-z0-9]+(?:-[a-z0-9]+)+$/i.test(url.pathname))
+        return 'guid_path';
+    } catch {
+      return 'incompatible_guid';
+    }
+    return 'incompatible_guid';
+  },
   canonicalizeGuid(value: string): string | null {
     try {
       const url = new URL(value);

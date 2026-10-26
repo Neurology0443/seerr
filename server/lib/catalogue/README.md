@@ -186,8 +186,8 @@ Recent cycles start at zero, stop only at a corroborated known boundary across t
 successive overlapping pages, and have a configurable page bound (2–1000). Their
 first run is partial. Partial Recent ranges must be revisited before a later cycle
 can report an observed window. Historical defects on advanced pages keep the pass
-partial through its terminal boundary; a subsequent clean full pass can repair
-that evidence. A failed request or wholly unusable page leaves its offset pending.
+partial through its terminal boundary; the diagnostic repair contract below
+determines which subsequent evidence can repair them. A failed request or wholly unusable page leaves its offset pending.
 Successful reprocessing at that offset can finish the current pass as observed,
 provided no other coverage defect remains, including after restart during backoff.
 Progress, coverage and bounded safe diagnostics are separate durable state. Neither
@@ -245,3 +245,61 @@ replace newer claims. No media associations or inferred season coverage are made
 The default P1 persistence path still rejects identity conflicts transactionally;
 collector writes quarantine conflicting records, keep valid records and retain a
 safe scoped diagnostic and partial coverage in that transaction.
+
+## Release diagnostics and Historical repair (CAT-012/CAT-013)
+
+The additive `ReleaseDiagnostics1792972800000` migration creates the isolated
+`release_diagnostics` table on SQLite and PostgreSQL. Page observations, diagnostics,
+repair transitions and checkpoints commit in the existing fenced page transaction.
+The bounded aggregate diagnostics remain available in collection state.
+
+Release entries retain tracker/category/mode, field/code/precise reason, first/last
+rejection, occurrences, safe identity, optional page context and repair status.
+`releaseKey` identifies a safely identifiable release independently of its rejection
+reason; distinct-release counts must count distinct non-null release keys, not
+diagnostic rows or occurrences. Unidentifiable sightings retain separate rows with
+null release keys. Neither offsets nor item positions establish identity.
+
+The adapter independently checks diagnostic GUIDs, hashes and titles. A complete
+safe rejected GUID can be retained without becoming an accepted torrent identity.
+Unsafe identifiers are represented by HMAC-SHA256; production TR4KER uses its
+configured authentication key as the HMAC key without persisting it. Fingerprints
+survive normal restarts; credential rotation conservatively leaves earlier opaque
+diagnostics unresolved. Titles are checked before truncation to 256 characters;
+known secrets, request/download URLs, encoded unsafe values and XML are withheld.
+
+Storage is bounded to 5,000 release diagnostics per tracker/category/mode, plus a
+fixed set of scope repair causes. Resolved history expires 30 days after resolution.
+Capacity eviction prefers resolved history. Evicting unresolved critical evidence
+creates a quarantined scope marker that permanently retains its coverage uncertainty;
+it cannot silently turn missing diagnostic history into proof of complete coverage.
+Its durable scope budget also bounds repair attempts when evicted diagnostics
+reappear; those releases cannot repeatedly acquire fresh automatic repair budgets.
+
+For Historical, `dirty` means at least one critical repair remains `unresolved`.
+`coverage` independently stays `partial` while the pass is unfinished, a critical
+release/scope is unresolved or quarantined, or the current scan is unreliable.
+Reaching terminal pages is a technical scan completion, not a resolution event.
+A release resolves only on a later accepted observation of the same safe GUID,
+with the affected field validated and no corresponding rejection. Matching a
+different GUID by hash, or failing to find the old release, never resolves it.
+A complete clean rescan can verify an explicitly recorded continuity region;
+unknown legacy gaps, unidentified releases and evicted evidence cannot be resolved
+by their absence from a scan. Independent issues retain independent states.
+
+Pending repairs schedule controlled rescans from zero through the existing
+Historical scope, even with periodic maintenance disabled. Each issue has at most
+three rescan attempts, with 30–900 second bounded exponential backoff; a rescan has
+a 10,000-page budget. Attempts, cycle, eligibility, next execution and outcome are
+durable. Requests use existing leases, fences, Recent priority, shared tracker
+budgets, 6-second repair spacing and Retry-After. Existing unusable-page suspension
+and request-failure recovery still apply. Unidentified sightings remain separate
+but share a bounded scope repair budget so new sightings cannot cause endless loops.
+
+After verified repair, only the addressed issue becomes `resolved`. After bounded
+unsuccessful attempts it becomes `quarantined`; this stops automatic repair while
+retaining uncertainty. Thus `dirty=false, coverage=partial` is an intentional durable
+state. `observed` requires a verified completed scan without remaining critical
+uncertainty. Old dirty or completed partial checkpoints gain an explicit legacy
+repair marker on upgrade; clean unfinished checkpoints retain their progress.
+No diagnostic API, administration UI or new collection engine is introduced.

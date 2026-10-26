@@ -237,3 +237,79 @@ formatting, typecheck, i18n, full repository suite, production build or live tra
 calls were run. Observed boundaries retain their existing exhaustiveness limits;
 no implementation blocker remains. No staging, commit, push, branch changes or
 sibling-worktree modifications were performed.
+
+## Corrective pass — release diagnostics and Historical repair (26 October 2026)
+
+CAT-012 and CAT-013 are corrected within P3. The strict accepted TR4KER GUID
+contract, native Seerr behavior, page fencing, shared quotas and P2 metadata
+semantics are preserved. No diagnostic API, P4 UI or P5/P6 behavior was added.
+
+Files changed:
+
+- `server/api/trackers/diagnostics.ts`: independent safe diagnostic identity/title projection and keyed fingerprints.
+- `server/api/trackers/{types,torznab,tr4ker}.ts`: additive release rejection details and precise stable GUID rejection reasons; ingestion rules are unchanged.
+- `server/api/trackers/{torznab,tr4ker}.test.ts`: safe rejected GUIDs, opaque fingerprints, precise causes and credential/encoded-value regressions.
+- `server/lib/catalogue/{types,entities}.ts`: isolated per-release diagnostic and repair metadata.
+- `server/lib/catalogue/migration/releaseDiagnostics.ts`, `migration/{sqlite,postgres}/1792972800000-ReleaseDiagnostics.ts`: additive diagnostic table, uniqueness, foreign key and repair/retention/identity indexes.
+- `server/lib/catalogue/collectionRepairs.ts`: diagnostic deduplication, retention, evidence-based resolution, bounded repair attempts and quarantine.
+- `server/lib/catalogue/{collector,collectionState,collectionStore,repository}.ts`: atomic integration into existing checkpoint transactions, legacy-state recovery and maintenance-independent repair scheduling.
+- `server/lib/catalogue/{collector,catalogue}.test.ts`: dual-engine diagnostic/repair regressions and updated migration-history/down-up checks.
+- `server/lib/catalogue/README.md`, this record: explicit dirty/coverage and repair-completion contracts.
+- `codex/catalogue/backlog.md`: CAT-012/CAT-013 marked Resolved with evidence; this project-reference path remains Git-ignored and unstaged.
+
+Historical `dirty` now represents outstanding critical repair work. Release
+resolution requires a later accepted observation of the same safe GUID with the
+affected field validated; another GUID sharing an infohash does not resolve it.
+A continuity region requires a complete clean rescan, including confirmed terminal
+emptiness. A page-budget stop cannot verify that region. Unknown legacy gaps,
+unidentified releases and evicted evidence retain uncertainty without inferred
+absence. Three unsuccessful controlled rescans quarantine an issue; quarantine
+can clear dirty while coverage stays partial. Repairs run with maintenance disabled,
+share the existing limiter/leases, and retain Recent priority and Retry-After.
+
+Repair attempts are capped at three, each with a 10,000-page budget and bounded
+30–900 second exponential backoff. Unidentified sightings retain distinct rows
+and null release keys, but share a bounded scope repair budget. Release storage is
+capped at 5,000 rows per tracker/category/mode; resolved history expires 30 days
+after resolution. Capacity eviction of uncertain evidence leaves an explicit
+quarantined coverage marker. Stable non-null release keys distinguish releases
+from occurrences and multiple rejection causes.
+The retention marker retains a scope-level attempt budget, tested with discarded
+and recreated diagnostic rows, so capacity churn cannot restart repairs forever.
+
+All commands ran in the existing devenv with offline fixtures, temporary SQLite
+files and an isolated PostgreSQL 17.9 cluster on loopback port 56486. The cluster
+used `/tmp/seerr-p3-repairs-pg`, the disposable test role and empty control database;
+test suites created/dropped only their own randomly named databases.
+
+```sh
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56486 SEERR_MIGRATION_PG_PASSWORD=repairs-disposable pnpm test server/lib/catalogue/collector.test.ts server/lib/catalogue/collectionRuntime.test.ts server/job/schedule.test.ts
+devenv shell -- pnpm test server/api/trackers/torznab.test.ts server/api/trackers/tr4ker.test.ts
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56486 SEERR_MIGRATION_PG_PASSWORD=repairs-disposable pnpm test server/lib/catalogue/catalogue.test.ts server/lib/catalogue/lifecycle.test.ts
+```
+
+Results: **92 P3 + 150 P2 + 34 storage/lifecycle tests passed; 0 failed, cancelled
+or skipped.** PostgreSQL suites ran sequentially against the dedicated instance.
+Coverage includes restart during backoff, independent issues, moved releases,
+quarantine, unknown-identity budgets, retention, atomic rollback, stale-owner
+fencing, concurrent collectors, cross-process quotas and native metadata changes.
+
+```sh
+devenv shell -- pnpm exec eslint server/api/trackers/diagnostics.ts server/api/trackers/torznab.ts server/api/trackers/tr4ker.ts server/api/trackers/torznab.test.ts server/api/trackers/tr4ker.test.ts server/api/trackers/types.ts server/lib/catalogue/collectionRepairs.ts server/lib/catalogue/collectionState.ts server/lib/catalogue/collectionStore.ts server/lib/catalogue/collector.ts server/lib/catalogue/collector.test.ts server/lib/catalogue/entities.ts server/lib/catalogue/types.ts server/lib/catalogue/repository.ts server/lib/catalogue/catalogue.test.ts server/lib/catalogue/migration/releaseDiagnostics.ts server/lib/catalogue/migration/sqlite/1792972800000-ReleaseDiagnostics.ts server/lib/catalogue/migration/postgres/1792972800000-ReleaseDiagnostics.ts
+git diff --check
+```
+
+Modified files were formatted and checked with the repository's Prettier; targeted
+lint and whitespace checks passed. Earlier runs exposed new-fixture placement,
+unknown-sighting retry timing and migration-count expectations; these were corrected
+before the passing runs. The terminal-only rejection regression now retains partial
+coverage as required; its separate corrected-release fixture actually re-observes
+the rejected release. No accepted-identity, transaction or quota assertion was weakened.
+
+The disposable PostgreSQL cluster was stopped and removed after testing. No live
+tracker calls, global lint/typecheck/format/i18n, full repository suite or build
+were run. No project environment configuration, real data, staging, branches,
+commits, pushes or sibling-worktree files were changed. No implementation blocker
+remains. Quarantined, unknown or evicted evidence intentionally retains partial
+coverage; HMAC identity across authentication-key rotation remains conservative
+as documented in the README.

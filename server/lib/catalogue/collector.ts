@@ -1,7 +1,9 @@
+import { diagnosticIdentity } from '@server/api/trackers/diagnostics';
 import { TrackerAdapterError } from '@server/api/trackers/errors';
 import type {
   NormalizedTrackerPage,
   PageRequest,
+  ReleaseRejection,
   TrackerAdapter,
 } from '@server/api/trackers/types';
 import { createHash, randomUUID } from 'node:crypto';
@@ -13,6 +15,11 @@ import {
   type Tr4kerCollectionSettings,
   type TrackerCollectionDescription,
 } from './collectionConfig';
+import {
+  REPAIR_PAGE_LIMIT,
+  persistReleaseDiagnostics,
+  prepareRepairs,
+} from './collectionRepairs';
 import {
   diagnose,
   pageContinuity,
@@ -192,6 +199,7 @@ export class CatalogueCollector {
     const step = limit - overlap;
     const state = readCollectionState(scope.collectionState);
     let cp = readCollectionCheckpoint(scope.checkpoint);
+    const repairRun = scope.mode === 'historical' && scope.phase === 'repair';
     const paginationChanged =
       cp != null &&
       (cp.pagination.limit !== limit || cp.pagination.overlap !== overlap);
@@ -219,7 +227,9 @@ export class CatalogueCollector {
         repairThrough,
         maintenance:
           scope.mode === 'historical' &&
-          ['complete', 'maintenance'].includes(scope.phase),
+          ['complete', 'maintenance', 'repair'].includes(scope.phase),
+        repairRun,
+        scanUncertain: false,
       };
       if (invalid) diagnose(state, 'invalid_checkpoint', 'page', now);
       if (paginationChanged) diagnose(state, 'pagination_changed', 'page', now);
@@ -228,19 +238,35 @@ export class CatalogueCollector {
       scope.phase =
         scope.mode === 'recent'
           ? 'recent'
-          : cp.maintenance
-            ? 'maintenance'
-            : 'initial';
+          : cp.repairRun
+            ? 'repair'
+            : cp.maintenance
+              ? 'maintenance'
+              : 'initial';
     }
     scope.status = 'running';
     // Persist a new cycle before the request, so interruption cannot erase it.
-    const beginning = checkpointFor(scope, cp, state, now);
+    let beginning = checkpointFor(scope, cp, state, now);
     await this.repository.persistPage([], beginning, {
       owner,
       clock: this.store.clock,
       onIdentityConflicts: () => beginning,
+      beforeCheckpoint: async (manager, _accepted, checkpoint) => {
+        beginning = await prepareRepairs(
+          manager,
+          checkpoint,
+          now,
+          paginationChanged
+            ? 'pagination_changed'
+            : scope.checkpoint && !readCollectionCheckpoint(scope.checkpoint)
+              ? 'invalid_checkpoint'
+              : undefined
+        );
+        return beginning;
+      },
     });
     Object.assign(scope, beginning);
+    Object.assign(state, readCollectionState(beginning.collectionState));
     if (this.stopped) return false;
     const category = tracker.categories.find(
       (category) => category.id === scope.categoryId
@@ -287,6 +313,21 @@ export class CatalogueCollector {
       ...record,
       observedAt: new Date(now),
     }));
+    const rejections: ReleaseRejection[] = page.rejections
+      ? [...page.rejections]
+      : page.anomalies.map((anomaly) => ({
+          ...anomaly,
+          reason:
+            anomaly.code === 'identity_conflict'
+              ? 'identity_conflict'
+              : 'invalid_value',
+          release: {
+            guid: null,
+            infohash: null,
+            title: null,
+            fingerprint: null,
+          },
+        }));
     const criticalAnomaly = page.anomalies.some(
       (a) =>
         ['canonicalGuid', 'infohash', 'releaseName', 'categories'].includes(
@@ -329,6 +370,7 @@ export class CatalogueCollector {
       (page.contractStatus === 'partial' &&
         records.length < page.receivedCount / 2);
     if (critical || unstable) {
+      if (unstable) cp.scanUncertain = true;
       // An unadvanced Historical page is still pending, not a skipped range.
       if (!systematic || scope.mode === 'recent') {
         cp.dirty = true;
@@ -415,6 +457,7 @@ export class CatalogueCollector {
             cp.repairThrough = Math.max(cp.repairThrough, request.offset);
         }
       } else if (cp.done) state.coverage = cp.dirty ? 'partial' : 'observed';
+      if (cp.repairRun && cp.pages >= REPAIR_PAGE_LIMIT) cp.done = true;
       cp.previous = hashes.slice(0, limit);
       scope.pagesProcessed++;
       scope.lastSuccessfulAt = new Date(now);
@@ -462,6 +505,45 @@ export class CatalogueCollector {
           await manager
             .getRepository(names.dispatch)
             .update({ trackerId: tracker.trackerId }, { failures: 0 });
+      },
+      beforeCheckpoint: async (manager, accepted, checkpoint) => {
+        for (const record of records)
+          if (!accepted.includes(record))
+            rejections.push({
+              itemIndex: records.indexOf(record),
+              field: 'infohash',
+              code: 'identity_conflict',
+              reason: 'identity_conflict',
+              release: diagnosticIdentity(
+                record.canonicalGuid,
+                record.infohash,
+                record.releaseName
+              ),
+            });
+        return persistReleaseDiagnostics(
+          manager,
+          checkpoint,
+          accepted,
+          rejections,
+          now,
+          {
+            region:
+              cp!.repairRun &&
+              cp!.pages >= REPAIR_PAGE_LIMIT &&
+              cp!.terminalOffset === null
+                ? 'scan_budget_exhausted'
+                : unstable
+                  ? repeated
+                    ? 'repeated_page'
+                    : 'abnormal_overlap'
+                  : critical && !rejections.length
+                    ? 'contract_page'
+                    : undefined,
+            systematic,
+            terminal: cp!.done,
+            offset: request.offset,
+          }
+        );
       },
     });
     return true;

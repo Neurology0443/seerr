@@ -124,3 +124,32 @@ export type ObservedTorrent = Pick<
     >;
   };
 export type SyncCheckpoint = Omit<CatalogueSyncState, 'id'>;
+
+export interface CatalogueReleaseDiagnostic {
+  id: number;
+  trackerId: string;
+  categoryId: number;
+  mode: 'recent' | 'historical';
+  diagnosticKey: string;
+  releaseKey: string | null;
+  kind: 'release' | 'scope';
+  guid: string | null;
+  infohash: string | null;
+  title: string | null;
+  fingerprint: string | null;
+  field: string;
+  code: string;
+  reason: string;
+  critical: boolean;
+  firstSeenAt: Date;
+  lastSeenAt: Date;
+  occurrences: number;
+  status: 'unresolved' | 'resolved' | 'quarantined';
+  attempts: number;
+  nextAttemptAt: Date | null;
+  lastAttemptCycle: string | null;
+  lastOutcome: string | null;
+  resolvedAt: Date | null;
+  offset: number | null;
+  itemPosition: number | null;
+}

@@ -1,5 +1,10 @@
 import { TrackerAdapterError, httpError } from '@server/api/trackers/errors';
-import type { TrackerAdapter } from '@server/api/trackers/types';
+import { normalizeTorznabPage } from '@server/api/trackers/torznab';
+import { TR4KER_CONTRACT } from '@server/api/trackers/tr4ker';
+import type {
+  ReleaseRejection,
+  TrackerAdapter,
+} from '@server/api/trackers/types';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -15,6 +20,13 @@ import {
   type TrackerCollectionDescription,
 } from './collectionConfig';
 import {
+  DIAGNOSTIC_LIMIT,
+  DIAGNOSTIC_RETENTION_MS,
+  REPAIR_PAGE_LIMIT,
+  persistReleaseDiagnostics,
+  retainDiagnostics,
+} from './collectionRepairs';
+import {
   readCollectionCheckpoint,
   readCollectionState,
 } from './collectionState';
@@ -26,7 +38,11 @@ import {
 } from './datasource';
 import { catalogueEntityNames as names } from './entities';
 import { CatalogueRepository } from './repository';
-import type { CatalogueSyncState, ObservedTorrent } from './types';
+import type {
+  CatalogueReleaseDiagnostic,
+  CatalogueSyncState,
+  ObservedTorrent,
+} from './types';
 
 type Fetch = TrackerAdapter['fetchHistoricalPage'];
 const instant = 1800000000000;
@@ -65,6 +81,18 @@ function page(trackerId: string, offset: number, count = 100) {
     records: Array.from({ length: count }, (_, i) =>
       record(offset + i, trackerId)
     ),
+  };
+}
+function rejection(
+  id: number,
+  field: ReleaseRejection['field'] = 'releaseName'
+): ReleaseRejection {
+  return {
+    itemIndex: id,
+    field,
+    code: 'contract_incompatible',
+    reason: field === 'releaseName' ? 'missing_title' : 'invalid_value',
+    release: { guid: guid(id), infohash: null, title: null, fingerprint: null },
   };
 }
 interface WorkerResult {
@@ -219,6 +247,648 @@ async function verify(
   }
   try {
     await t.test(
+      'different causes share a release key without conflating diagnostics and page rollback also rolls back diagnostics',
+      async () => {
+        const h = await setup();
+        await h.enable();
+        await h.tick();
+        now += 3000;
+        const claimed = await h.collector.store.claimNext(
+          h.tracker,
+          'diagnostic-owner',
+          h.tracker.settings
+        );
+        assert.ok(claimed);
+        const repository = new CatalogueRepository(db);
+        const before = await scope(h.id);
+        const cp = readCollectionCheckpoint(before.checkpoint)!;
+        cp.nextOffset += 80;
+        cp.pages++;
+        const input = { ...before, checkpoint: JSON.stringify(cp) };
+        const causes = [rejection(999), rejection(999, 'categories')];
+        const records = [record(998, h.id)];
+        await assert.rejects(
+          repository.persistPage(records, input, {
+            owner: 'diagnostic-owner',
+            clock,
+            onIdentityConflicts: () => input,
+            beforeCheckpoint: async (manager, accepted, checkpoint) => {
+              await persistReleaseDiagnostics(
+                manager,
+                checkpoint,
+                accepted,
+                causes,
+                now
+              );
+              throw new Error('Synthetic commit failure');
+            },
+          }),
+          /Synthetic commit failure/
+        );
+        assert.equal(
+          await db.getRepository(names.diagnostic).countBy({ trackerId: h.id }),
+          0
+        );
+        assert.equal(await repository.findTorrentByGuid(h.id, guid(998)), null);
+        assert.equal((await scope(h.id)).checkpoint, before.checkpoint);
+        await repository.persistPage(records, input, {
+          owner: 'diagnostic-owner',
+          clock,
+          onIdentityConflicts: () => input,
+          beforeCheckpoint: (manager, accepted, checkpoint) =>
+            persistReleaseDiagnostics(
+              manager,
+              checkpoint,
+              accepted,
+              causes,
+              now
+            ),
+        });
+        const diagnostics = await db
+          .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+          .findBy({ trackerId: h.id });
+        assert.equal(diagnostics.length, 2);
+        assert.equal(new Set(diagnostics.map((row) => row.releaseKey)).size, 1);
+        assert.notEqual(
+          diagnostics[0].diagnosticKey,
+          diagnostics[1].diagnosticKey
+        );
+        await h.collector.store.release(claimed.scope, 'diagnostic-owner');
+      }
+    );
+    await t.test(
+      'unidentified rejections retain separate observations but share a bounded scope repair budget',
+      async () => {
+        let id = '';
+        const h = await setup(async (req) =>
+          req.offset
+            ? page(id, req.offset, 0)
+            : {
+                ...page(id, 0, 2),
+                receivedCount: 3,
+                anomalies: [
+                  {
+                    itemIndex: 2,
+                    field: 'canonicalGuid',
+                    code: 'contract_incompatible',
+                  } as const,
+                ],
+              }
+        );
+        id = h.id;
+        await h.enable();
+        for (let pass = 0; pass < 4; pass++) {
+          if (pass) now = (await scope(id)).nextRunAt!.getTime();
+          for (let i = 0; i < 4; i++) await h.tick(pass ? 6000 : 3000);
+        }
+        const rows = await db
+          .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+          .findBy({ trackerId: id });
+        const releases = rows.filter((row) => row.kind === 'release');
+        assert.equal(releases.length, 4);
+        assert.ok(
+          releases.every(
+            (row) =>
+              row.releaseKey === null &&
+              row.guid === null &&
+              row.status === 'quarantined'
+          )
+        );
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
+          false
+        );
+        assert.equal(
+          readCollectionState((await scope(id)).collectionState).coverage,
+          'partial'
+        );
+        assert.equal((await scope(id)).nextRunAt, null);
+      }
+    );
+    await t.test(
+      'repair requests preserve Recent priority, concurrent ownership, Retry-After and maintenance spacing',
+      async () => {
+        let id = '';
+        let repair = false;
+        let fail = true;
+        const h = await setup(
+          async (req) => {
+            if (h.calls.at(-1)?.mode === 'recent')
+              return {
+                ...page(id, req.offset),
+                records: page(id, req.offset + 1000).records,
+              };
+            if (repair && fail) {
+              fail = false;
+              throw httpError(429, '120');
+            }
+            if (req.offset) return page(id, req.offset, 0);
+            return repair
+              ? page(id, 0, 3)
+              : {
+                  ...page(id, 0, 2),
+                  receivedCount: 3,
+                  anomalies: [rejection(2)],
+                  rejections: [rejection(2)],
+                };
+          },
+          { recentPageLimit: 2 }
+        );
+        id = h.id;
+        await h.enable();
+        for (let i = 0; i < 4; i++) await h.tick();
+        now = (await scope(id)).nextRunAt!.getTime();
+        repair = true;
+        const other = new CatalogueCollector(db, [h.tracker], clock);
+        await other.initialize();
+        await h.collector.enqueueRecent('movie');
+        const count = h.calls.length;
+        await Promise.all([h.collector.tick(), other.tick()]);
+        assert.equal(h.calls.length, count + 1);
+        assert.equal(h.calls.at(-1)?.mode, 'recent');
+        now += 3000;
+        await other.tick();
+        assert.equal(h.calls.at(-1)?.mode, 'recent');
+        now += 3000;
+        await h.collector.tick();
+        const failed = await scope(id);
+        assert.equal(failed.status, 'backoff');
+        assert.equal(failed.retryAfterAt!.getTime(), now + 120000);
+        const attempts = await db
+          .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+          .findOneByOrFail({ trackerId: id, kind: 'release' });
+        assert.equal(attempts.attempts, 1);
+        now += 119999;
+        assert.equal(await other.tick(), false);
+        now++;
+        await other.tick();
+        assert.equal(h.calls.at(-1)?.offset, 0);
+        const retried = h.calls.length;
+        now += 3000;
+        assert.equal(await h.collector.tick(), false);
+        assert.equal(h.calls.length, retried);
+        now += 3000;
+        await other.tick();
+        assert.equal(h.calls.length, retried + 1);
+      }
+    );
+    await t.test(
+      'a repair scan stops at its page budget and never turns an unverified region into observed coverage',
+      async () => {
+        const h = await setup();
+        await h.enable();
+        await h.tick();
+        const stored = await scope(h.id);
+        const cp = readCollectionCheckpoint(stored.checkpoint)!;
+        cp.pages = REPAIR_PAGE_LIMIT - 1;
+        cp.repairRun = true;
+        cp.maintenance = true;
+        cp.startedAt = now;
+        await h.collector.store.write(async (manager) => {
+          await persistReleaseDiagnostics(manager, stored, [], [], now, {
+            region: 'abnormal_overlap',
+          });
+          await manager
+            .getRepository(names.diagnostic)
+            .update(
+              { trackerId: h.id, reason: 'abnormal_overlap' },
+              { attempts: 3, lastAttemptCycle: stored.cycleId }
+            );
+        });
+        await db.getRepository(names.sync).update(stored.id, {
+          checkpoint: JSON.stringify(cp),
+          phase: 'repair',
+        });
+        now += 6000;
+        await h.collector.tick();
+        const finished = await scope(h.id);
+        assert.equal(readCollectionCheckpoint(finished.checkpoint)?.done, true);
+        assert.equal(
+          readCollectionCheckpoint(finished.checkpoint)?.dirty,
+          false
+        );
+        assert.equal(
+          readCollectionState(finished.collectionState).coverage,
+          'partial'
+        );
+        assert.equal(
+          (
+            await db
+              .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+              .findOneByOrFail({
+                trackerId: h.id,
+                reason: 'scan_budget_exhausted',
+              })
+          ).status,
+          'quarantined'
+        );
+        assert.equal(finished.nextRunAt, null);
+        assert.equal(
+          (
+            await db
+              .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+              .findOneByOrFail({ trackerId: h.id, reason: 'abnormal_overlap' })
+          ).status,
+          'quarantined',
+          'A page budget is not verification of the original region'
+        );
+      }
+    );
+    await t.test(
+      'release diagnostics deduplicate real P2 rejections, persist safe identities and keep unknown releases separate',
+      async () => {
+        let id = '';
+        const key = 'P3_DIAGNOSTIC_KEY_SENTINEL';
+        const safeGuid = 'https://tr4ker.net/torrent/Unsupported_Format';
+        const h = await setup(async (req) =>
+          normalizeTorznabPage(
+            `<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>
+        <item><guid>https://tr4ker.net/torrent/Valid-Release</guid><title>Valid</title></item>
+        <item><guid>${safeGuid}</guid><title>Safe diagnostic title</title><torznab:attr name="infohash" value="${'a'.repeat(40)}"/></item>
+        <item><guid>https://tr4ker.net/api/download?apikey=${key}</guid><title>${key}</title></item>
+        <item><title>Unidentified</title></item>
+        </channel></rss>`,
+            { ...req, limit: 100, trackerId: id, observedAt: new Date(now) },
+            TR4KER_CONTRACT,
+            [key]
+          )
+        );
+        id = h.id;
+        const diagnostics = () =>
+          db.getRepository<CatalogueReleaseDiagnostic>(names.diagnostic).find({
+            where: { trackerId: id, kind: 'release' },
+            order: { id: 'ASC' },
+          });
+        await h.enable();
+        await h.tick();
+        const first = await diagnostics();
+        assert.equal(first.length, 3);
+        assert.equal(
+          first.find((row) => row.guid === safeGuid)?.infohash,
+          'a'.repeat(40)
+        );
+        assert.equal(
+          first.find((row) => row.guid === safeGuid)?.reason,
+          'guid_path'
+        );
+        const unsafe = first.find((row) => row.reason === 'guid_query')!;
+        assert.equal(unsafe.guid, null);
+        assert.equal(unsafe.title, null);
+        assert.match(unsafe.fingerprint!, /^[a-f0-9]{64}$/);
+        await db.destroy();
+        db = createCatalogueDataSource(connection);
+        await db.initialize();
+        const resumed = new CatalogueCollector(db, [h.tracker], clock);
+        await resumed.initialize();
+        now += (await scope(id)).retryAfterAt!.getTime() - now;
+        await resumed.tick();
+        const rows = await diagnostics();
+        assert.equal(
+          rows.length,
+          4,
+          'Known releases deduplicate; unidentified observations remain separate'
+        );
+        const repeated = rows.find((row) => row.guid === safeGuid)!;
+        assert.equal(
+          repeated.id,
+          first.find((row) => row.guid === safeGuid)!.id
+        );
+        assert.equal(repeated.occurrences, 2);
+        assert.equal(repeated.firstSeenAt.getTime(), instant);
+        assert.ok(repeated.lastSeenAt > repeated.firstSeenAt);
+        assert.equal(
+          rows.filter((row) => row.reason === 'missing_guid').length,
+          2
+        );
+        assert.doesNotMatch(
+          JSON.stringify(rows),
+          /SENTINEL|apikey|\/api\/download|<item>/
+        );
+        assert.equal(
+          await db.getRepository(names.torrent).countBy({ trackerId: id }),
+          1
+        );
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.nextOffset,
+          0
+        );
+      }
+    );
+    await t.test(
+      'Historical repairs rescan moving scopes without maintenance, resolve only verified releases and quarantine bounded uncertainty',
+      async () => {
+        let id = '';
+        let repair = false;
+        const h = await setup(async (req) => {
+          if (req.offset > 0) return page(id, req.offset, 0);
+          const a = rejection(2);
+          const b = rejection(3);
+          const result = {
+            ...page(id, 0, 2),
+            receivedCount: 4,
+            anomalies: repair ? [b] : [a, b],
+            rejections: repair ? [b] : [a, b],
+          };
+          if (repair) {
+            // The corrected release moved from the missing item position. A
+            // different GUID sharing the other hash cannot resolve its rejection.
+            result.records = [
+              record(1000, id),
+              record(2, id),
+              record(0, id),
+              record(1, id),
+              { ...record(4, id), infohash: record(3, id).infohash },
+            ];
+            result.receivedCount = 6;
+          }
+          return result;
+        });
+        id = h.id;
+        const diagnostics = () =>
+          db
+            .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+            .findBy({ trackerId: id, kind: 'release' });
+        await h.enable();
+        for (let i = 0; i < 4; i++) await h.tick();
+        assert.equal(
+          await db.getRepository(names.torrent).countBy({ trackerId: id }),
+          2
+        );
+        assert.equal((await diagnostics()).length, 2);
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
+          true
+        );
+        assert.equal((await scope(id)).phase, 'repair');
+        const due = (await scope(id)).nextRunAt!.getTime();
+        await db.destroy();
+        db = createCatalogueDataSource(connection);
+        await db.initialize();
+        const resumed = new CatalogueCollector(db, [h.tracker], clock);
+        await resumed.initialize();
+        assert.equal(await resumed.tick(), false);
+        assert.equal((await scope(id)).nextRunAt!.getTime(), due);
+        repair = true;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          now = (await scope(id)).nextRunAt!.getTime();
+          for (let i = 0; i < 4; i++) {
+            await resumed.tick();
+            now += 6000;
+          }
+          const rows = await diagnostics();
+          assert.equal(
+            rows.find((row) => row.guid === guid(2))!.status,
+            'resolved'
+          );
+          const pending = rows.find((row) => row.guid === guid(3))!;
+          assert.equal(pending.attempts, attempt);
+          assert.equal(
+            pending.status,
+            attempt === 3 ? 'quarantined' : 'unresolved'
+          );
+          assert.equal(
+            readCollectionState((await scope(id)).collectionState).coverage,
+            'partial'
+          );
+          assert.equal(
+            readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
+            attempt < 3
+          );
+        }
+        assert.equal((await scope(id)).nextRunAt, null);
+        const calls = h.calls.length;
+        now += 86400000;
+        assert.equal(await resumed.tick(), false);
+        assert.equal(h.calls.length, calls);
+        await db.destroy();
+        db = createCatalogueDataSource(connection);
+        await db.initialize();
+        const restarted = new CatalogueCollector(db, [h.tracker], clock);
+        await restarted.initialize();
+        assert.equal(await restarted.tick(), false);
+        assert.equal(
+          readCollectionState((await scope(id)).collectionState).coverage,
+          'partial'
+        );
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
+          false
+        );
+        assert.ok(h.calls.filter((call) => call.offset === 0).length >= 4);
+        assert.ok(
+          h.calls
+            .slice(4)
+            .every(
+              (call, index, array) =>
+                !index || call.at - array[index - 1].at >= 6000
+            )
+        );
+      }
+    );
+    await t.test(
+      'legacy dirty and partial checkpoints retain unknown uncertainty through bounded repair instead of declaring absence',
+      async () => {
+        const h = await setup();
+        await h.enable();
+        await h.tick();
+        const stored = await scope(h.id);
+        const cp = readCollectionCheckpoint(stored.checkpoint)!;
+        cp.done = true;
+        cp.dirty = true;
+        const state = readCollectionState(stored.collectionState);
+        delete state.repairVersion;
+        await db.getRepository(names.sync).update(stored.id, {
+          checkpoint: JSON.stringify(cp),
+          collectionState: JSON.stringify(state),
+          phase: 'complete',
+          nextRunAt: null,
+        });
+        const resumed = new CatalogueCollector(db, [h.tracker], clock);
+        await resumed.initialize();
+        assert.equal((await scope(h.id)).phase, 'repair');
+        assert.ok((await scope(h.id)).nextRunAt);
+        const legacy = await db
+          .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+          .findOneByOrFail({ trackerId: h.id, reason: 'legacy_uncertainty' });
+        assert.equal(legacy.status, 'unresolved');
+        assert.equal(legacy.guid, null);
+        assert.equal(
+          readCollectionState((await scope(h.id)).collectionState).coverage,
+          'partial'
+        );
+      }
+    );
+    await t.test(
+      'a clean legacy in-progress scan resumes without inventing a repair defect',
+      async () => {
+        let id = '';
+        const h = await setup(async (req) =>
+          page(id, req.offset, req.offset ? 0 : 2)
+        );
+        id = h.id;
+        await h.enable();
+        await h.tick();
+        const before = await scope(id);
+        const state = readCollectionState(before.collectionState);
+        delete state.repairVersion;
+        await db
+          .getRepository(names.sync)
+          .update(before.id, { collectionState: JSON.stringify(state) });
+        const resumed = new CatalogueCollector(db, [h.tracker], clock);
+        await resumed.initialize();
+        assert.equal((await scope(id)).checkpoint, before.checkpoint);
+        assert.equal(
+          await db.getRepository(names.diagnostic).countBy({ trackerId: id }),
+          0
+        );
+        for (let i = 0; i < 3; i++) {
+          now += 3000;
+          await resumed.tick();
+        }
+        assert.equal(
+          readCollectionState((await scope(id)).collectionState).coverage,
+          'observed'
+        );
+      }
+    );
+    await t.test(
+      'diagnostic retention is bounded and evicted uncertainty remains an explicit quarantined coverage blocker',
+      async () => {
+        let id = '';
+        const h = await setup(async (req) =>
+          page(id, req.offset, req.offset ? 0 : 2)
+        );
+        id = h.id;
+        const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+          names.diagnostic
+        );
+        const base = {
+          trackerId: h.id,
+          categoryId: 2000,
+          mode: 'historical' as const,
+          kind: 'release' as const,
+          releaseKey: null,
+          guid: null,
+          infohash: null,
+          title: null,
+          fingerprint: null,
+          field: 'canonicalGuid',
+          code: 'contract_incompatible',
+          reason: 'missing_guid',
+          critical: true,
+          firstSeenAt: new Date(instant),
+          lastSeenAt: new Date(instant),
+          occurrences: 1,
+          status: 'unresolved' as const,
+          attempts: 0,
+          nextAttemptAt: new Date(instant + 30000),
+          lastAttemptCycle: null,
+          lastOutcome: 'pending',
+          resolvedAt: null,
+          offset: null,
+          itemPosition: null,
+        };
+        const checkpoint = await scope(h.id);
+        for (let start = 0; start < DIAGNOSTIC_LIMIT + 2; start += 100)
+          await repository.insert(
+            Array.from(
+              { length: Math.min(100, DIAGNOSTIC_LIMIT + 2 - start) },
+              (_, index) => ({
+                ...base,
+                diagnosticKey: `unknown:${start + index}`,
+              })
+            )
+          );
+        await h.collector.store.write((manager) =>
+          retainDiagnostics(manager, checkpoint, now)
+        );
+        assert.equal(
+          await repository.countBy({ trackerId: h.id, kind: 'release' }),
+          DIAGNOSTIC_LIMIT
+        );
+        assert.equal(
+          (
+            await repository.findOneByOrFail({
+              trackerId: h.id,
+              reason: 'retention_uncertainty',
+            })
+          ).status,
+          'quarantined'
+        );
+        const recentResolution = await repository.findOneByOrFail({
+          trackerId: h.id,
+          kind: 'release',
+        });
+        await repository.update(recentResolution.id, {
+          status: 'resolved',
+          lastSeenAt: new Date(instant - DIAGNOSTIC_RETENTION_MS - 1),
+          resolvedAt: new Date(now),
+        });
+        await h.collector.store.write((manager) =>
+          retainDiagnostics(manager, checkpoint, now)
+        );
+        assert.ok(
+          await repository.findOneBy({ id: recentResolution.id }),
+          'A recent resolution retains its history even when the rejection is old'
+        );
+        await repository.update(
+          { trackerId: h.id, kind: 'release' },
+          {
+            status: 'resolved',
+            lastSeenAt: new Date(instant - DIAGNOSTIC_RETENTION_MS - 1),
+            resolvedAt: new Date(instant - DIAGNOSTIC_RETENTION_MS - 1),
+          }
+        );
+        await h.collector.store.write((manager) =>
+          retainDiagnostics(manager, checkpoint, now)
+        );
+        assert.equal(await repository.countBy({ trackerId: h.id }), 1);
+        const reappear = async () => {
+          await repository.delete({ trackerId: id, kind: 'release' });
+          await repository.insert({
+            ...base,
+            diagnosticKey: 'evicted-and-reobserved',
+            releaseKey: 'b'.repeat(64),
+            guid: guid(999),
+            field: 'releaseName',
+            reason: 'missing_title',
+            nextAttemptAt: new Date(now + 30000),
+          });
+        };
+        await reappear();
+        await h.enable();
+        for (let i = 0; i < 4; i++) await h.tick();
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          if (attempt > 1) await reappear();
+          now = Math.max((await scope(id)).nextRunAt!.getTime(), now + 30000);
+          for (let i = 0; i < 4; i++) await h.tick(6000);
+          assert.equal(
+            (
+              await repository.findOneByOrFail({
+                trackerId: id,
+                reason: 'retention_uncertainty',
+              })
+            ).attempts,
+            attempt
+          );
+        }
+        assert.equal(
+          (await repository.findOneByOrFail({ trackerId: id, kind: 'release' }))
+            .lastOutcome,
+          'retention_budget_exhausted'
+        );
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
+          false
+        );
+        assert.equal(
+          readCollectionState((await scope(id)).collectionState).coverage,
+          'partial'
+        );
+        assert.equal((await scope(id)).nextRunAt, null);
+      }
+    );
+    await t.test(
       'Historical request retries recover at the same checkpoint without inventing a coverage gap',
       async () => {
         for (const scenario of [
@@ -331,6 +1001,10 @@ async function verify(
                   anomalies: [
                     { itemIndex: 0, code, field: 'infohash' } as const,
                     { itemIndex: 1, code, field: 'canonicalGuid' } as const,
+                  ],
+                  rejections: [
+                    rejection(0, 'infohash'),
+                    rejection(1, 'canonicalGuid'),
                   ],
                 }
           );
@@ -457,7 +1131,7 @@ async function verify(
       }
     );
     await t.test(
-      'a rejected nonempty page cancels pending terminal confirmation without advancing',
+      'a rejected nonempty page cancels terminal confirmation and retains uncertainty until verified',
       async () => {
         let id = '';
         let reads = 0;
@@ -510,7 +1184,11 @@ async function verify(
         );
         assert.equal(
           readCollectionState((await scope(id)).collectionState).coverage,
-          'observed'
+          'partial'
+        );
+        assert.equal(
+          readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
+          true
         );
       }
     );
@@ -899,8 +1577,9 @@ async function verify(
             if (!first) return page(id, req.offset, 0);
             first = false;
             return {
-              ...page(id, req.offset, 2),
-              receivedCount: corrected ? 2 : 3,
+              ...page(id, req.offset, corrected ? 3 : 2),
+              receivedCount: 3,
+              rejections: corrected ? [] : [rejection(2, 'canonicalGuid')],
               anomalies: corrected
                 ? []
                 : [
@@ -1373,11 +2052,12 @@ async function verify(
           await scope(h.id)
         );
         await db.undoLastMigration({ transaction: 'all' });
+        await db.undoLastMigration({ transaction: 'all' });
         const categories = await db
           .getRepository(names.category)
           .findBy({ torrentId: torrent.id });
         assert.equal(categories.length, 1);
-        assert.equal((await db.runMigrations()).length, 1);
+        assert.equal((await db.runMigrations()).length, 2);
         const reopened = await repository.findTorrentByGuid(h.id, guid(999999));
         assert.equal(reopened?.id, torrent.id);
         assert.equal(reopened?.nativeTmdbId, null);

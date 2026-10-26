@@ -564,7 +564,56 @@ describe('Torznab identity and security', () => {
         { itemIndex: 0, code: 'contract_incompatible', field: 'canonicalGuid' },
       ]);
       assert.ok(!JSON.stringify(page).includes(key));
-      assert.ok(!JSON.stringify(page).includes(guid));
+      const retained = page.rejections![0].release.guid;
+      if (retained !== null) {
+        assert.equal(retained, guid);
+        assert.doesNotMatch(retained, /[?%#\\\s]|\/api\/|\/download\//);
+      } else assert.ok(!JSON.stringify(page).includes(guid));
+    }
+  });
+
+  it('retains independently safe rejected identities, stable reasons and keyed fingerprints without relaxing ingestion', async () => {
+    const safeGuid = 'https://tr4ker.net/torrent/Unexpected_Format';
+    const unsafeGuid = `https://tr4ker.net/api/download?apikey=${key}`;
+    const hash = 'a'.repeat(40);
+    const xml = rss(
+      item(safeGuid, attr('infohash', hash)) +
+        `<item><guid>${unsafeGuid}</guid><title>${key}</title></item>` +
+        '<item><title>Unknown release</title></item>'
+    );
+    const first = await normalizeTr4ker(xml);
+    const second = await normalizeTr4ker(xml);
+    assert.equal(first.records.length, 0);
+    assert.deepEqual(first.rejections, second.rejections);
+    assert.deepEqual(
+      first.rejections!.map((row) => row.reason),
+      ['guid_path', 'guid_query', 'missing_guid']
+    );
+    assert.equal(first.rejections![0].release.guid, safeGuid);
+    assert.equal(first.rejections![0].release.infohash, hash);
+    assert.equal(first.rejections![1].release.guid, null);
+    assert.equal(first.rejections![1].release.title, null);
+    assert.match(first.rejections![1].release.fingerprint!, /^[a-f0-9]{64}$/);
+    assert.equal(first.rejections![2].release.guid, null);
+    assert.equal(first.rejections![2].release.fingerprint, null);
+    assert.doesNotMatch(
+      JSON.stringify(first),
+      /SENTINEL|\/api\/download|apikey/
+    );
+    for (const title of [
+      key,
+      encodeURIComponent(key),
+      'https://tracker.invalid/download/123',
+      '%68%74%74%70%73%3A%2F%2Ftracker.invalid',
+      '<raw>xml</raw>',
+    ]) {
+      const page = await normalizeTr4ker(
+        rss(
+          `<item><guid>${safeGuid}</guid><title><![CDATA[${title}]]></title></item>`
+        )
+      );
+      assert.equal(page.rejections![0].release.title, null);
+      assert.ok(!JSON.stringify(page).includes(title));
     }
   });
 

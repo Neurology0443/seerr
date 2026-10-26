@@ -239,9 +239,12 @@ describe('TR4KER HTTP contract', () => {
       { itemIndex: 0, code: 'contract_incompatible', field: 'canonicalGuid' },
     ]);
     for (const result of [partial, incompatible]) {
-      assert.doesNotMatch(
-        JSON.stringify(result),
-        /SENTINEL|REJECTED_TITLE|download|Axios/
+      assert.doesNotMatch(JSON.stringify(result), /SENTINEL|download|Axios/);
+      assert.equal(result.rejections![0].release.title, 'REJECTED_TITLE');
+      assert.equal(result.rejections![0].release.guid, null);
+      assert.match(
+        result.rejections![0].release.fingerprint!,
+        /^[a-f0-9]{64}$/
       );
       assert.equal('checkpoint' in result, false);
       assert.equal('suspended' in result, false);

@@ -360,6 +360,11 @@ export interface CollectedPageOptions {
   clock?: CatalogueClock;
   onIdentityConflicts: (count: number) => SyncCheckpoint;
   afterPersist?: (manager: EntityManager) => Promise<void>;
+  beforeCheckpoint?: (
+    manager: EntityManager,
+    accepted: ObservedTorrent[],
+    checkpoint: SyncCheckpoint
+  ) => Promise<SyncCheckpoint>;
 }
 
 export class CatalogueRepository {
@@ -449,6 +454,12 @@ export class CatalogueRepository {
       }
       const torrents = await upsertObservedTorrents(manager, records);
       await collection?.afterPersist?.(manager);
+      if (collection?.beforeCheckpoint)
+        checkpoint = await collection.beforeCheckpoint(
+          manager,
+          records,
+          checkpoint
+        );
       await fence();
       if (collection) {
         // Lease renewal belongs to the coordinator; a page must not overwrite it.

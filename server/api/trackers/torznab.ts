@@ -2,11 +2,14 @@ import ExternalAPI from '@server/api/externalapi';
 import { assertSafeCanonicalGuid } from '@server/lib/catalogue/repository';
 import axios from 'axios';
 import xml2js from 'xml2js';
+import { diagnosticIdentity } from './diagnostics';
 import { httpError, TrackerAdapterError } from './errors';
 import type {
   NormalizedTrackerPage,
   NormalizedTrackerTorrent,
   PageRequest,
+  RejectionReason,
+  ReleaseRejection,
   TorrentField,
   TrackerAnomaly,
   TrackerCapabilities,
@@ -22,6 +25,7 @@ export interface TorznabContract {
   fields: readonly string[];
   attributes: readonly string[];
   canonicalizeGuid: (value: string) => string | null;
+  guidRejectionReason?: (value: string) => RejectionReason;
 }
 
 interface XmlNode {
@@ -350,30 +354,33 @@ export async function normalizeTorznabPage(
     throw new TrackerAdapterError('invalid_response');
   const items = children(channel, 'item');
   const anomalies: TrackerAnomaly[] = [];
+  const rejections: ReleaseRejection[] = [];
   const candidates: NormalizedTrackerTorrent[] = [];
   const identities = new Map<string, Set<string>>();
   const identifiedItems: { canonicalGuid: string; itemIndex: number }[] = [];
+  const diagnosticIdentities = new Map<number, ReleaseRejection['release']>();
   for (const [itemIndex, item] of items.entries()) {
     const report = (
       field: TorrentField,
-      code: TrackerAnomaly['code'] = 'invalid_field'
+      code: TrackerAnomaly['code'] = 'invalid_field',
+      reason: ReleaseRejection['reason'] = code === 'conflicting_field'
+        ? 'conflicting_values'
+        : 'invalid_value'
     ) => {
       anomalies.push({ itemIndex, code, field });
+      rejections.push({
+        itemIndex,
+        code,
+        field,
+        reason,
+        release: diagnosticIdentities.get(itemIndex)!,
+      });
     };
     const scalar = (name: string): string | null => {
       if (!contract.fields.includes(name)) return null;
       const nodes = children(item, name);
       return nodes.length === 1 ? text(nodes[0]) : null;
     };
-    const canonicalGuid = canonicalizeTorznabGuid(
-      scalar('guid'),
-      contract,
-      secrets
-    );
-    if (canonicalGuid === null) {
-      report('canonicalGuid', 'contract_incompatible');
-      continue;
-    }
     const attrs = children(item, 'attr', TORZNAB_NAMESPACE).filter((attr) =>
       contract.attributes.includes(attribute(attr, 'name') ?? '')
     );
@@ -394,6 +401,28 @@ export async function normalizeTorznabPage(
         )
       )
       .map((hash) => hash.toLowerCase());
+    const rawGuid = scalar('guid');
+    const identity = diagnosticIdentity(
+      rawGuid,
+      new Set(validHashes).size === 1 ? validHashes[0] : null,
+      scalar('title'),
+      secrets
+    );
+    diagnosticIdentities.set(itemIndex, identity);
+    const canonicalGuid = canonicalizeTorznabGuid(rawGuid, contract, secrets);
+    if (canonicalGuid === null) {
+      report(
+        'canonicalGuid',
+        'contract_incompatible',
+        !children(item, 'guid').length
+          ? 'missing_guid'
+          : rawGuid
+            ? (contract.guidRejectionReason?.(rawGuid) ??
+              (identity.guid ? 'incompatible_guid' : 'unsafe_guid'))
+            : 'incompatible_guid'
+      );
+      continue;
+    }
     const knownHashes = identities.get(canonicalGuid) ?? new Set<string>();
     for (const hash of validHashes) knownHashes.add(hash);
     identities.set(canonicalGuid, knownHashes);
@@ -404,7 +433,11 @@ export async function normalizeTorznabPage(
       !invalidHash && new Set(validHashes).size === 1 ? validHashes[0] : null;
     const releaseName = safeText(scalar('title')?.trim() ?? null, secrets);
     if (releaseName === null) {
-      report('releaseName', 'contract_incompatible');
+      report(
+        'releaseName',
+        'contract_incompatible',
+        scalar('title') ? 'unsafe_title' : 'missing_title'
+      );
       continue;
     }
     const provenance: NormalizedTrackerTorrent['provenance'] = {
@@ -498,12 +531,20 @@ export async function normalizeTorznabPage(
     candidates.push(record);
   }
   for (const { canonicalGuid, itemIndex } of identifiedItems) {
-    if (identities.get(canonicalGuid)!.size > 1)
+    if (identities.get(canonicalGuid)!.size > 1) {
       anomalies.push({
         itemIndex,
         field: 'infohash',
         code: 'identity_conflict',
       });
+      rejections.push({
+        itemIndex,
+        field: 'infohash',
+        code: 'identity_conflict',
+        reason: 'identity_conflict',
+        release: diagnosticIdentities.get(itemIndex)!,
+      });
+    }
   }
   const records = candidates.filter(
     (record) => identities.get(record.canonicalGuid)!.size < 2
@@ -526,6 +567,7 @@ export async function normalizeTorznabPage(
     observedAt: new Date(context.observedAt),
     records,
     anomalies,
+    rejections,
     receivedCount: items.length,
     contractStatus:
       criticalRejections === 0

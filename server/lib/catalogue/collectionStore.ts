@@ -3,6 +3,7 @@ import type {
   Tr4kerCollectionSettings,
   TrackerCollectionDescription,
 } from './collectionConfig';
+import { prepareRepairs } from './collectionRepairs';
 import {
   emptyCollectionState,
   readCollectionCheckpoint,
@@ -100,6 +101,30 @@ export class CollectionStore {
             .orIgnore()
             .execute();
         }
+      // Upgrade old uncertain checkpoints under the existing tracker lock.
+      // Never rewrite a scope currently owned by another process.
+      const historical = await manager
+        .getRepository<CatalogueSyncState>(names.sync)
+        .findBy({ trackerId, mode: 'historical' });
+      for (const scope of historical) {
+        const cp = readCollectionCheckpoint(scope.checkpoint);
+        if (
+          !cp ||
+          readCollectionState(scope.collectionState).repairVersion ||
+          (scope.leaseExpiresAt && scope.leaseExpiresAt.getTime() > now)
+        )
+          continue;
+        const upgraded = await prepareRepairs(manager, scope, now);
+        if (
+          cp.done &&
+          (cp.dirty ||
+            readCollectionState(scope.collectionState).coverage === 'partial')
+        ) {
+          upgraded.phase = 'repair';
+          upgraded.nextRunAt = new Date(now + 30000);
+        }
+        await saveSyncCheckpoint(manager, upgraded);
+      }
       // Enabling maintenance later uses the last pass's observed finish time.
       if (settings.maintenanceIntervalMinutes !== null) {
         const finished = await manager
@@ -181,10 +206,11 @@ export class CollectionStore {
       for (const scope of candidates) {
         const maintenance =
           scope.mode === 'historical' &&
-          (scope.phase === 'maintenance' || scope.phase === 'complete');
+          ['maintenance', 'complete', 'repair'].includes(scope.phase);
         if (
           maintenance &&
-          (settings.maintenanceIntervalMinutes === null ||
+          ((scope.phase !== 'repair' &&
+            settings.maintenanceIntervalMinutes === null) ||
             (dispatch.maintenanceStart != null &&
               now <
                 dispatch.maintenanceStart +
@@ -246,7 +272,7 @@ export class CollectionStore {
         (!row.retryAfterAt || row.retryAfterAt.getTime() <= now);
       const maintenance =
         current.mode === 'historical' &&
-        ['maintenance', 'complete'].includes(current.phase);
+        ['maintenance', 'complete', 'repair'].includes(current.phase);
       if (
         !eligible(current) ||
         dispatch.suspended ||
@@ -254,7 +280,8 @@ export class CollectionStore {
         (dispatch.lastStart != null &&
           now < dispatch.lastStart + settings.globalSpacingSeconds * 1000) ||
         (maintenance &&
-          (settings.maintenanceIntervalMinutes === null ||
+          ((current.phase !== 'repair' &&
+            settings.maintenanceIntervalMinutes === null) ||
             (dispatch.maintenanceStart != null &&
               now <
                 dispatch.maintenanceStart +

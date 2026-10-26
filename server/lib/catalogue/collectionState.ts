@@ -15,6 +15,8 @@ export interface CollectionCheckpoint {
   dirty: boolean;
   repairThrough: number;
   maintenance: boolean;
+  repairRun?: boolean;
+  scanUncertain?: boolean;
 }
 export interface CollectionDiagnostic {
   code:
@@ -35,6 +37,7 @@ export interface CollectionState {
   diagnostics: CollectionDiagnostic[];
   recoverable: boolean;
   pendingDispatch?: boolean;
+  repairVersion?: 1;
 }
 export const emptyCollectionState = (): CollectionState => ({
   version: 1,

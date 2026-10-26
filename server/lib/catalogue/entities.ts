@@ -8,6 +8,7 @@ import type {
   CatalogueDispatchState,
   CatalogueEngine,
   CatalogueMediaAssociation,
+  CatalogueReleaseDiagnostic,
   CatalogueSyncState,
   CatalogueTorrent,
   CatalogueTracker,
@@ -23,6 +24,7 @@ export const catalogueEntityNames = {
   indexer: 'CatalogueDestinationIndexer',
   link: 'CatalogueDestinationTrackerLink',
   dispatch: 'CatalogueDispatchState',
+  diagnostic: 'CatalogueReleaseDiagnostic',
 } as const;
 
 // Build metadata per connection, without native decorators or global DB_TYPE.
@@ -58,6 +60,66 @@ export function createCatalogueEntities(
     onDelete: 'CASCADE' as const,
   });
   return [
+    new EntitySchema<CatalogueReleaseDiagnostic>({
+      name: catalogueEntityNames.diagnostic,
+      tableName: 'release_diagnostics',
+      schema,
+      columns: {
+        id,
+        trackerId: text('tracker_id'),
+        categoryId: int('category_id'),
+        mode: text('mode'),
+        diagnosticKey: text('diagnostic_key'),
+        releaseKey: text('release_key', true),
+        kind: text('kind'),
+        guid: text('guid', true),
+        infohash: text('infohash', true),
+        title: text('title', true),
+        fingerprint: text('fingerprint', true),
+        field: text('field'),
+        code: text('code'),
+        reason: text('reason'),
+        critical: { type: 'boolean' },
+        firstSeenAt: date('first_seen_at'),
+        lastSeenAt: date('last_seen_at'),
+        occurrences: int('occurrences'),
+        status: text('status'),
+        attempts: int('attempts'),
+        nextAttemptAt: date('next_attempt_at', true),
+        lastAttemptCycle: text('last_attempt_cycle', true),
+        lastOutcome: text('last_outcome', true),
+        resolvedAt: date('resolved_at', true),
+        offset: int('page_offset', true),
+        itemPosition: int('item_position', true),
+      },
+      uniques: [
+        {
+          name: 'UQ_catalogue_release_diagnostic',
+          columns: ['trackerId', 'categoryId', 'mode', 'diagnosticKey'],
+        },
+      ],
+      indices: [
+        {
+          name: 'IDX_catalogue_diagnostic_repair',
+          columns: ['trackerId', 'categoryId', 'status', 'nextAttemptAt'],
+        },
+        {
+          name: 'IDX_catalogue_diagnostic_retention',
+          columns: ['trackerId', 'categoryId', 'mode', 'status', 'resolvedAt'],
+        },
+        {
+          name: 'IDX_catalogue_diagnostic_guid',
+          columns: ['trackerId', 'categoryId', 'guid'],
+        },
+      ],
+      foreignKeys: [
+        fk(
+          'FK_catalogue_diagnostic_tracker',
+          catalogueEntityNames.tracker,
+          'trackerId'
+        ),
+      ],
+    }),
     new EntitySchema<CatalogueTracker>({
       name: catalogueEntityNames.tracker,
       tableName: 'trackers',
