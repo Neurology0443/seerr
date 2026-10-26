@@ -1,6 +1,12 @@
 import type { DataSource, EntityManager } from 'typeorm';
 import { In } from 'typeorm';
 import { catalogueEntityNames as names } from './entities';
+import {
+  CatalogueLeaseLostError,
+  catalogueWrite,
+  databaseTime,
+  type CatalogueClock,
+} from './transactions';
 import type {
   CatalogueCategory,
   CatalogueCoverage,
@@ -90,6 +96,37 @@ function requireTransaction(manager: EntityManager): void {
     throw new Error('Catalogue page writes require an active transaction');
 }
 
+function assertNativeProvenance(origin: unknown): void {
+  const value = origin as { source?: unknown; field?: unknown } | null;
+  // Native metadata remains a tracker claim. The adapter interprets the exact
+  // protocol field; persistence accepts only a bounded symbolic field path.
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).some((key) => key !== 'source' && key !== 'field') ||
+    value.source !== 'tracker' ||
+    typeof value.field !== 'string' ||
+    !/^[a-z_$/][a-z0-9_$.:/-]{0,127}$/i.test(value.field) ||
+    value.field.includes('//') ||
+    value.field
+      .split(/[.:/]/)
+      .some((part) =>
+        [
+          'apikey',
+          'passkey',
+          'authorization',
+          'auth',
+          'accesstoken',
+          'token',
+          'password',
+          'secret',
+        ].includes(part.toLowerCase().replace(/[_-]/g, ''))
+      )
+  )
+    throw new Error('Invalid catalogue native metadata provenance');
+}
+
 type NormalizedObservation = ObservedTorrent & { firstSeenAt: Date };
 
 function normalizeObservations(
@@ -111,6 +148,17 @@ function normalizeObservations(
     )
       throw new Error('Invalid catalogue infohash');
     for (const category of input.categories ?? []) integer(category, 1);
+    if (input.trackerMetadata) {
+      for (const field of ['tmdbId', 'tvdbId', 'season', 'episode'] as const) {
+        const value =
+          input.trackerMetadata[field as keyof typeof input.trackerMetadata];
+        if (value != null) {
+          integer(value, field.endsWith('Id') ? 1 : 0);
+          assertNativeProvenance(input.provenance?.[field]);
+        } else if (input.provenance?.[field] != null)
+          assertNativeProvenance(input.provenance[field]);
+      }
+    }
     const record: NormalizedObservation = {
       ...input,
       infohash: input.infohash?.toLowerCase() ?? null,
@@ -160,6 +208,12 @@ export async function upsertObservedTorrents(
     'first_seen_at',
     'last_seen_at',
     'seeders_observed_at',
+    'native_tmdb_id',
+    'native_tvdb_id',
+    'native_season',
+    'native_episode',
+    'native_provenance',
+    'native_observed_at',
   ];
   const repository = manager.getRepository<CatalogueTorrent>(names.torrent);
   const result: CatalogueTorrent[] = [];
@@ -186,6 +240,26 @@ export async function upsertObservedTorrents(
         encodeDate(record.firstSeenAt),
         encodeDate(record.observedAt),
         record.seeders == null ? null : encodeDate(record.observedAt),
+        record.trackerMetadata?.tmdbId ?? null,
+        record.trackerMetadata?.tvdbId ?? null,
+        record.trackerMetadata?.season ?? null,
+        record.trackerMetadata?.episode ?? null,
+        record.trackerMetadata
+          ? JSON.stringify(
+              Object.fromEntries(
+                (['tmdbId', 'tvdbId', 'season', 'episode'] as const)
+                  .filter((field) => record.trackerMetadata![field] != null)
+                  .map((field) => [
+                    field,
+                    {
+                      source: 'tracker',
+                      field: record.provenance![field]!.field,
+                    },
+                  ])
+              )
+            )
+          : null,
+        record.trackerMetadata ? encodeDate(record.observedAt) : null,
       ];
       return (
         '(' +
@@ -211,6 +285,7 @@ export async function upsertObservedTorrents(
       `INSERT INTO ${table} AS existing (${columns.map((column) => '"' + column + '"').join(',')}) VALUES ${values.join(',')}
       ON CONFLICT ("tracker_id", "canonical_guid") DO UPDATE SET
       "infohash" = COALESCE(existing."infohash", excluded."infohash"),
+      ${['native_tmdb_id', 'native_tvdb_id', 'native_season', 'native_episode', 'native_provenance', 'native_observed_at'].map((column) => `"${column}" = CASE WHEN excluded."native_observed_at" IS NOT NULL AND (existing."native_observed_at" IS NULL OR excluded."native_observed_at" >= existing."native_observed_at") THEN excluded."${column}" ELSE existing."${column}" END`).join(',')},
       ${observedColumns.map((column) => `"${column}" = CASE WHEN excluded."last_seen_at" >= existing."last_seen_at" THEN excluded."${column}" ELSE existing."${column}" END`).join(',')}
       WHERE existing."infohash" IS NULL OR excluded."infohash" IS NULL OR existing."infohash" = excluded."infohash"`,
       parameters
@@ -280,9 +355,17 @@ export async function saveSyncCheckpoint(
     .upsert(checkpoint, ['trackerId', 'categoryId', 'mode']);
 }
 
-// SQLite uses one physical connection; serialize this repository's transactions
-// to avoid nested transactions on that connection. Cross-process leases are PR3.
-const writeQueues = new WeakMap<DataSource, Promise<unknown>>();
+export interface CollectedPageOptions {
+  owner: string;
+  clock?: CatalogueClock;
+  onIdentityConflicts: (count: number) => SyncCheckpoint;
+  afterPersist?: (manager: EntityManager) => Promise<void>;
+  beforeCheckpoint?: (
+    manager: EntityManager,
+    accepted: ObservedTorrent[],
+    checkpoint: SyncCheckpoint
+  ) => Promise<SyncCheckpoint>;
+}
 
 export class CatalogueRepository {
   constructor(private readonly connection: DataSource) {}
@@ -290,16 +373,7 @@ export class CatalogueRepository {
   private write<T>(
     operation: (manager: EntityManager) => Promise<T>
   ): Promise<T> {
-    if (this.connection.options.type !== 'sqlite')
-      return this.connection.transaction(operation);
-    const result = (writeQueues.get(this.connection) ?? Promise.resolve()).then(
-      () => this.connection.transaction(operation)
-    );
-    writeQueues.set(
-      this.connection,
-      result.catch(() => undefined)
-    );
-    return result;
+    return catalogueWrite(this.connection, operation);
   }
 
   saveTracker(tracker: CatalogueTracker): Promise<void> {
@@ -312,13 +386,89 @@ export class CatalogueRepository {
 
   persistPage(
     records: ObservedTorrent[],
-    checkpoint: SyncCheckpoint
+    checkpoint: SyncCheckpoint,
+    collection?: CollectedPageOptions
   ): Promise<CatalogueTorrent[]> {
     return this.write(async (manager) => {
       if (records.some((record) => record.trackerId !== checkpoint.trackerId))
         throw new Error('Catalogue page must belong to its checkpoint tracker');
+      const fence = async () => {
+        if (!collection) return;
+        const now = new Date(await (collection.clock ?? databaseTime)(manager));
+        const result = await manager
+          .getRepository<CatalogueSyncState>(names.sync)
+          .createQueryBuilder()
+          .update()
+          .set({ leaseOwner: collection.owner })
+          .where(
+            'tracker_id = :tracker AND category_id = :category AND mode = :mode AND lease_owner = :owner AND lease_expires_at > :now',
+            {
+              tracker: checkpoint.trackerId,
+              category: checkpoint.categoryId,
+              mode: checkpoint.mode,
+              owner: collection.owner,
+              now,
+            }
+          )
+          .execute();
+        if (result.affected !== 1) throw new CatalogueLeaseLostError();
+      };
+      if (collection)
+        await manager
+          .getRepository(names.dispatch)
+          .update(
+            { trackerId: checkpoint.trackerId },
+            { trackerId: checkpoint.trackerId }
+          );
+      await fence();
+      if (collection && records.length) {
+        // The scope fence is a write before reads on SQLite. Serialize the
+        // tracker's page writes on PostgreSQL as well, across categories.
+        const existing = await manager
+          .getRepository<CatalogueTorrent>(names.torrent)
+          .find({
+            where: records.map((record) => ({
+              trackerId: record.trackerId,
+              canonicalGuid: record.canonicalGuid,
+            })),
+          });
+        const hashes = new Map(
+          existing.map((row) => [row.canonicalGuid, row.infohash])
+        );
+        let conflicts = 0;
+        records = records.filter((record) => {
+          const hash = hashes.get(record.canonicalGuid);
+          if (
+            hash &&
+            record.infohash &&
+            hash !== record.infohash.toLowerCase()
+          ) {
+            conflicts++;
+            return false;
+          }
+          if (record.infohash)
+            hashes.set(record.canonicalGuid, record.infohash.toLowerCase());
+          return true;
+        });
+        if (conflicts) checkpoint = collection.onIdentityConflicts(conflicts);
+      }
       const torrents = await upsertObservedTorrents(manager, records);
+      await collection?.afterPersist?.(manager);
+      if (collection?.beforeCheckpoint)
+        checkpoint = await collection.beforeCheckpoint(
+          manager,
+          records,
+          checkpoint
+        );
+      await fence();
+      if (collection) {
+        // Lease renewal belongs to the coordinator; a page must not overwrite it.
+        checkpoint = { ...checkpoint };
+        delete checkpoint.leaseOwner;
+        delete checkpoint.leaseExpiresAt;
+      }
       await saveSyncCheckpoint(manager, checkpoint);
+      await fence();
       return torrents;
     });
   }

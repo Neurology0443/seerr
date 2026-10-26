@@ -35,7 +35,7 @@ export interface FieldOrigin {
 // Structurally compatible with P1 writes. These IDs are tracker claims, not
 // resolved media associations. P1 owns first/last-seen and seeder freshness.
 export type NormalizedTrackerTorrent = Required<
-  Omit<ObservedTorrent, 'categories'>
+  Omit<ObservedTorrent, 'categories' | 'trackerMetadata' | 'provenance'>
 > &
   Pick<ObservedTorrent, 'categories'> & {
     trackerMetadata: {
@@ -58,9 +58,38 @@ export interface TrackerAnomaly {
   field: TorrentField;
 }
 
+export type RejectionReason =
+  | 'missing_guid'
+  | 'incompatible_guid'
+  | 'unsafe_guid'
+  | 'guid_scheme'
+  | 'guid_host'
+  | 'guid_credentials'
+  | 'guid_query'
+  | 'guid_fragment'
+  | 'guid_encoding'
+  | 'guid_path'
+  | 'missing_title'
+  | 'unsafe_title'
+  | 'invalid_value'
+  | 'conflicting_values'
+  | 'identity_conflict';
+export interface ReleaseDiagnosticIdentity {
+  guid: string | null;
+  infohash: string | null;
+  title: string | null;
+  fingerprint: string | null;
+}
+export interface ReleaseRejection extends TrackerAnomaly {
+  reason: RejectionReason;
+  release: ReleaseDiagnosticIdentity;
+  rejectedValue?: string | null;
+}
+
 export interface NormalizedTrackerPage extends TrackerPageContext {
   records: NormalizedTrackerTorrent[];
   anomalies: TrackerAnomaly[];
+  rejections?: ReleaseRejection[];
   receivedCount: number;
   // Describes only this response's critical field structure, not scan coverage.
   contractStatus: 'compatible' | 'partial' | 'incompatible';

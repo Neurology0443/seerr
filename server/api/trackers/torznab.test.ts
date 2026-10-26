@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { diagnosticRejectedValue } from './diagnostics';
 import { TrackerAdapterError } from './errors';
 import type { TorznabContract } from './torznab';
 import {
@@ -151,7 +152,6 @@ describe('Torznab normalization', () => {
         'seeders',
         'size',
         'tmdbId',
-        'tvdbId',
       ].sort()
     );
     assert.deepEqual(
@@ -166,6 +166,215 @@ describe('Torznab normalization', () => {
     );
     for (const record of page.records)
       assertSafeCanonicalGuid(record.canonicalGuid);
+  });
+
+  it('treats zero only as a missing TMDB/TVDB ID while preserving positive provenance and other numeric zeroes', async () => {
+    for (const fields of [
+      '',
+      attr('tmdbid', '0'),
+      attr('tvdbid', '0'),
+      attr('tmdbid', '0') + attr('tvdbid', '0'),
+    ]) {
+      const page = await normalizeTr4ker(
+        rss(item('https://tr4ker.net/torrent/Native-Ids', fields))
+      );
+      assert.equal(page.records.length, 1);
+      assert.equal(page.records[0].trackerMetadata.tmdbId, null);
+      assert.equal(page.records[0].trackerMetadata.tvdbId, null);
+      assert.equal(page.records[0].provenance.tmdbId, undefined);
+      assert.equal(page.records[0].provenance.tvdbId, undefined);
+      assert.deepEqual(page.anomalies, []);
+      assert.deepEqual(page.rejections, []);
+    }
+    const page = await normalize(
+      rss(
+        item(
+          'native-ids',
+          attr('tmdbid', '42') +
+            attr('tvdbid', '84') +
+            attr('season', '0') +
+            attr('episode', '0') +
+            attr('seeders', '0') +
+            attr('leechers', '0') +
+            attr('size', '0')
+        )
+      )
+    );
+    assert.deepEqual(page.records[0].trackerMetadata, {
+      tmdbId: 42,
+      tvdbId: 84,
+      season: 0,
+      episode: 0,
+    });
+    for (const [field, name] of [
+      ['tmdbId', 'tmdbid'],
+      ['tvdbId', 'tvdbid'],
+      ['season', 'season'],
+      ['episode', 'episode'],
+    ] as const)
+      assert.deepEqual(page.records[0].provenance[field], {
+        source: 'tracker',
+        field: `torznab:attr/${name}`,
+      });
+    assert.equal(page.records[0].seeders, 0);
+    assert.equal(page.records[0].leechers, 0);
+    assert.equal(page.records[0].size, 0);
+    assert.deepEqual(page.anomalies, []);
+  });
+
+  it('preserves native-ID invalid and conflict diagnostics without rejecting otherwise valid releases', async () => {
+    for (const [name, field] of [
+      ['tmdbid', 'tmdbId'],
+      ['tvdbid', 'tvdbId'],
+    ] as const) {
+      for (const value of [
+        'bad',
+        '-1',
+        '1.5',
+        '1e3',
+        '2147483648',
+        '9007199254740992',
+      ]) {
+        const page = await normalize(
+          rss(item('native-invalid', attr(name, value)))
+        );
+        assert.equal(page.records.length, 1);
+        assert.equal(page.contractStatus, 'compatible');
+        assert.equal(page.records[0].trackerMetadata[field], null);
+        assert.equal(page.records[0].provenance[field], undefined);
+        assert.deepEqual(page.anomalies, [
+          { itemIndex: 0, field, code: 'invalid_field' },
+        ]);
+        assert.equal(
+          page.rejections![0].rejectedValue,
+          value === 'bad' ? null : value
+        );
+      }
+      for (const [values, expected, code] of [
+        [['0', '0'], null, null],
+        [['42', '42'], 42, null],
+        [['0', '42'], null, 'conflicting_field'],
+        [['42', '0'], null, 'conflicting_field'],
+        [['42', '84'], null, 'conflicting_field'],
+        [['-1', '-1'], null, 'invalid_field'],
+      ] as const) {
+        const page = await normalize(
+          rss(
+            item(
+              'native-repeated',
+              values.map((value) => attr(name, value)).join('')
+            )
+          )
+        );
+        assert.equal(page.records.length, 1);
+        assert.equal(page.records[0].trackerMetadata[field], expected);
+        assert.deepEqual(
+          page.anomalies,
+          code ? [{ itemIndex: 0, field, code }] : []
+        );
+        if (code === 'conflicting_field')
+          assert.equal(page.rejections![0].reason, 'conflicting_values');
+      }
+    }
+    for (const name of ['season', 'episode', 'seeders', 'leechers', 'size']) {
+      const page = await normalize(
+        rss(item('other-invalid', attr(name, '-1')))
+      );
+      assert.equal(page.anomalies[0].code, 'invalid_field');
+      assert.equal(page.rejections![0].rejectedValue, undefined);
+    }
+  });
+
+  it('retains only short allowlisted rejected scalars, including configured-secret encoding checks', async () => {
+    const safe = [
+      '-1',
+      '1.5',
+      '1e3',
+      '2147483648',
+      '9'.repeat(32),
+      'NaN',
+      'null',
+      'undefined',
+      'unknown',
+      'none',
+      'invalid',
+    ];
+    const unsafe: unknown[] = [
+      null,
+      42,
+      {},
+      'bad-id',
+      '9'.repeat(33),
+      '123\n',
+      ' 123',
+      '123 ',
+      '1\t2',
+      'https://tracker.invalid/download?apikey=sentinel',
+      '/tmp/123',
+      '..',
+      'a/b',
+      'C:\\secret',
+      '<xml>123</xml>',
+      '%31%32%33',
+      '%2531%2532%2533',
+      '&#49;&#50;&#51;',
+      String.raw`\u0031\u0032\u0033`,
+      'apikey=123',
+      'token:123',
+      '123@example.invalid',
+    ];
+    for (const value of safe)
+      assert.equal(diagnosticRejectedValue(value), value);
+    for (const value of unsafe)
+      assert.equal(diagnosticRejectedValue(value), null);
+    for (const secret of ['SAMPLE_KEY', '12345', 'abc', 'NaN', '\u00d7M5']) {
+      const encoded = Buffer.from(secret);
+      const utf16 = Buffer.from(secret, 'utf16le');
+      const values = [
+        secret,
+        encodeURIComponent(secret),
+        encoded.toString('hex'),
+        Buffer.from(encoded.toString('hex')).toString('hex'),
+        utf16.toString('hex'),
+        utf16.swap16().toString('hex'),
+        encoded.toString('base64'),
+        encoded.toString('base64url'),
+      ];
+      for (const value of values)
+        assert.equal(diagnosticRejectedValue(value, [secret]), null);
+    }
+    for (const value of [
+      '-1',
+      '1.5',
+      '9'.repeat(32),
+      '9'.repeat(33),
+      key,
+      `-${Buffer.from('abc').toString('hex')}`,
+      `-${Buffer.from(Buffer.from('abc').toString('hex')).toString('hex')}`,
+      '%2531%2532%2533',
+      '&#x61;&#x62;&#x63;',
+      'https://tracker.invalid/download?apikey=sentinel',
+      '<xml>private</xml>',
+    ]) {
+      const escaped = value
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+      const page = await normalizeTorznabPage(
+        rss(item('native-safe-sample', attr('tmdbid', escaped))),
+        context,
+        fixtureContract,
+        [key, 'abc']
+      );
+      assert.equal(page.records.length, 1);
+      assert.equal(
+        page.rejections![0].rejectedValue,
+        diagnosticRejectedValue(value, [key, 'abc'])
+      );
+      if (diagnosticRejectedValue(value, [key, 'abc']) === null)
+        assert.ok(!JSON.stringify(page).includes(value));
+    }
   });
 
   it('retains season-only tracker claims without inferring coverage', async () => {
@@ -564,7 +773,56 @@ describe('Torznab identity and security', () => {
         { itemIndex: 0, code: 'contract_incompatible', field: 'canonicalGuid' },
       ]);
       assert.ok(!JSON.stringify(page).includes(key));
-      assert.ok(!JSON.stringify(page).includes(guid));
+      const retained = page.rejections![0].release.guid;
+      if (retained !== null) {
+        assert.equal(retained, guid);
+        assert.doesNotMatch(retained, /[?%#\\\s]|\/api\/|\/download\//);
+      } else assert.ok(!JSON.stringify(page).includes(guid));
+    }
+  });
+
+  it('retains independently safe rejected identities, stable reasons and keyed fingerprints without relaxing ingestion', async () => {
+    const safeGuid = 'https://tr4ker.net/torrent/Unexpected_Format';
+    const unsafeGuid = `https://tr4ker.net/api/download?apikey=${key}`;
+    const hash = 'a'.repeat(40);
+    const xml = rss(
+      item(safeGuid, attr('infohash', hash)) +
+        `<item><guid>${unsafeGuid}</guid><title>${key}</title></item>` +
+        '<item><title>Unknown release</title></item>'
+    );
+    const first = await normalizeTr4ker(xml);
+    const second = await normalizeTr4ker(xml);
+    assert.equal(first.records.length, 0);
+    assert.deepEqual(first.rejections, second.rejections);
+    assert.deepEqual(
+      first.rejections!.map((row) => row.reason),
+      ['guid_path', 'guid_query', 'missing_guid']
+    );
+    assert.equal(first.rejections![0].release.guid, safeGuid);
+    assert.equal(first.rejections![0].release.infohash, hash);
+    assert.equal(first.rejections![1].release.guid, null);
+    assert.equal(first.rejections![1].release.title, null);
+    assert.match(first.rejections![1].release.fingerprint!, /^[a-f0-9]{64}$/);
+    assert.equal(first.rejections![2].release.guid, null);
+    assert.equal(first.rejections![2].release.fingerprint, null);
+    assert.doesNotMatch(
+      JSON.stringify(first),
+      /SENTINEL|\/api\/download|apikey/
+    );
+    for (const title of [
+      key,
+      encodeURIComponent(key),
+      'https://tracker.invalid/download/123',
+      '%68%74%74%70%73%3A%2F%2Ftracker.invalid',
+      '<raw>xml</raw>',
+    ]) {
+      const page = await normalizeTr4ker(
+        rss(
+          `<item><guid>${safeGuid}</guid><title><![CDATA[${title}]]></title></item>`
+        )
+      );
+      assert.equal(page.rejections![0].release.title, null);
+      assert.ok(!JSON.stringify(page).includes(title));
     }
   });
 

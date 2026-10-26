@@ -1,4 +1,8 @@
 import logger from '@server/logger';
+import {
+  startCatalogueCollection,
+  stopCatalogueCollection,
+} from './collectionRuntime';
 import { createCatalogueDataSource } from './datasource';
 import { CatalogueDatabase } from './lifecycle';
 
@@ -7,7 +11,10 @@ let shutdownRegistered = false;
 
 export const getCatalogueState = () => catalogue.getState();
 export const getCatalogueConnection = () => catalogue.getConnection();
-export const shutdownCatalogue = () => catalogue.shutdown();
+export const shutdownCatalogue = async () => {
+  await stopCatalogueCollection();
+  await catalogue.shutdown();
+};
 
 export async function initializeCatalogue(): Promise<boolean> {
   const ready = await catalogue.initialize();
@@ -26,17 +33,21 @@ export async function initializeCatalogue(): Promise<boolean> {
 }
 
 export function startCatalogueInitialization(): void {
-  void initializeCatalogue().catch(() => {
-    // Initialization records database failures itself. A reporting failure must
-    // not turn this independent task into an unhandled rejection at startup.
-    try {
-      logger.error('Catalogue initialization could not be reported', {
-        label: 'Catalogue',
-      });
-    } catch {
-      /* The lifecycle state remains available even if logging fails. */
-    }
-  });
+  void initializeCatalogue()
+    .then((ready) => {
+      if (ready) return startCatalogueCollection(getCatalogueConnection());
+    })
+    .catch(() => {
+      // Initialization records database failures itself. A reporting failure must
+      // not turn this independent task into an unhandled rejection at startup.
+      try {
+        logger.error('Catalogue initialization could not be reported', {
+          label: 'Catalogue',
+        });
+      } catch {
+        /* The lifecycle state remains available even if logging fails. */
+      }
+    });
 }
 
 // The native server has no shutdown coordinator. Preserve signal exit semantics

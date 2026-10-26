@@ -5,8 +5,10 @@ import type {
   CatalogueCoverage,
   CatalogueDestinationIndexer,
   CatalogueDestinationTrackerLink,
+  CatalogueDispatchState,
   CatalogueEngine,
   CatalogueMediaAssociation,
+  CatalogueReleaseDiagnostic,
   CatalogueSyncState,
   CatalogueTorrent,
   CatalogueTracker,
@@ -21,6 +23,8 @@ export const catalogueEntityNames = {
   sync: 'CatalogueSyncState',
   indexer: 'CatalogueDestinationIndexer',
   link: 'CatalogueDestinationTrackerLink',
+  dispatch: 'CatalogueDispatchState',
+  diagnostic: 'CatalogueReleaseDiagnostic',
 } as const;
 
 // Build metadata per connection, without native decorators or global DB_TYPE.
@@ -56,6 +60,85 @@ export function createCatalogueEntities(
     onDelete: 'CASCADE' as const,
   });
   return [
+    new EntitySchema<CatalogueReleaseDiagnostic>({
+      name: catalogueEntityNames.diagnostic,
+      tableName: 'release_diagnostics',
+      schema,
+      columns: {
+        id,
+        trackerId: text('tracker_id'),
+        categoryId: int('category_id'),
+        mode: text('mode'),
+        diagnosticKey: text('diagnostic_key'),
+        releaseKey: text('release_key', true),
+        kind: text('kind'),
+        guid: text('guid', true),
+        infohash: text('infohash', true),
+        title: text('title', true),
+        fingerprint: text('fingerprint', true),
+        field: text('field'),
+        code: text('code'),
+        reason: text('reason'),
+        critical: { type: 'boolean' },
+        firstSeenAt: date('first_seen_at'),
+        lastSeenAt: date('last_seen_at'),
+        occurrences: int('occurrences'),
+        status: text('status'),
+        attempts: int('attempts'),
+        nextAttemptAt: date('next_attempt_at', true),
+        lastAttemptCycle: text('last_attempt_cycle', true),
+        lastOutcome: text('last_outcome', true),
+        resolvedAt: date('resolved_at', true),
+        offset: int('page_offset', true),
+        itemPosition: int('item_position', true),
+        rejectedValue: { ...text('rejected_value', true), length: 32 },
+      },
+      checks: [
+        {
+          name: 'CHK_catalogue_diagnostic_rejected_value_length',
+          expression: 'length("rejected_value") <= 32',
+        },
+      ],
+      uniques: [
+        {
+          name: 'UQ_catalogue_release_diagnostic',
+          columns: ['trackerId', 'categoryId', 'mode', 'diagnosticKey'],
+        },
+      ],
+      indices: [
+        {
+          name: 'IDX_catalogue_diagnostic_scope_state',
+          columns: [
+            'trackerId',
+            'categoryId',
+            'mode',
+            'kind',
+            'critical',
+            'status',
+            'nextAttemptAt',
+          ],
+        },
+        {
+          name: 'IDX_catalogue_diagnostic_repair',
+          columns: ['trackerId', 'categoryId', 'status', 'nextAttemptAt'],
+        },
+        {
+          name: 'IDX_catalogue_diagnostic_retention',
+          columns: ['trackerId', 'categoryId', 'mode', 'status', 'resolvedAt'],
+        },
+        {
+          name: 'IDX_catalogue_diagnostic_guid',
+          columns: ['trackerId', 'categoryId', 'guid'],
+        },
+      ],
+      foreignKeys: [
+        fk(
+          'FK_catalogue_diagnostic_tracker',
+          catalogueEntityNames.tracker,
+          'trackerId'
+        ),
+      ],
+    }),
     new EntitySchema<CatalogueTracker>({
       name: catalogueEntityNames.tracker,
       tableName: 'trackers',
@@ -93,6 +176,16 @@ export function createCatalogueEntities(
         firstSeenAt: date('first_seen_at'),
         lastSeenAt: date('last_seen_at'),
         seedersObservedAt: date('seeders_observed_at', true),
+        nativeTmdbId: int('native_tmdb_id', true),
+        nativeTvdbId: int('native_tvdb_id', true),
+        nativeSeason: int('native_season', true),
+        nativeEpisode: int('native_episode', true),
+        nativeProvenance: {
+          name: 'native_provenance',
+          type: 'text',
+          nullable: true,
+        },
+        nativeObservedAt: date('native_observed_at', true),
       },
       uniques: [
         {
@@ -219,6 +312,14 @@ export function createCatalogueEntities(
         retryAfterAt: date('retry_after_at', true),
         errorCode: text('error_code', true),
         lastHttpStatus: int('last_http_status', true),
+        collectionState: {
+          name: 'collection_state',
+          type: 'text',
+          nullable: true,
+        },
+        nextRunAt: date('next_run_at', true),
+        leaseOwner: text('lease_owner', true),
+        leaseExpiresAt: date('lease_expires_at', true),
       },
       uniques: [
         {
@@ -229,6 +330,44 @@ export function createCatalogueEntities(
       foreignKeys: [
         fk(
           'FK_catalogue_sync_tracker',
+          catalogueEntityNames.tracker,
+          'trackerId'
+        ),
+      ],
+    }),
+    new EntitySchema<CatalogueDispatchState>({
+      name: catalogueEntityNames.dispatch,
+      tableName: 'tracker_dispatch',
+      schema,
+      columns: {
+        trackerId: { name: 'tracker_id', type: 'varchar', primary: true },
+        ...Object.fromEntries(
+          ['lastStart', 'maintenanceStart', 'cooldownUntil'].map((property) => [
+            property,
+            {
+              name: {
+                lastStart: 'last_start',
+                maintenanceStart: 'maintenance_start',
+                cooldownUntil: 'cooldown_until',
+              }[property],
+              type: 'bigint',
+              nullable: true,
+              transformer: {
+                to: (value: number | null) => value,
+                from: (value: string | number | null) =>
+                  value == null ? null : Number(value),
+              },
+            },
+          ])
+        ),
+        suspended: { type: 'boolean', default: false },
+        failures: { type: 'integer', default: 0 },
+        errorCode: text('error_code', true),
+        lastHttpStatus: int('last_http_status', true),
+      },
+      foreignKeys: [
+        fk(
+          'FK_catalogue_dispatch_tracker',
           catalogueEntityNames.tracker,
           'trackerId'
         ),
