@@ -22,7 +22,6 @@ import {
 import {
   DIAGNOSTIC_LIMIT,
   DIAGNOSTIC_RETENTION_MS,
-  REPAIR_PAGE_LIMIT,
   persistReleaseDiagnostics,
   retainDiagnostics,
 } from './collectionRepairs';
@@ -346,6 +345,71 @@ async function verify(
         } finally {
           finish.resolve();
           await recent;
+        }
+      }
+    );
+    await t.test(
+      'concurrent Recent and Historical continuity incidents keep independent identities and scheduling',
+      async () => {
+        const entered = deferred();
+        const finish = deferred();
+        const h = await setup(
+          async (req) => {
+            const mode = h.calls.at(-1)!.mode;
+            if (mode === 'historical' && req.offset === 80) {
+              entered.resolve();
+              await finish.promise;
+            }
+            return page(h.id, req.offset * 10);
+          },
+          { recentPageLimit: 2 }
+        );
+        await h.enable();
+        await h.tick();
+        const flight = h.collector.tick();
+        try {
+          await entered.promise;
+          const historical = await scope(h.id);
+          const other = new CatalogueCollector(db, [h.tracker], clock);
+          await other.initialize();
+          await other.enqueueRecent('movie');
+          now += 3000;
+          await other.tick();
+          now += 3000;
+          await other.tick();
+          const recent = await scope(h.id, 'recent');
+          assert.deepEqual(await scope(h.id), historical);
+          finish.resolve();
+          await flight;
+          assert.deepEqual(await scope(h.id, 'recent'), recent);
+          const rows = await db
+            .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+            .findBy({ trackerId: h.id, reason: 'abnormal_overlap' });
+          assert.equal(rows.length, 2);
+          assert.deepEqual(
+            new Set(rows.map((row) => row.mode)),
+            new Set(['recent', 'historical'])
+          );
+          assert.notEqual(rows[0].diagnosticKey, rows[1].diagnosticKey);
+          assert.ok(
+            rows.every(
+              (row) =>
+                row.occurrences === 1 &&
+                row.attempts === 0 &&
+                row.status === 'quarantined'
+            )
+          );
+          assert.equal(
+            readCollectionCheckpoint((await scope(h.id)).checkpoint)?.dirty,
+            false
+          );
+          assert.equal(
+            readCollectionState((await scope(h.id)).collectionState).coverage,
+            'partial'
+          );
+        } finally {
+          finish.resolve();
+          await flight;
         }
       }
     );
@@ -819,13 +883,22 @@ async function verify(
         const small = await measured();
         for (let start = 0; start < 4000; start += 100)
           await repository.insert(
-            Array.from({ length: 100 }, (_, index) =>
-              diagnosticFixture(
+            Array.from({ length: 100 }, (_, index) => ({
+              ...diagnosticFixture(
                 h.id,
                 100000 + start + index,
                 (start + index) % 2 ? 'recent' : 'historical'
-              )
-            )
+              ),
+              ...(start + index > 0 && (start + index) % 4 === 0
+                ? {
+                    kind: 'scope' as const,
+                    guid: null,
+                    releaseKey: null,
+                    reason: 'abnormal_overlap',
+                    field: 'page',
+                  }
+                : {}),
+            }))
           );
         const unrelated = await repository.findOneByOrFail({
           trackerId: h.id,
@@ -886,53 +959,329 @@ async function verify(
       }
     );
     await t.test(
-      'genuine failed region repairs remain bounded even when new source anomalies appear',
+      'large traversals with recurring overlap warnings finish once and remain partial after restart',
       async () => {
-        let id = '';
-        let repairing = false;
         const h = await setup(async (req) => {
-          if (req.offset >= 160) return page(id, req.offset, 0);
-          if (req.offset === 80) return page(id, 1080);
-          const bad = rejection(99999 + h.calls.length);
-          return repairing
-            ? {
-                ...page(id, 0),
-                receivedCount: 101,
-                anomalies: [bad],
-                rejections: [bad],
-              }
-            : page(id, 0);
+          if (req.offset >= 3200) return page(h.id, req.offset, 0);
+          const result = page(h.id, req.offset * 10);
+          if ((req.offset / 80) % 4 !== 3) return result;
+          const bad = rejection(90000 + req.offset);
+          return {
+            ...result,
+            receivedCount: 101,
+            anomalies: [bad],
+            rejections: [bad],
+          };
         });
-        id = h.id;
         await h.enable();
-        for (let i = 0; i < 5; i++) await h.tick();
-        repairing = true;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          now = (await scope(id)).nextRunAt!.getTime();
-          for (let i = 0; i < 5; i++) await h.tick(6000);
-          const region = await db
-            .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
-            .findOneByOrFail({ trackerId: id, reason: 'abnormal_overlap' });
-          assert.equal(region.attempts, attempt);
-          assert.equal(
-            region.status,
-            attempt === 3 ? 'quarantined' : 'unresolved'
-          );
-        }
+        for (let i = 0; i < 43; i++) await h.tick();
+        assert.equal(h.calls.length, 43);
+        assert.equal(h.calls.filter((call) => call.offset === 0).length, 1);
+        const finished = await scope(h.id);
+        assert.equal(finished.phase, 'complete');
+        assert.equal(finished.nextRunAt, null);
+        const cp = readCollectionCheckpoint(finished.checkpoint)!;
+        assert.equal(cp.done, true);
+        assert.equal(cp.dirty, false);
         assert.equal(
-          readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
-          false
-        );
-        assert.equal(
-          readCollectionState((await scope(id)).collectionState).coverage,
+          readCollectionState(finished.collectionState).coverage,
           'partial'
         );
-        assert.equal((await scope(id)).nextRunAt, null);
+        const incidents = await db
+          .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+          .findBy({ trackerId: h.id, kind: 'scope' });
+        assert.equal(incidents.length, 2);
+        assert.deepEqual(
+          new Set(incidents.map((row) => row.reason)),
+          new Set(['abnormal_overlap', 'source_data_overlap'])
+        );
+        assert.equal(
+          incidents.reduce((total, row) => total + row.occurrences, 0),
+          39
+        );
+        assert.ok(
+          incidents.every(
+            (row) => row.attempts === 0 && row.status === 'quarantined'
+          )
+        );
+        assert.equal(
+          await db
+            .getRepository(names.diagnostic)
+            .countBy({ trackerId: h.id, kind: 'release' }),
+          10
+        );
+        await db.destroy();
+        db = createCatalogueDataSource(connection);
+        await db.initialize();
+        const resumed = new CatalogueCollector(db, [h.tracker], clock);
+        await resumed.initialize();
+        for (let i = 0; i < 5; i++) {
+          now += 86400000;
+          assert.equal(await resumed.tick(), false);
+          await resumed.initialize();
+        }
+        assert.deepEqual(await scope(h.id), finished);
+        assert.equal(h.calls.length, 43);
+      }
+    );
+    await t.test(
+      'independent overlap episodes preserve their own identity and quarantined history across moving offsets',
+      async () => {
+        const starts = [0, 1000, 2000, 2080, 5000, 6000];
+        const h = await setup(async (req) =>
+          req.offset / 80 < starts.length
+            ? page(h.id, starts[req.offset / 80])
+            : page(h.id, req.offset, 0)
+        );
+        await h.enable();
+        await h.tick();
+        await h.tick();
+        const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+          names.diagnostic
+        );
+        const first = await repository.findOneByOrFail({
+          trackerId: h.id,
+          reason: 'abnormal_overlap',
+        });
+        await repository.update(first.id, {
+          attempts: 3,
+          lastOutcome: 'repair_budget_exhausted',
+        });
+        await h.tick();
+        const repeat = await repository.findOneByOrFail({ id: first.id });
+        assert.equal(repeat.occurrences, 2);
+        assert.equal(repeat.firstSeenAt.getTime(), first.firstSeenAt.getTime());
+        assert.ok(repeat.lastSeenAt > first.lastSeenAt);
+        assert.equal(repeat.attempts, 3);
+        assert.equal(repeat.lastOutcome, 'repair_budget_exhausted');
+        await h.tick(); // Usable continuity separates episodes, without resolving the old gap.
+        const unchanged = await repository.findOneByOrFail({ id: first.id });
+        const other = new CatalogueCollector(db, [h.tracker], clock);
+        await other.initialize();
+        await Promise.all([h.collector.tick(), other.tick()]);
+        now += 3000;
+        const rows = await repository.find({
+          where: { trackerId: h.id, reason: 'abnormal_overlap' },
+          order: { id: 'ASC' },
+        });
+        assert.equal(rows.length, 2);
+        assert.notEqual(rows[0].diagnosticKey, rows[1].diagnosticKey);
+        assert.deepEqual(rows[0], unchanged);
+        assert.equal(rows[1].attempts, 0);
+        assert.equal(rows[1].occurrences, 1);
+        assert.equal(rows[1].status, 'quarantined');
+        await other.tick();
+        now += 3000;
+        assert.equal(
+          (await repository.findOneByOrFail({ id: rows[1].id })).occurrences,
+          2
+        );
+        assert.equal(await repository.countBy({ trackerId: h.id }), 2);
+        assert.deepEqual(
+          h.calls.map((call) => call.offset),
+          [0, 80, 160, 240, 320, 400]
+        );
+      }
+    );
+    await t.test(
+      'independent repeated-page incidents do not inherit quarantine and resolve only their own pending page after restart',
+      async () => {
+        let phase = 'first';
+        const h = await setup(
+          async (req) => {
+            if (req.offset === 0) return page(h.id, 0);
+            if (req.offset === 80)
+              return phase === 'first' ? page(h.id, 0) : page(h.id, 1080);
+            if (req.offset === 160)
+              return phase === 'second' ? page(h.id, 1080) : page(h.id, 1160);
+            return page(h.id, req.offset, 0);
+          },
+          { failureLimit: 2 }
+        );
+        await h.enable();
+        await h.tick();
+        await h.tick();
+        const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+          names.diagnostic
+        );
+        const first = await repository.findOneByOrFail({
+          trackerId: h.id,
+          reason: 'repeated_page',
+        });
+        assert.equal(first.attempts, 1);
+        assert.equal(first.status, 'unresolved');
+        now = (await scope(h.id)).retryAfterAt!.getTime();
+        await h.tick();
+        const exhausted = await repository.findOneByOrFail({ id: first.id });
+        assert.equal(exhausted.attempts, 2);
+        assert.equal(exhausted.occurrences, 2);
+        assert.equal(exhausted.status, 'quarantined');
+        assert.equal(exhausted.lastOutcome, 'retry_budget_exhausted');
+        assert.equal(
+          readCollectionCheckpoint((await scope(h.id)).checkpoint)?.dirty,
+          false
+        );
         const calls = h.calls.length;
         now += 86400000;
         await h.collector.initialize();
         assert.equal(await h.collector.tick(), false);
         assert.equal(h.calls.length, calls);
+        phase = 'second';
+        await h.collector.store.recover(h.id, 2000, 'historical');
+        await h.tick(); // A usable but uncertain response ends the first episode.
+        const old = await repository.findOneByOrFail({ id: first.id });
+        assert.equal(old.status, 'quarantined');
+        assert.equal(old.attempts, 2);
+        await h.tick();
+        const incidents = await repository.find({
+          where: { trackerId: h.id, reason: 'repeated_page' },
+          order: { id: 'ASC' },
+        });
+        assert.equal(incidents.length, 2);
+        const independent = incidents[1];
+        assert.notEqual(independent.diagnosticKey, first.diagnosticKey);
+        assert.equal(independent.status, 'unresolved');
+        assert.equal(independent.attempts, 1);
+        assert.equal(independent.occurrences, 1);
+        assert.deepEqual(
+          await repository.findOneByOrFail({ id: first.id }),
+          old
+        );
+        await db.destroy();
+        db = createCatalogueDataSource(connection);
+        await db.initialize();
+        const resumed = new CatalogueCollector(db, [h.tracker], clock);
+        const concurrent = new CatalogueCollector(db, [h.tracker], clock);
+        await resumed.initialize();
+        await concurrent.initialize();
+        phase = 'valid';
+        now = (await scope(h.id)).retryAfterAt!.getTime();
+        const before = h.calls.length;
+        await Promise.all([resumed.tick(), concurrent.tick()]);
+        assert.equal(h.calls.length, before + 1);
+        const restartedRepository =
+          db.getRepository<CatalogueReleaseDiagnostic>(names.diagnostic);
+        const resolved = await restartedRepository.findOneByOrFail({
+          id: independent.id,
+        });
+        assert.equal(resolved.status, 'resolved');
+        assert.equal(resolved.attempts, 1);
+        assert.equal(
+          resolved.firstSeenAt.getTime(),
+          independent.firstSeenAt.getTime()
+        );
+        assert.deepEqual(
+          await restartedRepository.findOneByOrFail({ id: first.id }),
+          old
+        );
+        assert.equal(
+          readCollectionState((await scope(h.id)).collectionState).coverage,
+          'partial'
+        );
+        // A stale pointer to resolved history must not reuse its dates or counters.
+        const recovered = await scope(h.id);
+        const cp = readCollectionCheckpoint(recovered.checkpoint)!;
+        cp.incidentKeys = { repeated_page: resolved.diagnosticKey };
+        await db
+          .getRepository(names.sync)
+          .update(recovered.id, { checkpoint: JSON.stringify(cp) });
+        h.adapter.fetchHistoricalPage = async () => page(h.id, 1160);
+        now += 3000;
+        await resumed.tick();
+        const newest = await restartedRepository.findOneOrFail({
+          where: { trackerId: h.id, reason: 'repeated_page' },
+          order: { id: 'DESC' },
+        });
+        assert.notEqual(newest.diagnosticKey, resolved.diagnosticKey);
+        assert.equal(newest.status, 'unresolved');
+        assert.equal(newest.attempts, 1);
+        assert.equal(newest.occurrences, 1);
+        assert.equal(newest.firstSeenAt.getTime(), now);
+        assert.deepEqual(
+          await restartedRepository.findOneByOrFail({ id: resolved.id }),
+          resolved
+        );
+      }
+    );
+    await t.test(
+      'pending repeated-page incidents retain bounded request and unusable-page recovery and require confirmed terminal emptiness',
+      async () => {
+        for (const recovery of ['request', 'unusable', 'empty']) {
+          let repeat = true;
+          const h = await setup(
+            async (req) => {
+              if (req.offset === 0) return page(h.id, 0);
+              if (repeat) {
+                repeat = false;
+                return page(h.id, 0);
+              }
+              if (recovery === 'request') throw httpError(503);
+              if (recovery === 'unusable') {
+                const bad = rejection(999);
+                return {
+                  ...page(h.id, req.offset, 0),
+                  receivedCount: 1,
+                  contractStatus: 'incompatible',
+                  anomalies: [bad],
+                  rejections: [bad],
+                };
+              }
+              return page(h.id, req.offset, 0);
+            },
+            { failureLimit: 2 }
+          );
+          await h.enable();
+          await h.tick();
+          await h.tick();
+          now = (await scope(h.id)).retryAfterAt!.getTime();
+          await h.tick();
+          const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+            names.diagnostic
+          );
+          const row = await repository.findOneByOrFail({
+            trackerId: h.id,
+            reason: 'repeated_page',
+          });
+          const waiting = await scope(h.id);
+          assert.equal(
+            readCollectionCheckpoint(waiting.checkpoint)?.nextOffset,
+            80
+          );
+          if (recovery === 'empty') {
+            assert.equal(row.status, 'unresolved');
+            assert.equal(
+              readCollectionCheckpoint(waiting.checkpoint)?.dirty,
+              true
+            );
+            await h.tick();
+            await h.tick();
+            const resolved = await repository.findOneByOrFail({ id: row.id });
+            assert.equal(resolved.status, 'resolved');
+            assert.equal(resolved.lastOutcome, 'verified_collection');
+            assert.equal(
+              readCollectionCheckpoint((await scope(h.id)).checkpoint)?.done,
+              true
+            );
+            assert.equal((await scope(h.id)).nextRunAt, null);
+          } else {
+            assert.equal(waiting.status, 'suspended');
+            assert.equal(row.status, 'quarantined');
+            assert.equal(row.lastOutcome, 'retry_budget_exhausted');
+            assert.equal(row.nextAttemptAt, null);
+            assert.equal(
+              readCollectionCheckpoint(waiting.checkpoint)?.dirty,
+              false
+            );
+            assert.equal(
+              readCollectionState(waiting.collectionState).coverage,
+              'partial'
+            );
+            now += 86400000;
+            await h.collector.initialize();
+            assert.equal(await h.collector.tick(), false);
+            assert.equal(h.calls.length, 3);
+          }
+        }
       }
     );
     await t.test(
@@ -1057,34 +1406,32 @@ async function verify(
       }
     );
     await t.test(
-      'repair requests preserve Recent priority, concurrent ownership, Retry-After and maintenance spacing',
+      'pending page recovery preserves Recent priority, concurrent ownership and Retry-After without restarting Historical',
       async () => {
-        let id = '';
-        let repair = false;
+        let repeat = true;
         let fail = true;
         const h = await setup(
           async (req) => {
             if (h.calls.at(-1)?.mode === 'recent')
-              return {
-                ...page(id, req.offset),
-                records: page(id, req.offset + 1000).records,
-              };
-            if (repair && fail) {
+              return page(h.id, req.offset + 5000);
+            if (req.offset === 80 && repeat) {
+              repeat = false;
+              return page(h.id, 0);
+            }
+            if (req.offset === 80 && fail) {
               fail = false;
               throw httpError(429, '120');
             }
-            if (req.offset >= 160) return page(id, req.offset, 0);
-            if (req.offset === 80 && !repair) return page(id, 1080);
-            if (req.offset) return page(id, req.offset, 0);
-            return repair ? page(id, 0, 3) : page(id, 0);
+            return req.offset >= 160
+              ? page(h.id, req.offset, 0)
+              : page(h.id, req.offset);
           },
           { recentPageLimit: 2 }
         );
-        id = h.id;
         await h.enable();
-        for (let i = 0; i < 5; i++) await h.tick();
-        now = (await scope(id)).nextRunAt!.getTime();
-        repair = true;
+        await h.tick();
+        await h.tick();
+        now = (await scope(h.id)).retryAfterAt!.getTime();
         const other = new CatalogueCollector(db, [h.tracker], clock);
         await other.initialize();
         await h.collector.enqueueRecent('movie');
@@ -1097,93 +1444,109 @@ async function verify(
         assert.equal(h.calls.at(-1)?.mode, 'recent');
         now += 3000;
         await h.collector.tick();
-        const failed = await scope(id);
+        const failed = await scope(h.id);
         assert.equal(failed.status, 'backoff');
         assert.equal(failed.retryAfterAt!.getTime(), now + 120000);
-        const attempts = await db
-          .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
-          .findOneByOrFail({
-            trackerId: id,
-            kind: 'scope',
-            reason: 'abnormal_overlap',
-          });
-        assert.equal(attempts.attempts, 1);
+        assert.equal(
+          readCollectionCheckpoint(failed.checkpoint)?.nextOffset,
+          80
+        );
         now += 119999;
         assert.equal(await other.tick(), false);
         now++;
         await other.tick();
-        assert.equal(h.calls.at(-1)?.offset, 0);
-        const retried = h.calls.length;
-        now += 3000;
-        assert.equal(await h.collector.tick(), false);
-        assert.equal(h.calls.length, retried);
-        now += 3000;
-        await other.tick();
-        assert.equal(h.calls.length, retried + 1);
+        assert.equal(h.calls.at(-1)?.offset, 80);
+        const recovered = await db
+          .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
+          .findOneByOrFail({ trackerId: h.id, reason: 'repeated_page' });
+        assert.equal(recovered.status, 'resolved');
+        assert.deepEqual(
+          h.calls
+            .filter((call) => call.mode === 'historical')
+            .map((call) => call.offset),
+          [0, 80, 80, 80]
+        );
       }
     );
     await t.test(
-      'a repair scan stops at its page budget and never turns an unverified region into observed coverage',
+      'persisted overlap-driven repairs retire before requests without losing uncertainty or exhausted history',
       async () => {
-        const h = await setup();
-        await h.enable();
-        await h.tick();
-        const stored = await scope(h.id);
-        const cp = readCollectionCheckpoint(stored.checkpoint)!;
-        cp.pages = REPAIR_PAGE_LIMIT - 1;
-        cp.repairRun = true;
-        cp.maintenance = true;
-        cp.startedAt = now;
-        await h.collector.store.write(async (manager) => {
-          await persistReleaseDiagnostics(manager, stored, [], [], now, {
-            region: 'abnormal_overlap',
-          });
-          await manager.getRepository(names.diagnostic).update(
-            { trackerId: h.id, reason: 'abnormal_overlap' },
-            {
-              attempts: 3,
-              lastAttemptCycle: stored.cycleId,
-              lastOutcome: 'scanning',
-            }
+        for (const running of [false, true]) {
+          const h = await setup();
+          await h.enable();
+          await h.tick();
+          const stored = await scope(h.id);
+          const cp = readCollectionCheckpoint(stored.checkpoint)!;
+          cp.repairRun = running;
+          cp.done = !running;
+          cp.dirty = true;
+          cp.pages = 9999;
+          const old = {
+            ...diagnosticFixture(h.id, 99),
+            kind: 'scope' as const,
+            guid: null,
+            releaseKey: null,
+            diagnosticKey: 'scope:abnormal_overlap',
+            field: 'page',
+            reason: 'abnormal_overlap',
+            status: running
+              ? ('unresolved' as const)
+              : ('quarantined' as const),
+            attempts: 3,
+            nextAttemptAt: new Date(now),
+            lastOutcome: running ? 'scanning' : 'repair_budget_exhausted',
+          };
+          const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+            names.diagnostic
           );
-        });
-        await db.getRepository(names.sync).update(stored.id, {
-          checkpoint: JSON.stringify(cp),
-          phase: 'repair',
-        });
-        now += 6000;
-        await h.collector.tick();
-        const finished = await scope(h.id);
-        assert.equal(readCollectionCheckpoint(finished.checkpoint)?.done, true);
-        assert.equal(
-          readCollectionCheckpoint(finished.checkpoint)?.dirty,
-          false
-        );
-        assert.equal(
-          readCollectionState(finished.collectionState).coverage,
-          'partial'
-        );
-        assert.equal(
-          (
-            await db
-              .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
-              .findOneByOrFail({
-                trackerId: h.id,
-                reason: 'scan_budget_exhausted',
-              })
-          ).status,
-          'quarantined'
-        );
-        assert.equal(finished.nextRunAt, null);
-        assert.equal(
-          (
-            await db
-              .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
-              .findOneByOrFail({ trackerId: h.id, reason: 'abnormal_overlap' })
-          ).status,
-          'quarantined',
-          'A page budget is not verification of the original region'
-        );
+          await repository.insert(old);
+          await db.getRepository(names.sync).update(stored.id, {
+            checkpoint: JSON.stringify(cp),
+            phase: 'repair',
+            nextRunAt: new Date(now),
+            collectionState: JSON.stringify({
+              ...readCollectionState(stored.collectionState),
+              repairVersion: 2,
+              coverage: 'partial',
+            }),
+          });
+          const resumed = new CatalogueCollector(db, [h.tracker], clock);
+          await resumed.initialize();
+          assert.equal(await resumed.tick(), false);
+          const finished = await scope(h.id);
+          assert.equal(finished.phase, 'complete');
+          assert.equal(finished.nextRunAt, null);
+          assert.equal(
+            readCollectionCheckpoint(finished.checkpoint)?.done,
+            true
+          );
+          assert.equal(
+            readCollectionCheckpoint(finished.checkpoint)?.dirty,
+            false
+          );
+          assert.equal(
+            readCollectionCheckpoint(finished.checkpoint)?.nextOffset,
+            cp.nextOffset
+          );
+          assert.equal(
+            readCollectionCheckpoint(finished.checkpoint)?.terminalOffset,
+            null
+          );
+          assert.equal(
+            readCollectionState(finished.collectionState).coverage,
+            'partial'
+          );
+          const incident = await repository.findOneByOrFail({
+            trackerId: h.id,
+          });
+          assert.equal(incident.attempts, 3);
+          assert.equal(incident.occurrences, 1);
+          assert.equal(incident.status, 'quarantined');
+          now += 86400000;
+          await resumed.initialize();
+          assert.equal(await resumed.tick(), false);
+          assert.equal(h.calls.length, 1);
+        }
       }
     );
     await t.test(
@@ -1430,6 +1793,89 @@ async function verify(
         assert.equal(
           readCollectionState((await scope(id)).collectionState).coverage,
           'observed'
+        );
+      }
+    );
+    await t.test(
+      'scope incident history has bounded retention without losing uncertainty or loading unrelated history per page',
+      async () => {
+        const h = await setup();
+        await h.enable();
+        await h.tick();
+        const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+          names.diagnostic
+        );
+        for (let start = 0; start < DIAGNOSTIC_LIMIT + 2; start += 100) {
+          await repository.insert(
+            Array.from(
+              { length: Math.min(100, DIAGNOSTIC_LIMIT + 2 - start) },
+              (_, index) => ({
+                ...diagnosticFixture(h.id, start + index),
+                kind: 'scope' as const,
+                guid: null,
+                releaseKey: null,
+                diagnosticKey: `scope:abnormal_overlap:${randomUUID()}`,
+                field: 'page',
+                reason: 'abnormal_overlap',
+              })
+            )
+          );
+        }
+        const current = await scope(h.id);
+        const oldest = await repository.findOneOrFail({
+          where: { trackerId: h.id },
+          order: { id: 'ASC' },
+        });
+        const active = readCollectionCheckpoint(current.checkpoint)!;
+        active.incidentKeys = { abnormal_overlap: oldest.diagnosticKey };
+        current.checkpoint = JSON.stringify(active);
+        await h.collector.store.write(async (manager) => {
+          await retainDiagnostics(manager, current, now);
+          await saveSyncCheckpoint(manager, current);
+        });
+        assert.equal(
+          await repository.countBy({
+            trackerId: h.id,
+            reason: 'abnormal_overlap',
+          }),
+          DIAGNOSTIC_LIMIT
+        );
+        const marker = await repository.findOneByOrFail({
+          trackerId: h.id,
+          reason: 'retention_uncertainty',
+        });
+        assert.equal(marker.status, 'quarantined');
+        assert.deepEqual(
+          await repository.findOneByOrFail({ id: oldest.id }),
+          oldest
+        );
+        const progress = readCollectionCheckpoint(current.checkpoint)!;
+        progress.done = true;
+        await h.collector.store.write(async (manager) => {
+          const updated = await persistReleaseDiagnostics(
+            manager,
+            { ...current, checkpoint: JSON.stringify(progress) },
+            [],
+            [],
+            now
+          );
+          await saveSyncCheckpoint(manager, updated);
+        });
+        assert.equal(
+          readCollectionState((await scope(h.id)).collectionState).coverage,
+          'partial'
+        );
+        assert.equal(
+          readCollectionCheckpoint((await scope(h.id)).checkpoint)?.dirty,
+          false
+        );
+        assert.equal(
+          await repository.countBy({ trackerId: h.id }),
+          DIAGNOSTIC_LIMIT + 1
+        );
+        assert.deepEqual(
+          await repository.findOneByOrFail({ id: marker.id }),
+          marker
         );
       }
     );
@@ -2111,7 +2557,7 @@ async function verify(
       }
     );
     await t.test(
-      'broken or reordered continuity remains partial across restart; a clean later pass repairs coverage',
+      'broken or reordered continuity remains partial across restart and explicitly configured maintenance',
       async () => {
         for (const reordered of [false, true]) {
           let id = '';
@@ -2140,7 +2586,7 @@ async function verify(
           await h.tick();
           assert.equal(
             readCollectionCheckpoint((await scope(id)).checkpoint)?.dirty,
-            true
+            false
           );
           await db.destroy();
           db = createCatalogueDataSource(connection);
@@ -2167,7 +2613,8 @@ async function verify(
             now += 6000;
           }
           const state = readCollectionState((await scope(id)).collectionState);
-          assert.equal(state.coverage, 'observed');
+          assert.equal(state.coverage, 'partial');
+          assert.equal(h.calls.filter((call) => call.offset === 0).length, 2);
           assert.ok(
             state.diagnostics.some((d) => d.code === 'abnormal_overlap')
           );

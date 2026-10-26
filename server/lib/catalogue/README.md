@@ -268,14 +268,15 @@ survive normal restarts; credential rotation conservatively leaves earlier opaqu
 diagnostics unresolved. Titles are checked before truncation to 256 characters;
 known secrets, request/download URLs, encoded unsafe values and XML are withheld.
 
-Storage is bounded to 5,000 release diagnostics per tracker/category/mode, plus a
-fixed set of scope repair causes. Resolved history expires 30 days after resolution.
+Storage is bounded to 5,000 release diagnostics and 5,000 collection incidents per
+tracker/category/mode, plus one aggregate lost-evidence marker. Resolved history
+expires 30 days after resolution. Active episode rows are protected from capacity eviction.
 Capacity eviction prefers resolved history. Evicting unresolved critical evidence
 creates a quarantined scope marker that permanently retains its coverage uncertainty;
 it cannot silently turn missing diagnostic history into proof of complete coverage.
 Neither evicted evidence nor a reappearing release diagnostic creates a repair job.
 
-For Historical, `dirty` means an actionable collection-region repair remains
+For Historical, `dirty` means an actionable pending-page incident remains
 `unresolved`. Source-data rejections are immediately `quarantined`, with outcome
 `source_data_unrepairable`, no retry date and no new repair attempts. They still
 affect coverage; quarantine does not mean the release was repaired or absent.
@@ -287,34 +288,34 @@ with the affected field validated and no corresponding rejection. Matching a
 different GUID by hash, or failing to find the old release, never resolves it.
 Such evidence comes from normal collection or explicitly configured maintenance;
 an individual rejected release never schedules another API request or full scan.
-A complete clean rescan can verify an explicitly recorded continuity region;
-unknown legacy gaps, unidentified releases and evicted evidence cannot be resolved
-by their absence from a scan. Independent issues retain independent states.
+Pagination warnings (`abnormal_overlap`, filtered overlap, changed pagination and
+invalid checkpoint context) do not prove an actionable, bounded collection gap.
+They remain quarantined coverage uncertainty, without dedicated requests or scans.
+A later clean traversal does not silently resolve unrelated continuity incidents.
 
-Automatic region recovery requires a scoped collection failure: broken continuity,
-a repeated page, changed pagination or an invalid checkpoint. Eligibility requires
-an unresolved scope cause, an available attempt budget and a due retry date; an
-in-progress attempt resumes its committed checkpoint. `coverage=partial` alone
-never creates that obligation. A repeated page is retried at its pending checkpoint;
-successful continuity there resolves that page failure without another full pass.
-Unusable responses retain bounded same-offset backoff and suspension. Filtered
-source data cannot, by itself, create an actionable missing-region diagnosis.
+Recoverable failures retry the pending page, with the existing configured failure
+limit, exponential backoff, Retry-After, leases, quota and suspension. Repeated-page
+incidents record that page's retry state and resolve only when its pending response
+has valid continuity, or its emptiness is confirmed by the normal terminal policy.
+A usable but uncertain recovery retains quarantine; exhaustion is never coverage
+evidence. No currently recorded warning justifies a separate full Historical pass.
+Only an explicitly configured maintenance interval starts another normal traversal.
+`dirty=false, coverage=partial` is a valid durable terminal state.
 
-Genuine incomplete regions can use the existing Historical scope for at most three
-controlled rescans, even with periodic maintenance disabled. Each rescan has a
-10,000-page budget and bounded 30–900 second exponential backoff. Attempts, cycle,
-next execution and outcome are durable. Existing leases, fences, Recent priority,
-shared tracker quotas, 6-second repair spacing and Retry-After remain authoritative.
-New release anomalies do not reset or extend that region repair budget.
+Collection incidents use opaque episode keys persisted in the checkpoint, within
+tracker/category/mode. Consecutive same-reason observations share that episode even
+as offsets move. Healthy continuity ends overlap episodes; advancing a pending
+page ends its retry episode. A new ordinary cycle also separates episodes; a later incident gets a fresh key and independent retry history.
+These are observation boundaries, not inferred release identities or missing ranges.
+Quarantined episodes remain visible without rearming their budget. Resolution is
+limited to the active repeated-page incident; other history is left untouched.
+Active keys are bounded, and persistence looks up only those keys, not all incidents.
 
-After verified repair, only the addressed issue becomes `resolved`. After bounded
-unsuccessful attempts it becomes `quarantined`; this stops automatic repair while
-retaining uncertainty. Thus `dirty=false, coverage=partial` is an intentional durable
-state. `observed` requires a verified completed scan without remaining critical
-uncertainty. Repair-state version 2 retires old release-driven repair jobs and
-unproven legacy obligations without losing their uncertainty or occurrence history.
-Clean unfinished scans and genuine pending region repairs retain their checkpoints.
-Cancelled old rescans are technical stops, never fabricated terminal-empty evidence.
+Repair-state version 3 retires persisted full-scan obligations, preserving old
+identities, counters, quarantines and coverage uncertainty. In-progress obsolete
+rescans stop before another request, retaining their offset without inventing
+terminal-empty evidence. Ordinary unfinished traversals keep their checkpoints;
+request and unusable-page retries retain their existing bounded recovery behavior.
 
 Diagnostic reads, aggregates, retention, repair eligibility and counters are scoped
 by tracker/category/mode. Recent never schedules Historical repairs, or conversely.

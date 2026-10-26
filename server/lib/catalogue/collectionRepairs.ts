@@ -9,6 +9,7 @@ import { In, LessThan, Not } from 'typeorm';
 import {
   readCollectionCheckpoint,
   readCollectionState,
+  type CollectionCheckpoint,
 } from './collectionState';
 import { catalogueEntityNames as names } from './entities';
 import type {
@@ -17,20 +18,10 @@ import type {
   SyncCheckpoint,
 } from './types';
 
-export const REPAIR_ATTEMPT_LIMIT = 3;
-export const REPAIR_PAGE_LIMIT = 10000;
 export const DIAGNOSTIC_LIMIT = 5000;
 export const DIAGNOSTIC_RETENTION_MS = 30 * 86400000;
 const BATCH_SIZE = 100;
 const WRITE_BATCH_SIZE = 20;
-const actionableReasons = [
-  'abnormal_overlap',
-  'repeated_page',
-  'pagination_changed',
-  'invalid_checkpoint',
-];
-const delay = (attempts: number) =>
-  Math.min(900000, 30000 * 2 ** Math.max(0, attempts - 1));
 export const criticalRejection = (
   a: Pick<TrackerAnomaly, 'field' | 'code'>
 ): boolean =>
@@ -43,23 +34,40 @@ const scopeOf = (scope: SyncCheckpoint) => ({
   mode: scope.mode,
 });
 
+// A key identifies one observation episode, not a reason, page or moving offset.
+// Consecutive observations retain it until a usable page separates the episodes.
 async function issue(
   manager: EntityManager,
   scope: SyncCheckpoint,
+  cp: CollectionCheckpoint | null,
   now: number,
   reason: string,
-  offset?: number
+  offset?: number,
+  retrying = false
 ): Promise<void> {
   const repository = manager.getRepository<CatalogueReleaseDiagnostic>(
     names.diagnostic
   );
-  const where = { ...scopeOf(scope), diagnosticKey: `scope:${reason}` };
-  const old = await repository.findOneBy(where);
-  const actionable = actionableReasons.includes(reason);
-  const recurring = old && old.status !== 'resolved';
+  const keys = cp ? (cp.incidentKeys ??= {}) : {};
+  const key = keys[reason];
+  const previous = key
+    ? await repository.findOneBy({ ...scopeOf(scope), diagnosticKey: key })
+    : null;
+  const old =
+    previous?.status !== 'resolved' && previous?.reason === reason
+      ? previous
+      : null;
+  const diagnosticKey = old?.diagnosticKey ?? `scope:${reason}:${randomUUID()}`;
+  keys[reason] = diagnosticKey;
+  const actionable = reason === 'repeated_page' && retrying;
+  const quarantined =
+    old?.status === 'quarantined' ||
+    !actionable ||
+    scope.status === 'suspended';
   await repository.upsert(
     {
-      ...where,
+      ...scopeOf(scope),
+      diagnosticKey,
       kind: 'scope',
       releaseKey: null,
       guid: null,
@@ -73,51 +81,42 @@ async function issue(
       firstSeenAt: old?.firstSeenAt ?? new Date(now),
       lastSeenAt: new Date(now),
       occurrences: Math.min(2147483647, (old?.occurrences ?? 0) + 1),
-      status: recurring
-        ? old.status
-        : actionable
-          ? 'unresolved'
-          : 'quarantined',
-      attempts: recurring ? old.attempts : 0,
-      nextAttemptAt: recurring
-        ? old.nextAttemptAt
-        : actionable
-          ? new Date(now + delay(0))
-          : null,
-      lastAttemptCycle: recurring ? old.lastAttemptCycle : null,
-      lastOutcome: recurring
-        ? old.lastOutcome
-        : actionable
-          ? 'pending'
-          : 'non_repairable_uncertainty',
+      status: quarantined ? 'quarantined' : 'unresolved',
+      attempts: Math.min(
+        2147483647,
+        (old?.attempts ?? 0) +
+          (actionable && old?.status !== 'quarantined' ? 1 : 0)
+      ),
+      nextAttemptAt: quarantined ? null : scope.retryAfterAt,
+      lastAttemptCycle: actionable
+        ? scope.cycleId
+        : (old?.lastAttemptCycle ?? null),
+      lastOutcome:
+        old?.status === 'quarantined'
+          ? old.lastOutcome
+          : actionable
+            ? quarantined
+              ? 'retry_budget_exhausted'
+              : 'retrying_page'
+            : 'non_repairable_uncertainty',
       resolvedAt: null,
       offset:
-        reason === 'repeated_page' && offset != null && offset <= 2147483647
-          ? offset
-          : (old?.offset ?? null),
+        offset != null && offset <= 2147483647 ? offset : (old?.offset ?? null),
       itemPosition: null,
     },
     ['trackerId', 'categoryId', 'mode', 'diagnosticKey']
   );
 }
 
-// SQL aggregates, scoped by mode, never materialize the category's release history.
+// SQL aggregates, scoped by mode, never materialize the category's history.
 async function summary(manager: EntityManager, scope: SyncCheckpoint) {
-  const repository = manager.getRepository<CatalogueReleaseDiagnostic>(
-    names.diagnostic
-  );
-  const pending =
-    "diagnostic.kind = 'scope' AND diagnostic.status = 'unresolved' AND diagnostic.reason IN (:...reasons)";
-  const raw = await repository
+  const raw = await manager
+    .getRepository<CatalogueReleaseDiagnostic>(names.diagnostic)
     .createQueryBuilder('diagnostic')
     .select('COUNT(*)', 'uncertain')
     .addSelect(
-      `COALESCE(SUM(CASE WHEN ${pending} THEN 1 ELSE 0 END),0)`,
+      "COALESCE(SUM(CASE WHEN diagnostic.kind = 'scope' AND diagnostic.status = 'unresolved' AND diagnostic.reason = 'repeated_page' THEN 1 ELSE 0 END),0)",
       'pending'
-    )
-    .addSelect(
-      `MIN(CASE WHEN ${pending} THEN diagnostic.next_attempt_at END)`,
-      'next'
     )
     .where(
       'diagnostic.tracker_id = :tracker AND diagnostic.category_id = :category AND diagnostic.mode = :mode',
@@ -131,20 +130,28 @@ async function summary(manager: EntityManager, scope: SyncCheckpoint) {
       'diagnostic.critical = :critical AND diagnostic.status <> :resolved',
       { critical: true, resolved: 'resolved' }
     )
-    .setParameter('reasons', actionableReasons)
     .getRawOne();
-  const next: Date | null =
-    raw.next == null
-      ? null
-      : manager.connection.driver.prepareHydratedValue(
-          raw.next,
-          repository.metadata.findColumnWithPropertyName('nextAttemptAt')!
-        );
-  return {
-    uncertain: Number(raw.uncertain),
-    pending: Number(raw.pending),
-    next,
-  };
+  return { uncertain: Number(raw.uncertain), pending: Number(raw.pending) };
+}
+
+async function deferPendingPage(
+  manager: EntityManager,
+  checkpoint: SyncCheckpoint,
+  cp: CollectionCheckpoint
+) {
+  const key = cp.incidentKeys?.repeated_page;
+  if (!key || !['backoff', 'suspended'].includes(checkpoint.status)) return;
+  const suspended = checkpoint.status === 'suspended';
+  await manager.getRepository(names.diagnostic).update(
+    { ...scopeOf(checkpoint), diagnosticKey: key, status: 'unresolved' },
+    suspended
+      ? {
+          status: 'quarantined',
+          nextAttemptAt: null,
+          lastOutcome: 'retry_budget_exhausted',
+        }
+      : { nextAttemptAt: checkpoint.retryAfterAt }
+  );
 }
 
 function maintenanceAt(
@@ -159,8 +166,8 @@ function maintenanceAt(
       );
 }
 
-// Runs before the existing final SQL request permit, under its page fence or
-// initialization tracker lock. Version 2 retires old release-driven repair jobs.
+// Runs under the existing page fence or initialization tracker lock. Version 3
+// retires full rescans: none of the recorded warnings proves a bounded gap.
 export async function prepareRepairs(
   manager: EntityManager,
   checkpoint: SyncCheckpoint,
@@ -173,14 +180,7 @@ export async function prepareRepairs(
   );
   const cp = readCollectionCheckpoint(checkpoint.checkpoint);
   const state = readCollectionState(checkpoint.collectionState);
-  const upgrading = state.repairVersion !== 2;
-  if (
-    !state.repairVersion &&
-    checkpoint.mode === 'historical' &&
-    cp &&
-    (cp.dirty || (cp.done && state.coverage === 'partial'))
-  )
-    await issue(manager, checkpoint, now, 'legacy_uncertainty');
+  const upgrading = state.repairVersion !== 3;
   if (upgrading) {
     await repository.update(
       { ...scopeOf(checkpoint), kind: 'release', status: 'unresolved' },
@@ -191,92 +191,49 @@ export async function prepareRepairs(
       }
     );
     await repository.update(
-      {
-        ...scopeOf(checkpoint),
-        kind: 'scope',
-        status: 'unresolved',
-        reason: Not(In(actionableReasons)),
-      },
+      { ...scopeOf(checkpoint), kind: 'scope', status: 'unresolved' },
       {
         status: 'quarantined',
         nextAttemptAt: null,
-        lastOutcome: 'non_repairable_uncertainty',
+        lastOutcome: 'unbounded_repair_retired',
       }
     );
-    state.repairVersion = 2;
+    state.repairVersion = 3;
   }
   if (!cp) return { ...checkpoint, collectionState: JSON.stringify(state) };
-  if (region) await issue(manager, checkpoint, now, region);
-  // Scope causes are a fixed, small set. Release rows are never loaded here.
-  const regions = await repository.findBy({
-    ...scopeOf(checkpoint),
-    kind: 'scope',
-    status: 'unresolved',
-    reason: In(actionableReasons),
-  });
-  const exhausted = regions.filter(
-    (row) =>
-      row.attempts >= REPAIR_ATTEMPT_LIMIT &&
-      !(
-        cp.repairRun &&
-        row.lastAttemptCycle === checkpoint.cycleId &&
-        row.lastOutcome === 'scanning'
-      )
-  );
-  if (exhausted.length)
-    await repository.update(
-      { id: In(exhausted.map((row) => row.id)) },
-      {
-        status: 'quarantined',
-        nextAttemptAt: null,
-        lastOutcome: 'repair_budget_exhausted',
-      }
-    );
-  if (cp.repairRun && cp.pages === 0) {
-    const eligible = regions.filter(
-      (row) =>
-        !exhausted.includes(row) &&
-        row.lastAttemptCycle !== checkpoint.cycleId &&
-        (!row.nextAttemptAt || row.nextAttemptAt.getTime() <= now)
-    );
-    if (eligible.length)
-      await repository.update(
-        { id: In(eligible.map((row) => row.id)) },
-        {
-          attempts: () => 'attempts + 1',
-          lastAttemptCycle: checkpoint.cycleId,
-          nextAttemptAt: null,
-          lastOutcome: 'scanning',
-        }
-      );
-  }
+  if (region) await issue(manager, checkpoint, cp, now, region);
+  await deferPendingPage(manager, checkpoint, cp);
   let totals = await summary(manager, checkpoint);
+  const obsolete = cp.repairRun || checkpoint.phase === 'repair';
+  if (
+    upgrading &&
+    (cp.dirty || obsolete || (cp.done && state.coverage === 'partial')) &&
+    !totals.uncertain
+  ) {
+    await issue(manager, checkpoint, cp, now, 'legacy_uncertainty');
+    totals = await summary(manager, checkpoint);
+  }
   if (checkpoint.mode === 'historical') {
-    // Cancel previously persisted rescans whose only obligations were source
-    // anomalies. This technical stop is not terminal-empty or coverage evidence.
-    if (cp.repairRun && !cp.done && !totals.pending) {
+    if (obsolete) {
+      // A technical stop preserves the offset and uncertainty, never inventing
+      // terminal-empty evidence or spending another request permit.
       if (!totals.uncertain) {
-        await issue(manager, checkpoint, now, 'cancelled_legacy_repair');
+        await issue(manager, checkpoint, cp, now, 'cancelled_legacy_repair');
         totals = await summary(manager, checkpoint);
       }
       cp.done = true;
-      checkpoint.status = 'idle';
+      if (checkpoint.status !== 'suspended') checkpoint.status = 'idle';
     }
     cp.dirty = totals.pending > 0;
     if (totals.uncertain || !cp.done || cp.scanUncertain)
       state.coverage = 'partial';
-    if (cp.done) {
-      if (totals.pending) {
-        checkpoint.phase = 'repair';
-        checkpoint.nextRunAt = totals.next ?? new Date(now + delay(0));
-      } else if (upgrading || checkpoint.phase === 'repair') {
-        checkpoint.phase = 'complete';
-        checkpoint.nextRunAt = maintenanceAt(
-          checkpoint,
-          now,
-          maintenanceIntervalMinutes
-        );
-      }
+    if (cp.done && (upgrading || obsolete)) {
+      checkpoint.phase = 'complete';
+      checkpoint.nextRunAt = maintenanceAt(
+        checkpoint,
+        now,
+        maintenanceIntervalMinutes
+      );
     }
   }
   return {
@@ -300,36 +257,60 @@ export async function retainDiagnostics(
     status: 'resolved',
     resolvedAt: LessThan(new Date(now - DIAGNOSTIC_RETENTION_MS)),
   });
-  const excess =
-    (await repository.countBy({ ...where, kind: 'release' })) -
-    DIAGNOSTIC_LIMIT;
-  if (excess <= 0) return;
-  const removed = await repository
-    .createQueryBuilder('diagnostic')
-    .select(['diagnostic.id', 'diagnostic.critical', 'diagnostic.status'])
-    .where(
-      'diagnostic.tracker_id = :tracker AND diagnostic.category_id = :category AND diagnostic.mode = :mode AND diagnostic.kind = :kind',
-      {
-        tracker: scope.trackerId,
-        category: scope.categoryId,
-        mode: scope.mode,
-        kind: 'release',
-      }
-    )
-    .orderBy(
-      "CASE WHEN diagnostic.status = 'resolved' THEN 0 ELSE 1 END",
-      'ASC'
-    )
-    .addOrderBy('diagnostic.last_seen_at', 'ASC')
-    .addOrderBy('diagnostic.id', 'ASC')
-    .take(excess)
-    .getMany();
-  if (removed.some((row) => row.critical && row.status !== 'resolved'))
-    await issue(manager, scope, now, 'retention_uncertainty');
-  for (let i = 0; i < removed.length; i += BATCH_SIZE)
-    await repository.delete(
-      removed.slice(i, i + BATCH_SIZE).map((row) => row.id)
-    );
+  const active = Object.values(
+    readCollectionCheckpoint(scope.checkpoint)?.incidentKeys ?? {}
+  );
+  for (const kind of ['release', 'scope'] as const) {
+    const excess =
+      (await repository.countBy({
+        ...where,
+        kind,
+        ...(kind === 'scope' ? { reason: Not('retention_uncertainty') } : {}),
+      })) - DIAGNOSTIC_LIMIT;
+    if (excess <= 0) continue;
+    const victims = repository
+      .createQueryBuilder('diagnostic')
+      .select(['diagnostic.id', 'diagnostic.critical', 'diagnostic.status'])
+      .where(
+        'diagnostic.tracker_id = :tracker AND diagnostic.category_id = :category AND diagnostic.mode = :mode AND diagnostic.kind = :kind AND diagnostic.reason <> :marker',
+        {
+          tracker: scope.trackerId,
+          category: scope.categoryId,
+          mode: scope.mode,
+          kind,
+          marker: 'retention_uncertainty',
+        }
+      )
+      .orderBy(
+        "CASE WHEN diagnostic.status = 'resolved' THEN 0 ELSE 1 END",
+        'ASC'
+      )
+      .addOrderBy('diagnostic.last_seen_at', 'ASC')
+      .addOrderBy('diagnostic.id', 'ASC');
+    if (active.length)
+      victims.andWhere('diagnostic.diagnostic_key NOT IN (:...active)', {
+        active,
+      });
+    const removed = await victims.take(excess).getMany();
+    if (removed.some((row) => row.critical && row.status !== 'resolved')) {
+      // This is an aggregate lost-evidence marker, not a retryable incident.
+      const marker = await repository.findOneBy({
+        ...where,
+        kind: 'scope',
+        reason: 'retention_uncertainty',
+      });
+      const cp = readCollectionCheckpoint(scope.checkpoint);
+      if (marker && cp)
+        (cp.incidentKeys ??= {}).retention_uncertainty = marker.diagnosticKey;
+      if (!marker)
+        await issue(manager, scope, cp, now, 'retention_uncertainty');
+      if (cp) scope.checkpoint = JSON.stringify(cp);
+    }
+    for (let i = 0; i < removed.length; i += BATCH_SIZE)
+      await repository.delete(
+        removed.slice(i, i + BATCH_SIZE).map((row) => row.id)
+      );
+  }
 }
 
 function validated(record: ObservedTorrent, field: string): boolean {
@@ -362,7 +343,6 @@ export async function persistReleaseDiagnostics(
     systematic?: boolean;
     terminal?: boolean;
     offset?: number;
-    maintenanceIntervalMinutes?: number | null;
     continuous?: boolean;
   } = {}
 ): Promise<SyncCheckpoint> {
@@ -510,76 +490,73 @@ export async function persistReleaseDiagnostics(
       );
   }
   if (options.region)
-    await issue(manager, checkpoint, now, options.region, options.offset);
-  const regions = await repository.findBy({
-    ...scopeOf(checkpoint),
-    kind: 'scope',
-    status: Not('resolved'),
-  });
-  const resolvedRegions: number[] = [];
-  const failedRegions: number[] = [];
-  for (const row of regions) {
-    const retriedPage =
-      row.reason === 'repeated_page' &&
-      row.offset !== null &&
-      ((row.offset === options.offset &&
-        accepted.length > 0 &&
-        options.continuous &&
-        !options.systematic) ||
-        (options.terminal && cp.terminalOffset === row.offset));
-    const cleanRescan =
-      options.terminal &&
-      cp.terminalOffset !== null &&
-      !cp.scanUncertain &&
-      cp.startedAt >= row.lastSeenAt.getTime();
-    if (actionableReasons.includes(row.reason) && (retriedPage || cleanRescan))
-      resolvedRegions.push(row.id);
-    else if (
-      options.terminal &&
-      cp.repairRun &&
-      row.lastAttemptCycle === checkpoint.cycleId &&
-      row.status === 'unresolved'
-    )
-      failedRegions.push(row.id);
-  }
-  if (resolvedRegions.length)
-    await repository.update(
-      { id: In(resolvedRegions) },
-      {
-        status: 'resolved',
-        resolvedAt: new Date(now),
-        nextAttemptAt: null,
-        lastOutcome: 'verified_collection',
-      }
+    await issue(
+      manager,
+      checkpoint,
+      cp,
+      now,
+      options.region,
+      options.offset,
+      options.systematic
     );
-  for (const row of regions.filter((row) => failedRegions.includes(row.id))) {
-    const quarantine = row.attempts >= REPAIR_ATTEMPT_LIMIT;
+  if (options.systematic) await deferPendingPage(manager, checkpoint, cp);
+  // Read only the bounded active episode keys. Historical scope history can grow
+  // to its retention cap without adding per-page reads or unrelated resolutions.
+  const active = Object.values(cp.incidentKeys ?? {});
+  const regions = active.length
+    ? await repository.findBy({
+        ...scopeOf(checkpoint),
+        kind: 'scope',
+        diagnosticKey: In(active),
+        status: Not('resolved'),
+      })
+    : [];
+  let pendingEmpty = false;
+  for (const row of regions) {
+    if (row.reason !== 'repeated_page' || options.systematic) continue;
+    const retriedPage =
+      row.offset === options.offset &&
+      options.continuous &&
+      accepted.length > 0;
+    const terminalPage = options.terminal && cp.terminalOffset === row.offset;
+    if (!terminalPage && !accepted.length && cp.empty?.offset === row.offset) {
+      pendingEmpty = true;
+      continue;
+    }
+    if (row.status === 'quarantined' && !retriedPage && !terminalPage) continue;
     await repository.update(row.id, {
-      status: quarantine ? 'quarantined' : 'unresolved',
-      nextAttemptAt: quarantine ? null : new Date(now + delay(row.attempts)),
+      status: retriedPage || terminalPage ? 'resolved' : 'quarantined',
+      resolvedAt: retriedPage || terminalPage ? new Date(now) : null,
+      nextAttemptAt: null,
       lastOutcome:
-        cp.terminalOffset === null
-          ? 'scan_budget_exhausted'
-          : 'unresolved_after_scan',
+        retriedPage || terminalPage
+          ? 'verified_collection'
+          : 'uncertain_page_recovery',
     });
   }
+  if (!options.systematic) {
+    for (const reason of Object.keys(cp.incidentKeys ?? {})) {
+      if (
+        reason !== options.region &&
+        reason !== 'retention_uncertainty' &&
+        !(
+          ['abnormal_overlap', 'source_data_overlap'].includes(reason) &&
+          !options.continuous
+        ) &&
+        !(reason === 'repeated_page' && pendingEmpty)
+      )
+        delete cp.incidentKeys![reason];
+    }
+  }
+  // Retention may add its uncertainty marker to this checkpoint's active keys.
+  checkpoint.checkpoint = JSON.stringify(cp);
   await retainDiagnostics(manager, checkpoint, now);
+  Object.assign(cp, readCollectionCheckpoint(checkpoint.checkpoint));
   const totals = await summary(manager, checkpoint);
   if (checkpoint.mode === 'historical') {
     cp.dirty = totals.pending > 0;
     state.coverage =
       totals.uncertain || !cp.done || cp.scanUncertain ? 'partial' : 'observed';
-    if (cp.done && totals.pending) {
-      checkpoint.phase = 'repair';
-      checkpoint.nextRunAt = totals.next ?? new Date(now + delay(0));
-    } else if (cp.done && checkpoint.phase === 'repair') {
-      checkpoint.phase = 'complete';
-      checkpoint.nextRunAt = maintenanceAt(
-        checkpoint,
-        now,
-        options.maintenanceIntervalMinutes ?? null
-      );
-    }
   } else if (totals.uncertain) state.coverage = 'partial';
   return {
     ...checkpoint,

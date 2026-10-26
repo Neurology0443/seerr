@@ -387,3 +387,73 @@ request or benchmark was run. No environment configuration, real data, staging,
 branch, commit, push or sibling worktree was changed. No implementation blocker
 remains. Quarantined source/legacy/evicted uncertainty intentionally retains partial
 coverage and is never converted into evidence of absence.
+
+## Corrective pass — Historical continuity and repair scope (26 October 2026)
+
+Files changed: `collectionRepairs.ts`, `collectionState.ts`, `collectionStore.ts`,
+`collector.ts`, `collector.test.ts`, `README.md` and this validation record, all
+under `server/lib/catalogue/`. No schema migration or environment change was needed.
+The existing CAT-013 backlog entry already describes these findings and was not changed.
+
+Ordinary overlap warnings and source rejections remain quarantined uncertainty;
+none schedules dedicated requests or full Historical passes. Historical completes
+with `dirty=false, coverage=partial`. Recovery retries the pending page with the
+existing backoff, failure limit, suspension, shared quota and Recent priority.
+Repair-state version 3 retires legacy full-scan jobs before another request, while
+preserving offsets, diagnostic identities, counters and coverage uncertainty.
+
+Scope diagnostics now identify bounded observation episodes with opaque keys in
+the checkpoint. Consecutive warnings retain their keys across moving offsets and
+restart. Healthy continuity, pending-page progression or a new ordinary cycle
+separates incidents; independent incidents never inherit exhausted, quarantined or
+resolved history. Only the addressed active repeated-page incident can resolve,
+using valid continuity at its pending page or confirmed terminal emptiness.
+Request failures and unusable responses cannot advance that page; suspension also
+quarantines its pending incident in the existing fenced transaction.
+
+Retention bounds release and scope histories independently to 5,000 entries per
+tracker/category/mode, plus a lost-evidence marker. Active episode rows are protected
+from capacity eviction. Lookups use bounded active keys; accepted release matching
+remains batched and targeted, and coverage uses scoped SQL aggregates.
+
+### Focused validation
+
+A disposable PostgreSQL 17.9 cluster at `/tmp/seerr-p3-continuity-pg`, listening
+only on loopback port 56488, served test-created databases without real data.
+
+```sh
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56488 SEERR_MIGRATION_PG_PASSWORD=continuity-disposable pnpm test server/lib/catalogue/collector.test.ts server/lib/catalogue/collectionRuntime.test.ts server/job/schedule.test.ts
+devenv shell -- pnpm exec eslint server/lib/catalogue/collectionRepairs.ts server/lib/catalogue/collectionState.ts server/lib/catalogue/collectionStore.ts server/lib/catalogue/collector.ts server/lib/catalogue/collector.test.ts
+```
+
+**122 tests passed, 0 failed/cancelled/skipped**, exercising real SQLite and
+PostgreSQL. Focused lint passed. New or updated regression coverage includes:
+
+- Forty nonempty moving pages with recurring overlap warnings and ten rejected
+  releases finish in exactly **43 calls**, including terminal confirmations, with
+  one start at offset zero and two deduplicated continuity episodes. Repeated
+  scheduler executions and database reopen retain the completed partial state.
+- Independent same-reason incidents retain separate identities, observations,
+  budgets and quarantines. Reobservation preserves existing counts and outcomes;
+  stale pointers to resolved history cannot transfer its dates or counters.
+- Concurrent collectors and in-flight Recent/Historical responses preserve
+  independent diagnostics, checkpoints and scheduling. Resolution of a recovered
+  pending page leaves unrelated quarantines unchanged.
+- Same-offset recovery, Retry-After, unusable-page suspension and terminal-empty
+  corroboration stay bounded. Persisted overlap-driven jobs stop without requests,
+  including exhausted and in-progress states; uncertainty remains partial.
+- Scope-history retention preserves active incidents and lost-evidence uncertainty.
+  With **4,000 mixed prior release/scope diagnostics**, a page uses **12 diagnostic
+  SQL calls** versus **11** before seeding; no diagnostic SELECT returns over
+  **100 rows**. Native metadata, identity conflict, rollback, lease and quota
+  regressions remain green in the same focused collector suite.
+
+Only the seven modified files were formatted and checked with the repository's
+Prettier; `git diff --check` passed. The disposable PostgreSQL cluster was stopped
+and removed after validation. No global format/lint/typecheck/i18n, full repository
+suite, build or live tracker request was run. No staging, branch, commit, push,
+real data or sibling worktree was changed.
+
+No blocker remains. Continuity uncertainty intentionally stays partial: a completed
+traversal or clean maintenance pass cannot establish a missing range or silently
+resolve unrelated incidents.

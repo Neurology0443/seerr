@@ -108,7 +108,7 @@ export class CollectionStore {
         .findBy({ trackerId });
       for (const scope of existingScopes) {
         if (
-          (readCollectionState(scope.collectionState).repairVersion === 2 &&
+          (readCollectionState(scope.collectionState).repairVersion === 3 &&
             scope.phase !== 'repair') ||
           (scope.leaseExpiresAt && scope.leaseExpiresAt.getTime() > now)
         )
@@ -408,7 +408,10 @@ export class CollectionStore {
       const state = { ...checkpoint };
       delete state.leaseOwner;
       delete state.leaseExpiresAt;
-      await saveSyncCheckpoint(manager, state);
+      await saveSyncCheckpoint(
+        manager,
+        await prepareRepairs(manager, state, now)
+      );
       if (current.leaseExpiresAt.getTime() <= (await this.clock(manager)))
         throw new CatalogueLeaseLostError();
     });

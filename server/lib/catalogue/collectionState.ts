@@ -18,6 +18,7 @@ export interface CollectionCheckpoint {
   repairRun?: boolean;
   scanUncertain?: boolean;
   previousRejected?: boolean;
+  incidentKeys?: Record<string, string>;
 }
 export interface CollectionDiagnostic {
   code:
@@ -38,7 +39,7 @@ export interface CollectionState {
   diagnostics: CollectionDiagnostic[];
   recoverable: boolean;
   pendingDispatch?: boolean;
-  repairVersion?: 1 | 2;
+  repairVersion?: 1 | 2 | 3;
 }
 export const emptyCollectionState = (): CollectionState => ({
   version: 1,
@@ -79,6 +80,18 @@ export function readCollectionCheckpoint(
         : parsed
     ) as CollectionCheckpoint;
     if (
+      (cp.incidentKeys !== undefined &&
+        (!cp.incidentKeys ||
+          Array.isArray(cp.incidentKeys) ||
+          typeof cp.incidentKeys !== 'object' ||
+          Object.keys(cp.incidentKeys).length > 16 ||
+          Object.entries(cp.incidentKeys).some(
+            ([reason, key]) =>
+              !/^[a-z_]{1,40}$/.test(reason) ||
+              typeof key !== 'string' ||
+              !/^scope:[a-z_]{1,40}:[a-f0-9-]{36}$/.test(key) ||
+              !key.startsWith(`scope:${reason}:`)
+          ))) ||
       cp.version !== 2 ||
       !cp.pagination ||
       !Number.isSafeInteger(cp.pagination.limit) ||

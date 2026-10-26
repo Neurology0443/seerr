@@ -15,11 +15,7 @@ import {
   type Tr4kerCollectionSettings,
   type TrackerCollectionDescription,
 } from './collectionConfig';
-import {
-  REPAIR_PAGE_LIMIT,
-  persistReleaseDiagnostics,
-  prepareRepairs,
-} from './collectionRepairs';
+import { persistReleaseDiagnostics, prepareRepairs } from './collectionRepairs';
 import {
   diagnose,
   pageContinuity,
@@ -461,7 +457,6 @@ export class CatalogueCollector {
             cp.repairThrough = Math.max(cp.repairThrough, request.offset);
         }
       } else if (cp.done) state.coverage = cp.dirty ? 'partial' : 'observed';
-      if (cp.repairRun && cp.pages >= REPAIR_PAGE_LIMIT) cp.done = true;
       cp.previous = hashes.slice(0, limit);
       cp.previousRejected = critical;
       scope.pagesProcessed++;
@@ -532,28 +527,21 @@ export class CatalogueCollector {
           rejections,
           now,
           {
-            region:
-              cp!.repairRun &&
-              cp!.pages >= REPAIR_PAGE_LIMIT &&
-              cp!.terminalOffset === null
-                ? 'scan_budget_exhausted'
-                : unstable
-                  ? repeated
-                    ? 'repeated_page'
-                    : systematic
-                      ? undefined
-                      : sourceGap
-                        ? 'source_data_overlap'
-                        : 'abnormal_overlap'
-                  : critical && !rejections.length
-                    ? 'contract_page'
-                    : undefined,
+            region: unstable
+              ? repeated
+                ? 'repeated_page'
+                : systematic
+                  ? undefined
+                  : sourceGap
+                    ? 'source_data_overlap'
+                    : 'abnormal_overlap'
+              : critical && !rejections.length
+                ? 'contract_page'
+                : undefined,
             systematic,
             terminal: cp!.done,
             offset: request.offset,
             continuous: !unstable,
-            maintenanceIntervalMinutes:
-              tracker.settings.maintenanceIntervalMinutes,
           }
         );
       },
