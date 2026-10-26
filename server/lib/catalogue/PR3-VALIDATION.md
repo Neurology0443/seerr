@@ -313,3 +313,77 @@ commits, pushes or sibling-worktree files were changed. No implementation blocke
 remains. Quarantined, unknown or evicted evidence intentionally retains partial
 coverage; HMAC identity across authentication-key rotation remains conservative
 as documented in the README.
+
+## Corrective pass — Historical repair boundaries and diagnostic isolation
+
+Files changed:
+
+- `collectionRepairs.ts`: non-repairable source diagnostics, scoped repair eligibility, explicit targeted cross-mode resolution, batched persistence, SQL aggregates and bounded eviction selection.
+- `collectionState.ts`, `collectionStore.ts`, `collector.ts`: repair-state v2 upgrade, retirement of obsolete source-driven rescans, filtered-page continuity context and same-checkpoint recovery.
+- `entities.ts`, `migration/diagnosticScopeIndex.ts`, `migration/{sqlite,postgres}/1792972800001-DiagnosticScopeIndex.ts`: one additive scope/state index on both engines; frozen migrations remain unchanged.
+- `collector.test.ts`, `catalogue.test.ts`: focused boundary/isolation/volume regressions and four-migration down/up/history expectations.
+- `README.md`, this validation record: current state transitions and validation evidence.
+- `codex/catalogue/backlog.md`: clarification appended to CAT-013; this local reference remains Git-ignored and unstaged. No entries were deleted or created.
+
+All paths above except the backlog are relative to `server/lib/catalogue/`.
+
+Individual source-data rejections immediately retain `quarantined` diagnostics with
+`source_data_unrepairable`, no retry date and no new repair attempt. Re-observation
+updates occurrence history without scheduling extra requests. A later accepted
+observation resolves only the same safe GUID and validated field; missing optional
+data cannot resolve that field. Critical uncertainty still makes coverage partial.
+
+Automatic scope repair requires an unresolved, evidenced collection cause: broken
+continuity, repeated pages, changed pagination or an invalid checkpoint. Existing
+backoff, suspension, shared quotas, Recent priority, leases and fences remain in
+effect. An unusable page stays at its pending checkpoint; a rejected/filtered page
+cannot invent an advanced missing region. Genuine region rescans remain capped at
+three attempts and 10,000 pages each. New source anomalies never extend that budget.
+Partial coverage alone never schedules a repair. Obsolete persisted source-driven
+jobs stop conservatively without losing observations or fabricating terminal evidence.
+
+Lookup, aggregates, retention and repair transitions include tracker/category/mode.
+The only intentional cross-mode operation resolves a matching release diagnostic
+from accepted identity/field evidence; it does not update the other mode's checkpoint,
+retry counters or schedule. Concurrent response tests exercise that isolation.
+
+Validation used the existing devenv environment, offline fixtures, temporary SQLite
+files and PostgreSQL 17.9 in `/tmp/seerr-p3-boundaries-pg` on loopback port 56487.
+The empty disposable control database and test-only role were used; suites created
+and dropped only their own randomly named databases. PostgreSQL suites ran sequentially.
+
+```sh
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56487 SEERR_MIGRATION_PG_PASSWORD=boundaries-disposable pnpm test server/lib/catalogue/collector.test.ts server/lib/catalogue/collectionRuntime.test.ts server/job/schedule.test.ts
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56487 SEERR_MIGRATION_PG_PASSWORD=boundaries-disposable pnpm test server/lib/catalogue/catalogue.test.ts server/lib/catalogue/lifecycle.test.ts server/api/trackers/torznab.test.ts server/api/trackers/tr4ker.test.ts
+```
+
+**112 P3 tests and 184 persistence/lifecycle/P2 regressions passed: 0 failed,
+cancelled or skipped.** Both real SQL engines cover normal partial completion,
+recurring/new rejected releases across 12 pages without extra Historical passes,
+restart and legacy upgrade, configured maintenance resolution, concurrent mode
+isolation, explicit cross-mode resolution, same-offset unusable/repeated page
+recovery, bounded genuine repairs, metadata, identity conflicts and request budgets.
+
+The per-page diagnostic fixture processes 100 rejections plus an accepted observation.
+With 4,000 prior diagnostic rows, both engines use **12 diagnostic SQL calls** versus
+**11** before seeding, the extra call resolving the relevant seeded record. No
+diagnostic SELECT returns more than **100 rows**; unrelated rows/counters are
+unchanged. Capacity cleanup selects only evicted rows, not the complete category.
+
+```sh
+devenv shell -- pnpm exec eslint server/lib/catalogue/collectionRepairs.ts server/lib/catalogue/collectionState.ts server/lib/catalogue/collectionStore.ts server/lib/catalogue/collector.ts server/lib/catalogue/collector.test.ts server/lib/catalogue/catalogue.test.ts server/lib/catalogue/entities.ts server/lib/catalogue/migration/diagnosticScopeIndex.ts server/lib/catalogue/migration/sqlite/1792972800001-DiagnosticScopeIndex.ts server/lib/catalogue/migration/postgres/1792972800001-DiagnosticScopeIndex.ts
+git diff --check
+```
+
+Targeted lint and whitespace checks passed. All modified files were formatted and
+checked with the repository's Prettier. Source-anomaly rescan fixtures were updated
+to assert the newly required non-repairable behavior; the shared quota/Retry-After
+fixture now uses a genuine continuity defect. Identity, metadata, transactional and
+rate-limit assertions were preserved.
+
+The disposable PostgreSQL cluster was stopped and removed after validation. No
+global formatting, lint, typecheck, i18n, full repository suite, build, live tracker
+request or benchmark was run. No environment configuration, real data, staging,
+branch, commit, push or sibling worktree was changed. No implementation blocker
+remains. Quarantined source/legacy/evicted uncertainty intentionally retains partial
+coverage and is never converted into evidence of absence.

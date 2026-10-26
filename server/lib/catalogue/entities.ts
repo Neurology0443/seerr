@@ -100,6 +100,18 @@ export function createCatalogueEntities(
       ],
       indices: [
         {
+          name: 'IDX_catalogue_diagnostic_scope_state',
+          columns: [
+            'trackerId',
+            'categoryId',
+            'mode',
+            'kind',
+            'critical',
+            'status',
+            'nextAttemptAt',
+          ],
+        },
+        {
           name: 'IDX_catalogue_diagnostic_repair',
           columns: ['trackerId', 'categoryId', 'status', 'nextAttemptAt'],
         },

@@ -260,13 +260,16 @@ export class CatalogueCollector {
             ? 'pagination_changed'
             : scope.checkpoint && !readCollectionCheckpoint(scope.checkpoint)
               ? 'invalid_checkpoint'
-              : undefined
+              : undefined,
+          tracker.settings.maintenanceIntervalMinutes
         );
         return beginning;
       },
     });
     Object.assign(scope, beginning);
     Object.assign(state, readCollectionState(beginning.collectionState));
+    cp = readCollectionCheckpoint(beginning.checkpoint)!;
+    if (cp.done) return false;
     if (this.stopped) return false;
     const category = tracker.categories.find(
       (category) => category.id === scope.categoryId
@@ -353,6 +356,7 @@ export class CatalogueCollector {
     const repeated = continuity === 'repeated';
     const critical =
       unusable || page.contractStatus !== 'compatible' || criticalAnomaly;
+    const sourceGap = critical || cp.previousRejected;
     for (const anomaly of page.anomalies)
       diagnose(state, anomaly.code, anomaly.field, now);
     const unstable = continuity !== 'continuous';
@@ -370,7 +374,7 @@ export class CatalogueCollector {
       (page.contractStatus === 'partial' &&
         records.length < page.receivedCount / 2);
     if (critical || unstable) {
-      if (unstable) cp.scanUncertain = true;
+      if (unstable && !systematic) cp.scanUncertain = true;
       // An unadvanced Historical page is still pending, not a skipped range.
       if (!systematic || scope.mode === 'recent') {
         cp.dirty = true;
@@ -459,6 +463,7 @@ export class CatalogueCollector {
       } else if (cp.done) state.coverage = cp.dirty ? 'partial' : 'observed';
       if (cp.repairRun && cp.pages >= REPAIR_PAGE_LIMIT) cp.done = true;
       cp.previous = hashes.slice(0, limit);
+      cp.previousRejected = critical;
       scope.pagesProcessed++;
       scope.lastSuccessfulAt = new Date(now);
       scope.nextRunAt = new Date(now + 1);
@@ -535,13 +540,20 @@ export class CatalogueCollector {
                 : unstable
                   ? repeated
                     ? 'repeated_page'
-                    : 'abnormal_overlap'
+                    : systematic
+                      ? undefined
+                      : sourceGap
+                        ? 'source_data_overlap'
+                        : 'abnormal_overlap'
                   : critical && !rejections.length
                     ? 'contract_page'
                     : undefined,
             systematic,
             terminal: cp!.done,
             offset: request.offset,
+            continuous: !unstable,
+            maintenanceIntervalMinutes:
+              tracker.settings.maintenanceIntervalMinutes,
           }
         );
       },

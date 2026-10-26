@@ -103,26 +103,23 @@ export class CollectionStore {
         }
       // Upgrade old uncertain checkpoints under the existing tracker lock.
       // Never rewrite a scope currently owned by another process.
-      const historical = await manager
+      const existingScopes = await manager
         .getRepository<CatalogueSyncState>(names.sync)
-        .findBy({ trackerId, mode: 'historical' });
-      for (const scope of historical) {
-        const cp = readCollectionCheckpoint(scope.checkpoint);
+        .findBy({ trackerId });
+      for (const scope of existingScopes) {
         if (
-          !cp ||
-          readCollectionState(scope.collectionState).repairVersion ||
+          (readCollectionState(scope.collectionState).repairVersion === 2 &&
+            scope.phase !== 'repair') ||
           (scope.leaseExpiresAt && scope.leaseExpiresAt.getTime() > now)
         )
           continue;
-        const upgraded = await prepareRepairs(manager, scope, now);
-        if (
-          cp.done &&
-          (cp.dirty ||
-            readCollectionState(scope.collectionState).coverage === 'partial')
-        ) {
-          upgraded.phase = 'repair';
-          upgraded.nextRunAt = new Date(now + 30000);
-        }
+        const upgraded = await prepareRepairs(
+          manager,
+          scope,
+          now,
+          undefined,
+          settings.maintenanceIntervalMinutes
+        );
         await saveSyncCheckpoint(manager, upgraded);
       }
       // Enabling maintenance later uses the last pass's observed finish time.

@@ -273,33 +273,58 @@ fixed set of scope repair causes. Resolved history expires 30 days after resolut
 Capacity eviction prefers resolved history. Evicting unresolved critical evidence
 creates a quarantined scope marker that permanently retains its coverage uncertainty;
 it cannot silently turn missing diagnostic history into proof of complete coverage.
-Its durable scope budget also bounds repair attempts when evicted diagnostics
-reappear; those releases cannot repeatedly acquire fresh automatic repair budgets.
+Neither evicted evidence nor a reappearing release diagnostic creates a repair job.
 
-For Historical, `dirty` means at least one critical repair remains `unresolved`.
+For Historical, `dirty` means an actionable collection-region repair remains
+`unresolved`. Source-data rejections are immediately `quarantined`, with outcome
+`source_data_unrepairable`, no retry date and no new repair attempts. They still
+affect coverage; quarantine does not mean the release was repaired or absent.
 `coverage` independently stays `partial` while the pass is unfinished, a critical
 release/scope is unresolved or quarantined, or the current scan is unreliable.
 Reaching terminal pages is a technical scan completion, not a resolution event.
 A release resolves only on a later accepted observation of the same safe GUID,
 with the affected field validated and no corresponding rejection. Matching a
 different GUID by hash, or failing to find the old release, never resolves it.
+Such evidence comes from normal collection or explicitly configured maintenance;
+an individual rejected release never schedules another API request or full scan.
 A complete clean rescan can verify an explicitly recorded continuity region;
 unknown legacy gaps, unidentified releases and evicted evidence cannot be resolved
 by their absence from a scan. Independent issues retain independent states.
 
-Pending repairs schedule controlled rescans from zero through the existing
-Historical scope, even with periodic maintenance disabled. Each issue has at most
-three rescan attempts, with 30–900 second bounded exponential backoff; a rescan has
-a 10,000-page budget. Attempts, cycle, eligibility, next execution and outcome are
-durable. Requests use existing leases, fences, Recent priority, shared tracker
-budgets, 6-second repair spacing and Retry-After. Existing unusable-page suspension
-and request-failure recovery still apply. Unidentified sightings remain separate
-but share a bounded scope repair budget so new sightings cannot cause endless loops.
+Automatic region recovery requires a scoped collection failure: broken continuity,
+a repeated page, changed pagination or an invalid checkpoint. Eligibility requires
+an unresolved scope cause, an available attempt budget and a due retry date; an
+in-progress attempt resumes its committed checkpoint. `coverage=partial` alone
+never creates that obligation. A repeated page is retried at its pending checkpoint;
+successful continuity there resolves that page failure without another full pass.
+Unusable responses retain bounded same-offset backoff and suspension. Filtered
+source data cannot, by itself, create an actionable missing-region diagnosis.
+
+Genuine incomplete regions can use the existing Historical scope for at most three
+controlled rescans, even with periodic maintenance disabled. Each rescan has a
+10,000-page budget and bounded 30–900 second exponential backoff. Attempts, cycle,
+next execution and outcome are durable. Existing leases, fences, Recent priority,
+shared tracker quotas, 6-second repair spacing and Retry-After remain authoritative.
+New release anomalies do not reset or extend that region repair budget.
 
 After verified repair, only the addressed issue becomes `resolved`. After bounded
 unsuccessful attempts it becomes `quarantined`; this stops automatic repair while
 retaining uncertainty. Thus `dirty=false, coverage=partial` is an intentional durable
 state. `observed` requires a verified completed scan without remaining critical
-uncertainty. Old dirty or completed partial checkpoints gain an explicit legacy
-repair marker on upgrade; clean unfinished checkpoints retain their progress.
+uncertainty. Repair-state version 2 retires old release-driven repair jobs and
+unproven legacy obligations without losing their uncertainty or occurrence history.
+Clean unfinished scans and genuine pending region repairs retain their checkpoints.
+Cancelled old rescans are technical stops, never fabricated terminal-empty evidence.
+
+Diagnostic reads, aggregates, retention, repair eligibility and counters are scoped
+by tracker/category/mode. Recent never schedules Historical repairs, or conversely.
+An explicit resolution query may match a validated GUID and field across modes;
+it changes only that diagnosis, leaving the other mode's checkpoint and scheduling
+state untouched. Unknown optional fields are insufficient resolution evidence.
+
+`DiagnosticScopeIndex1792972800001` adds a scope/state index on both engines.
+Page diagnostics are deduplicated in memory, looked up in batches of 100 and
+upserted in batches of 20. Resolution queries select only observed GUIDs, coverage
+uses SQL aggregates and capacity cleanup loads only rows being evicted. No page
+loads the full category diagnostic history or issues one query per release.
 No diagnostic API, administration UI or new collection engine is introduced.
