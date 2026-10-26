@@ -91,7 +91,14 @@ export function createCatalogueEntities(
         resolvedAt: date('resolved_at', true),
         offset: int('page_offset', true),
         itemPosition: int('item_position', true),
+        rejectedValue: { ...text('rejected_value', true), length: 32 },
       },
+      checks: [
+        {
+          name: 'CHK_catalogue_diagnostic_rejected_value_length',
+          expression: 'length("rejected_value") <= 32',
+        },
+      ],
       uniques: [
         {
           name: 'UQ_catalogue_release_diagnostic',

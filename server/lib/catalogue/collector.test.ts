@@ -45,6 +45,7 @@ import type {
   CatalogueReleaseDiagnostic,
   CatalogueSyncState,
   ObservedTorrent,
+  SyncCheckpoint,
 } from './types';
 
 type Fetch = TrackerAdapter['fetchHistoricalPage'];
@@ -108,6 +109,7 @@ function diagnosticFixture(
     categoryId: 2000,
     mode,
     diagnosticKey: `fixture:${id}`,
+    rejectedValue: null,
     releaseKey: createHash('sha256').update(guid(id)).digest('hex'),
     kind: 'release',
     guid: guid(id),
@@ -282,6 +284,261 @@ async function verify(
     return { id, calls, adapter, tracker, collector, enable, tick };
   }
   try {
+    await t.test(
+      'nullable bounded diagnostic samples migrate existing history without changing identity, indexes or statuses',
+      async () => {
+        const h = await setup();
+        const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+          names.diagnostic
+        );
+        await repository.insert({
+          ...diagnosticFixture(h.id, 999),
+          field: 'tmdbId',
+          reason: 'invalid_value',
+          attempts: 2,
+        });
+        const before = await repository.findOneByOrFail({ trackerId: h.id });
+        const table =
+          connection.type === 'postgres'
+            ? 'catalogue.release_diagnostics'
+            : 'release_diagnostics';
+        const indexes = async () => {
+          const runner = db.createQueryRunner();
+          try {
+            return (await runner.getTable(table))!.indices
+              .map((index) => ({
+                name: index.name ?? '',
+                columns: index.columnNames,
+              }))
+              .sort((a, b) => a.name.localeCompare(b.name));
+          } finally {
+            await runner.release();
+          }
+        };
+        const initialIndexes = await indexes();
+        await db.undoLastMigration({ transaction: 'all' });
+        const runner = db.createQueryRunner();
+        try {
+          assert.equal(await runner.hasColumn(table, 'rejected_value'), false);
+        } finally {
+          await runner.release();
+        }
+        assert.equal((await db.runMigrations()).length, 1);
+        assert.deepEqual(
+          await repository.findOneByOrFail({ id: before.id }),
+          before
+        );
+        assert.equal(before.rejectedValue, null);
+        assert.deepEqual(await indexes(), initialIndexes);
+        await repository.update(before.id, { rejectedValue: '9'.repeat(32) });
+        assert.equal(
+          (await repository.findOneByOrFail({ id: before.id })).rejectedValue,
+          '9'.repeat(32)
+        );
+        await assert.rejects(
+          repository.update(before.id, { rejectedValue: '9'.repeat(33) })
+        );
+        assert.equal(
+          (await repository.findOneByOrFail({ id: before.id })).rejectedValue,
+          '9'.repeat(32)
+        );
+        await repository.update(before.id, { rejectedValue: null });
+        assert.deepEqual(
+          await repository.findOneByOrFail({ id: before.id }),
+          before
+        );
+      }
+    );
+    await t.test(
+      'zero native IDs preserve latest metadata and normal Historical completion without persistent diagnostics',
+      async () => {
+        const h = await setup(async (req) =>
+          normalizeTorznabPage(
+            `<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>${
+              req.offset
+                ? ''
+                : `<item><guid>${guid(777)}</guid><title>Native Ids</title><torznab:attr name="tmdbid" value="0"/><torznab:attr name="tvdbid" value="0"/><torznab:attr name="season" value="0"/><torznab:attr name="episode" value="0"/></item>`
+            }</channel></rss>`,
+            { ...req, limit: 100, trackerId: h.id, observedAt: new Date(now) },
+            TR4KER_CONTRACT
+          )
+        );
+        const repository = new CatalogueRepository(db);
+        await repository.persistPage(
+          [{ ...record(777, h.id), observedAt: new Date(now - 60000) }],
+          await scope(h.id)
+        );
+        await h.enable();
+        for (let i = 0; i < 4; i++) await h.tick();
+        const saved = await repository.findTorrentByGuid(h.id, guid(777));
+        assert.equal(saved!.nativeTmdbId, null);
+        assert.equal(saved!.nativeTvdbId, null);
+        assert.equal(saved!.nativeSeason, 0);
+        assert.equal(saved!.nativeEpisode, 0);
+        assert.equal(JSON.parse(saved!.nativeProvenance!).tmdbId, undefined);
+        assert.equal(JSON.parse(saved!.nativeProvenance!).tvdbId, undefined);
+        assert.equal(
+          await db.getRepository(names.diagnostic).countBy({ trackerId: h.id }),
+          0
+        );
+        const finished = await scope(h.id);
+        assert.equal(
+          readCollectionState(finished.collectionState).coverage,
+          'observed'
+        );
+        assert.equal(
+          readCollectionCheckpoint(finished.checkpoint)?.dirty,
+          false
+        );
+        assert.equal(readCollectionCheckpoint(finished.checkpoint)?.done, true);
+        assert.equal(finished.nextRunAt, null);
+        now += 86400000;
+        await h.collector.initialize();
+        assert.equal(await h.collector.tick(), false);
+        assert.deepEqual(
+          h.calls.map((call) => call.offset),
+          [0, 80, 80, 160]
+        );
+      }
+    );
+    await t.test(
+      'safe native-ID rejection samples deduplicate and unsafe reobservations clear them without changing collection policy',
+      async () => {
+        let sample = '-1';
+        const secret = 'P3_NATIVE_SAMPLE_SECRET';
+        const h = await setup(
+          async (req) =>
+            normalizeTorznabPage(
+              `<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>${req.offset ? '' : `<item><guid>${guid(888)}</guid><title>Native Sample</title><torznab:attr name="tmdbid" value="${sample.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')}"/></item>`}</channel></rss>`,
+              {
+                ...req,
+                limit: 100,
+                trackerId: h.id,
+                observedAt: new Date(now),
+              },
+              TR4KER_CONTRACT,
+              [secret]
+            ),
+          { recentPageLimit: 2 }
+        );
+        await h.enable('recent');
+        await h.tick();
+        await h.tick();
+        const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+          names.diagnostic
+        );
+        const first = await repository.findOneByOrFail({ trackerId: h.id });
+        assert.equal(first.rejectedValue, '-1');
+        assert.equal(first.critical, false);
+        for (const [index, value] of [
+          '1.5',
+          secret,
+          Buffer.from(secret).toString('base64'),
+          '%2531%2532%2533',
+          '<private>xml</private>',
+          'https://tracker.invalid/download?apikey=private',
+          '9'.repeat(33),
+        ].entries()) {
+          sample = value;
+          now += 900000;
+          await h.collector.enqueueRecent('movie');
+          await h.tick();
+          await h.tick();
+          const row = await repository.findOneByOrFail({ id: first.id });
+          assert.equal(await repository.countBy({ trackerId: h.id }), 1);
+          assert.equal(row.occurrences, index + 2);
+          assert.equal(row.rejectedValue, index === 0 ? '1.5' : null);
+          assert.equal(row.firstSeenAt.getTime(), first.firstSeenAt.getTime());
+          assert.equal(row.diagnosticKey, first.diagnosticKey);
+          assert.equal(row.status, 'quarantined');
+          assert.equal(row.attempts, 0);
+          assert.equal(row.nextAttemptAt, null);
+          assert.ok(!JSON.stringify(row).includes(value) || value === '1.5');
+        }
+        const stored = await scope(h.id, 'recent');
+        assert.equal(readCollectionCheckpoint(stored.checkpoint)?.dirty, false);
+        assert.equal(
+          readCollectionState(stored.collectionState).coverage,
+          'partial'
+        );
+        assert.equal(readCollectionCheckpoint(stored.checkpoint)?.done, true);
+        assert.deepEqual(
+          h.calls.map((call) => call.offset),
+          Array.from({ length: 16 }, (_, index) => (index % 2 ? 80 : 0))
+        );
+        assert.ok(h.calls.every((call) => call.mode === 'recent'));
+        assert.equal((await scope(h.id)).checkpoint, null);
+      }
+    );
+    await t.test(
+      'persistence independently rejects forged diagnostic samples and changes no row identity when the sample changes',
+      async () => {
+        const h = await setup();
+        await h.enable();
+        await h.tick();
+        const repository = db.getRepository<CatalogueReleaseDiagnostic>(
+          names.diagnostic
+        );
+        let stored: SyncCheckpoint = await scope(h.id);
+        for (const [index, value] of [
+          '-1',
+          'https://private.invalid/key',
+          '-1\n',
+          '9'.repeat(33),
+          null,
+          '1.5',
+        ].entries()) {
+          await h.collector.store.write(async (manager) => {
+            stored = await persistReleaseDiagnostics(
+              manager,
+              stored,
+              [],
+              [
+                {
+                  ...rejection(333, 'tmdbId'),
+                  code: 'invalid_field',
+                  rejectedValue: value,
+                },
+              ],
+              now
+            );
+            await saveSyncCheckpoint(manager, { ...stored });
+          });
+          const row = await repository.findOneByOrFail({ trackerId: h.id });
+          assert.equal(await repository.countBy({ trackerId: h.id }), 1);
+          assert.equal(row.occurrences, index + 1);
+          assert.equal(
+            row.rejectedValue,
+            index === 0 ? '-1' : index === 5 ? '1.5' : null
+          );
+          now += 3000;
+        }
+        await h.collector.store.write((manager) =>
+          persistReleaseDiagnostics(
+            manager,
+            stored,
+            [],
+            [
+              {
+                ...rejection(334, 'seeders'),
+                code: 'invalid_field',
+                rejectedValue: '-1',
+              },
+            ],
+            now
+          )
+        );
+        assert.equal(
+          (
+            await repository.findOneByOrFail({
+              trackerId: h.id,
+              field: 'seeders',
+            })
+          ).rejectedValue,
+          null
+        );
+      }
+    );
     await t.test(
       'concurrent Recent and Historical responses commit independent diagnostics and checkpoints under the shared limiter',
       async () => {
@@ -3167,11 +3424,12 @@ async function verify(
         await db.undoLastMigration({ transaction: 'all' });
         await db.undoLastMigration({ transaction: 'all' });
         await db.undoLastMigration({ transaction: 'all' });
+        await db.undoLastMigration({ transaction: 'all' });
         const categories = await db
           .getRepository(names.category)
           .findBy({ torrentId: torrent.id });
         assert.equal(categories.length, 1);
-        assert.equal((await db.runMigrations()).length, 3);
+        assert.equal((await db.runMigrations()).length, 4);
         const reopened = await repository.findTorrentByGuid(h.id, guid(999999));
         assert.equal(reopened?.id, torrent.id);
         assert.equal(reopened?.nativeTmdbId, null);

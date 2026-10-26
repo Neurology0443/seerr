@@ -152,4 +152,5 @@ export interface CatalogueReleaseDiagnostic {
   resolvedAt: Date | null;
   offset: number | null;
   itemPosition: number | null;
+  rejectedValue: string | null;
 }

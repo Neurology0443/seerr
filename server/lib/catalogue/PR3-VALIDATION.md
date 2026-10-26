@@ -457,3 +457,63 @@ real data or sibling worktree was changed.
 No blocker remains. Continuity uncertainty intentionally stays partial: a completed
 traversal or clean maintenance pass cannot establish a missing range or silently
 resolve unrelated incidents.
+
+## Corrective pass — Native ID normalization and safe diagnostic values (26 October 2026)
+
+Changed files:
+
+- `server/api/trackers/diagnostics.ts`, `torznab.ts`, `types.ts`, `torznab.test.ts`.
+- `server/lib/catalogue/types.ts`, `entities.ts`, `collectionRepairs.ts`,
+  `collector.test.ts`, `catalogue.test.ts`, `README.md` and this validation record.
+- `server/lib/catalogue/migration/rejectedDiagnosticValue.ts` and the SQLite and
+  PostgreSQL `1792972800002-RejectedDiagnosticValue.ts` wrappers.
+
+Only native TMDB/TVDB zeroes normalize to missing claims, with no provenance or
+rejections. Missing and positive IDs retain their semantics; malformed, fractional,
+negative, oversized and conflicting repeated claims stay diagnosed. In particular,
+zero mixed with a positive ID is a conflict. Other numeric fields are unchanged.
+New zero observations still replace older native IDs with `null`; valid releases
+remain accepted and verified media associations are unaffected.
+
+The fifth additive catalogue migration adds nullable, unindexed `rejected_value`,
+with a 32-character length constraint on SQLite and PostgreSQL. Existing rows get
+`NULL` and retain their IDs, history, counters and statuses. Up/down migrations
+preserve the table's existing indexes and native Seerr isolation.
+
+Normalization retains only complete numeric notation or fixed invalid-value
+markers (`NaN`, `null`, `undefined`, `unknown`, `none`, `invalid`). Unsafe values,
+whitespace, URLs, paths, markup, percent escapes and oversized input yield `NULL`;
+there is no trimming or truncation. Configured secrets and their nested hex,
+UTF-16 hex and Base64 forms are withheld, with encoding checks bounded by the
+sample length. Persistence independently revalidates the scalar allowlist and
+accepts samples only for malformed TMDB/TVDB diagnostics. An unsafe reobservation
+clears a stale sample; changing samples never changes diagnostic identity.
+
+### Focused validation
+
+```sh
+devenv shell -- pnpm test server/api/trackers/torznab.test.ts server/api/trackers/tr4ker.test.ts
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56489 SEERR_MIGRATION_PG_PASSWORD=native-ids-disposable pnpm test server/lib/catalogue/collector.test.ts server/lib/catalogue/collectionRuntime.test.ts server/job/schedule.test.ts
+devenv shell -- env SEERR_MIGRATION_PG_DISPOSABLE=true SEERR_MIGRATION_PG_PORT=56489 SEERR_MIGRATION_PG_PASSWORD=native-ids-disposable pnpm test server/lib/catalogue/catalogue.test.ts
+```
+
+**153 normalization/security tests, 130 collector/runtime/scheduler tests and 22
+storage/migration tests passed: 305 total, 0 failed/cancelled/skipped.** The database
+suites used real SQLite and a disposable PostgreSQL 17.9 instance on loopback port 56489. New coverage includes both native IDs, zero/missing/positive/invalid and
+repeated values, safe/unsafe/secret-encoding samples, stale-value clearing,
+deduplication, legacy-row preservation and database-enforced length limits.
+Existing retention, transaction, Recent/Historical isolation, continuity, quota and
+metadata regressions remain green. Processing 100 rejected records with 4,000
+prior diagnostics still uses **12 diagnostic SQL calls** versus **11** before
+seeding; no diagnostic SELECT returns more than **100 rows**.
+
+Only the 14 modified or added files were formatted and checked with the repository
+Prettier. ESLint covered only the 12 changed TypeScript files; `git diff --check`
+passed. No global formatting, lint, typecheck, i18n, full repository suite, build or
+live TR4KER call was run. The disposable PostgreSQL cluster was stopped and removed.
+No environment configuration, branch, staging, commit, push, native data or sibling
+worktree was changed. No backlog entry was created or updated.
+
+No blocker remains. Rejected samples are deliberately conservative and optional;
+values outside the allowlist remain diagnosed with `NULL` samples. Collector,
+checkpoint, repair, coverage and availability policies were not changed.

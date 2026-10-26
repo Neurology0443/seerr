@@ -268,6 +268,22 @@ survive normal restarts; credential rotation conservatively leaves earlier opaqu
 diagnostics unresolved. Titles are checked before truncation to 256 characters;
 known secrets, request/download URLs, encoded unsafe values and XML are withheld.
 
+Optional native `tmdbid=0` and `tvdbid=0` normalize to missing claims (`null`),
+without provenance or rejection diagnostics. Positive IDs keep their provenance;
+malformed values and conflicts, including zero mixed with a positive ID, remain
+diagnosed. Zero handling for season, episode, seeders and other fields is unchanged.
+
+`RejectedDiagnosticValue1792972800002` adds nullable, unindexed `rejected_value`
+with a 32-character database bound on both engines. Only malformed TMDB/TVDB
+rejections may carry a sample: complete numeric notation or the fixed markers
+`NaN`, `null`, `undefined`, `unknown`, `none`, `invalid`. Whitespace, arbitrary
+strings, URLs, paths, markup, encoded payloads and oversized input are withheld,
+never trimmed or truncated into a sample. Normalization checks configured secrets,
+including hex/UTF-16 hex and Base64 representations; persistence revalidates the
+allowlist. A later unsafe rejection replaces the old sample with `NULL` while
+retaining the same diagnostic identity and occurrence count. Existing rows migrate
+with `NULL` samples and retain their history and status.
+
 Storage is bounded to 5,000 release diagnostics and 5,000 collection incidents per
 tracker/category/mode, plus one aggregate lost-evidence marker. Resolved history
 expires 30 days after resolution. Active episode rows are protected from capacity eviction.

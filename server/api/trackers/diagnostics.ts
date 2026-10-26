@@ -2,6 +2,45 @@ import { createHmac, randomBytes } from 'node:crypto';
 import type { ReleaseDiagnosticIdentity } from './types';
 
 const processKey = randomBytes(32).toString('hex');
+
+// Native-ID diagnostics admit numeric notation and fixed invalid-value markers,
+// never arbitrary upstream strings. Validate before returning the whole scalar;
+// trimming or truncation could hide an unsafe suffix or encoded credential.
+export function diagnosticRejectedValue(
+  value: unknown,
+  secrets: readonly string[] = []
+): string | null {
+  if (
+    typeof value !== 'string' ||
+    value.length > 32 ||
+    value !== value.trim() ||
+    !/^(?:[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?|nan|null|undefined|unknown|none|invalid)$/i.test(
+      value
+    )
+  )
+    return null;
+  const sample = value.toLowerCase();
+  for (const secret of secrets) {
+    if (!secret || secret.length > 32) continue;
+    const representations = new Set([secret]);
+    // Encodings only grow. The sample bound also bounds nested representations.
+    for (const representation of representations) {
+      if (sample.includes(representation.toLowerCase())) return null;
+      const utf8 = Buffer.from(representation);
+      const utf16 = Buffer.from(representation, 'utf16le');
+      for (const encoded of [
+        utf8.toString('hex'),
+        utf16.toString('hex'),
+        utf16.swap16().toString('hex'),
+        utf8.toString('base64').replace(/=+$/, ''),
+        utf8.toString('base64url'),
+      ])
+        if (encoded.length <= value.length) representations.add(encoded);
+    }
+  }
+  return value;
+}
+
 // This independent boundary accepts safe detail identifiers, never HTTP API or
 // download routes. It does not decide whether an identifier may be ingested.
 export function diagnosticIdentity(

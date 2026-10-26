@@ -83,6 +83,7 @@ export interface ReleaseDiagnosticIdentity {
 export interface ReleaseRejection extends TrackerAnomaly {
   reason: RejectionReason;
   release: ReleaseDiagnosticIdentity;
+  rejectedValue?: string | null;
 }
 
 export interface NormalizedTrackerPage extends TrackerPageContext {

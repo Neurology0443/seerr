@@ -2,8 +2,8 @@ import ExternalAPI from '@server/api/externalapi';
 import { assertSafeCanonicalGuid } from '@server/lib/catalogue/repository';
 import axios from 'axios';
 import xml2js from 'xml2js';
-import { diagnosticIdentity } from './diagnostics';
-import { httpError, TrackerAdapterError } from './errors';
+import { diagnosticIdentity, diagnosticRejectedValue } from './diagnostics';
+import { TrackerAdapterError, httpError } from './errors';
 import type {
   NormalizedTrackerPage,
   NormalizedTrackerTorrent,
@@ -88,8 +88,8 @@ function decode(value: string): string | null {
   }
 }
 
-// Arbitrary upstream text is never used in diagnostics. Required text containing
-// credentials is rejected rather than persisting a subtly altered release name.
+// Required text containing credentials is rejected rather than persisting a
+// subtly altered release name.
 function safeText(
   value: string | null,
   secrets: readonly string[]
@@ -365,7 +365,8 @@ export async function normalizeTorznabPage(
       code: TrackerAnomaly['code'] = 'invalid_field',
       reason: ReleaseRejection['reason'] = code === 'conflicting_field'
         ? 'conflicting_values'
-        : 'invalid_value'
+        : 'invalid_value',
+      rejectedValue?: string | null
     ) => {
       anomalies.push({ itemIndex, code, field });
       rejections.push({
@@ -374,6 +375,9 @@ export async function normalizeTorznabPage(
         field,
         reason,
         release: diagnosticIdentities.get(itemIndex)!,
+        ...(['tmdbId', 'tvdbId'].includes(field)
+          ? { rejectedValue: diagnosticRejectedValue(rejectedValue, secrets) }
+          : {}),
       });
     };
     const scalar = (name: string): string | null => {
@@ -454,15 +458,27 @@ export async function normalizeTorznabPage(
     ): number | null => {
       const values = attributeValues(name);
       if (!values.length) return null;
-      const numbers = values.map((value) => integer(value, min, max));
+      const nativeId = field === 'tmdbId' || field === 'tvdbId';
+      const numbers = values.map((value) =>
+        integer(value, nativeId ? 0 : min, max)
+      );
       if (numbers.some((value) => value === null)) {
-        report(field);
+        const rejected = new Set(
+          values.filter((_value, index) => numbers[index] === null)
+        );
+        report(
+          field,
+          'invalid_field',
+          'invalid_value',
+          rejected.size === 1 ? [...rejected][0] : null
+        );
         return null;
       }
       if (new Set(numbers).size !== 1) {
         report(field, 'conflicting_field');
         return null;
       }
+      if (nativeId && numbers[0] === 0) return null;
       provenance[field] = { source: 'tracker', field: `torznab:attr/${name}` };
       return numbers[0];
     };

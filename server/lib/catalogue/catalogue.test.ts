@@ -100,7 +100,7 @@ async function verifyStorage(
       assert.equal(
         (await db.query(`SELECT * FROM "catalogue"."catalogue_migrations"`))
           .length,
-        4
+        5
       );
       assert.equal(
         (
@@ -124,7 +124,7 @@ async function verifyStorage(
       assert.equal((await db.query('PRAGMA foreign_keys'))[0].foreign_keys, 1);
       assert.equal(
         (await db.query('SELECT * FROM catalogue_migrations')).length,
-        4
+        5
       );
       assert.equal(
         (await db.query(`SELECT name FROM sqlite_master WHERE name = 'media'`))
@@ -799,6 +799,7 @@ async function verifyStorage(
         await db.undoLastMigration({ transaction: 'all' });
         await db.undoLastMigration({ transaction: 'all' });
         await db.undoLastMigration({ transaction: 'all' });
+        await db.undoLastMigration({ transaction: 'all' });
         const runner = db.createQueryRunner();
         try {
           assert.equal(
@@ -809,7 +810,7 @@ async function verifyStorage(
           await runner.release();
         }
         assert.deepEqual(await nativeSnapshot(), before);
-        assert.equal((await db.runMigrations()).length, 4);
+        assert.equal((await db.runMigrations()).length, 5);
       }
     );
   } finally {
@@ -970,7 +971,7 @@ it('connection and migration failures remain observable, recoverable and isolate
           .getConnection()
           .query('SELECT * FROM catalogue_migrations')
       ).length,
-      4
+      5
     );
   } finally {
     await database.shutdown();
@@ -1228,7 +1229,7 @@ it(
             const history = await db.query(
               'SELECT * FROM "catalogue"."catalogue_migrations" ORDER BY "id"'
             );
-            assert.equal(history.length, 4);
+            assert.equal(history.length, 5);
             const repository = new CatalogueRepository(db);
             await repository.saveTracker({
               id: 'restricted-role',

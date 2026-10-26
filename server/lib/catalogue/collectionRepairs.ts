@@ -1,4 +1,7 @@
-import { diagnosticIdentity } from '@server/api/trackers/diagnostics';
+import {
+  diagnosticIdentity,
+  diagnosticRejectedValue,
+} from '@server/api/trackers/diagnostics';
 import type {
   ReleaseRejection,
   TrackerAnomaly,
@@ -103,6 +106,7 @@ async function issue(
       offset:
         offset != null && offset <= 2147483647 ? offset : (old?.offset ?? null),
       itemPosition: null,
+      rejectedValue: null,
     },
     ['trackerId', 'categoryId', 'mode', 'diagnosticKey']
   );
@@ -440,6 +444,11 @@ export async function persistReleaseDiagnostics(
             ? options.offset
             : null,
         itemPosition: rejection.itemIndex,
+        rejectedValue:
+          ['tmdbId', 'tvdbId'].includes(rejection.field) &&
+          rejection.code === 'invalid_field'
+            ? diagnosticRejectedValue(rejection.rejectedValue)
+            : null,
       };
     });
     for (let j = 0; j < values.length; j += WRITE_BATCH_SIZE)
